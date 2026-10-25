@@ -25,7 +25,7 @@ pub fn check(comptime Host: type, comptime readiness: anytype, comptime serve: a
     readiness(h, struct {}); // existing families need no readiness callback
     try std.testing.expect(h.health == null);
     readiness(h, Family);
-    try serve(h, std.testing.io, .{ .exact_width = 8 }, 8, .{ .lanes = 2 }, null);
+    try serve(h, struct {}, std.testing.io, .{ .exact_width = 8 }, 8, .{ .lanes = 2 }, null);
     defer {
         h.host.stop();
         h.core.deinit();
@@ -73,7 +73,7 @@ fn eager(comptime Host: type, comptime serve: anytype) !void {
     h.* = .{ .gpa = gpa, .gpu = null, .family = &probe, .release = Probe.release, .inner = backend.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .served = .{ .backend = backend.backend(), .facts = facts, .stream_bytes = 0, .prepare = .{ .ctx = &probe, .run = Probe.run } } };
     Probe.opening = true;
     defer Probe.opening = false;
-    try serve(h, std.testing.io, facts, 64, .{ .lanes = 1 }, null);
+    try serve(h, struct {}, std.testing.io, facts, 64, .{ .lanes = 1 }, null);
     defer {
         h.host.stop();
         h.core.deinit();
@@ -129,7 +129,7 @@ pub fn context(comptime H: type, comptime serve: anytype) !void {
     defer backend.deinit();
     var dummy: u8 = 0;
     var h: H = .{ .gpa = a, .gpu = &gpu, .family = &dummy, .release = undefined, .inner = backend.backend(), .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
-    try serve(&h, std.testing.io, .{}, 1, .{ .lanes = 1 }, null);
+    try serve(&h, struct {}, std.testing.io, .{}, 1, .{ .lanes = 1 }, null);
     defer {
         h.host.stop();
         h.core.deinit();
