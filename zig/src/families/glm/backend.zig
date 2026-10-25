@@ -65,6 +65,7 @@ pub const Backend = struct {
             .mtp_step_ms = if (b.costs) |c| c.head_ms else 1.3,
             .depth_rate = depth_rate,
             .streams_exact = true,
+            .first_tree = false, // orig's first window after a prompt: `count = d` drafts, not the DFlash2 chain read back
             .hidden_rows = true,
             .batch_rows = st.max_rows,
             .max_streams = @intCast(b.sl.slots.len),
