@@ -1,4 +1,4 @@
-//! Two-rank all-gathers as one-shot RoCE writes after b12x's RoCEnante (local-inference-lab/b12x, Apache-2.0).
+//! One-shot RoCE all-gathers after b12x's RoCEnante (local-inference-lab/b12x, Apache-2.0); two to four ranks.
 
 const std = @import("std");
 const platform = @import("sys");
@@ -14,6 +14,8 @@ const kernels = @import("kernels.zig");
 const nap = @import("roce_nap.zig");
 
 const max_hcas = 2;
+pub const max_world_roce = 4; // the most ranks this gather serves (a region holds a slot per peer)
+const max_peers = max_world_roce - 1;
 const slots = 2;
 const flag_stride = 128;
 const send_depth = 256;
@@ -154,28 +156,36 @@ pub fn wanted() bool {
     return !std.mem.eql(u8, std.mem.span(v), "0");
 }
 
-/// The peer's `mine`: both ranks' values cross the group's communicator, rank order.
-fn swap(comptime T: type, group: *const tp_group.Group, d: *const Driver, s: Stream, mine: T) !T {
-    var both: [2]T = undefined;
-    try group.gather(T, d, s, mine, &both);
-    return both[1 - group.rank];
+/// Peer p of rank `rank` in a `world` (peers 0..world-2 in ring order; both directions agree on the mapping).
+fn peerRank(rank: usize, p: usize, world: usize) usize {
+    return (rank + 1 + p) % world;
 }
 
-// -- the region's layout (the same on both ranks) ---------------------------------------------------------------------
+/// This rank's index in peer `r`'s peer list (where its writes land in r's region).
+fn myIndexAt(me: usize, r: usize, world: usize) usize {
+    return (me + world - 1 - r) % world;
+}
+
+// -- the region's layout (the same on every rank) ---------------------------------------------------------------------
 const Layout = struct {
     slot_bytes: usize,
+    world: usize,
     recv: usize,
     flags: usize,
     send: usize,
     ctrl: usize,
     total: usize,
+    recv_peer_stride: usize, // one peer's receive slots: slots * slot_bytes
+    flag_peer_stride: usize, // one peer's flags: slots * max_hcas * flag_stride
 
-    fn of(max_bytes: usize) Layout {
+    fn of(max_bytes: usize, world: usize) Layout {
         const s = std.mem.alignForward(usize, max_bytes, 4096);
-        const flags = slots * s;
-        const send = flags + slots * max_hcas * flag_stride;
-        const ctrl = send + slots * s;
-        return .{ .slot_bytes = s, .recv = 0, .flags = flags, .send = send, .ctrl = ctrl, .total = ctrl + flag_stride };
+        const peers = world - 1;
+        const recv = peers * slots * s;
+        const flags = recv + peers * slots * max_hcas * flag_stride;
+        const send = flags + slots * s;
+        return .{ .slot_bytes = s, .world = world, .recv = 0, .flags = flags, .send = send, .ctrl = send + slots * s,
+                  .total = send + slots * s + flag_stride, .recv_peer_stride = slots * s, .flag_peer_stride = slots * max_hcas * flag_stride };
     }
 };
 // ctrl words
@@ -184,15 +194,15 @@ const c_nbytes = 1; // + slot
 const c_error = 3;
 const c_hca = 4;
 
-/// What a rank tells its peer to connect: its region, and per HCA its key, address and queue pair.
+/// What a rank tells every peer to connect: its region, and per HCA its key, address and queue pair.
 const Blob = extern struct {
     ok: u32,
     n_hca: u32,
     slot_bytes: u64,
-    max_bytes: u64, // the largest shard this rank would send this way (both ranks use the smaller)
+    max_bytes: u64, // the largest shard this rank would send this way (every rank uses the smallest)
     addr: u64,
     rkey: [max_hcas]u32,
-    qpn: [max_hcas]u32,
+    qpn: [max_peers][max_hcas]u32, // peer p's queue pair on HCA h: the peer at index p connects to qpn[p][h]
     mtu: [max_hcas]u32,
     lid: [max_hcas]u16,
     gid: [max_hcas][16]u8,
@@ -203,7 +213,7 @@ const Hca = struct {
     pd: ?*Pd = null,
     mr: ?*Mr = null,
     cq: ?*Cq = null,
-    qp: ?*Qp = null,
+    qps: [max_peers]?*Qp = @splat(null), // one queue pair per peer on this HCA's completion queue
     gid: [16]u8 = @splat(0),
     gid_index: c_int = 0,
     lid: u16 = 0,
@@ -217,6 +227,8 @@ pub const Gather = struct {
     lib: platform.DynLib,
     api: Api,
     rank: u8,
+    world: usize = 2,
+    n_peers: usize = 1,
     hcas: [max_hcas]Hca = @splat(.{}),
     n_hca: u32 = 0,
     layout: Layout,
@@ -226,8 +238,8 @@ pub const Gather = struct {
     module: Module,
     f: Function,
     max_bytes: usize,
-    peer_addr: u64 = 0,
-    peer_rkey: [max_hcas]u32 = @splat(0),
+    peer_addr: [max_peers]u64 = @splat(0),
+    peer_rkey: [max_peers][max_hcas]u32 = @splat(@splat(0)),
     last_seq: u32 = 0,
     running: std.atomic.Value(bool) = .init(false),
     failed: std.atomic.Value(bool) = .init(false),
@@ -235,48 +247,60 @@ pub const Gather = struct {
     err: [256]u8 = @splat(0),
     gathers: u64 = 0,
 
-    /// Both ranks' exchange or null on both; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
+    /// Every rank's exchange or null on all; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
-        if (group.world != 2) return error.PeerRefused;
+        if (group.world < 2 or group.world > max_world_roce) return error.PeerRefused;
         const g = try gpa.create(Gather);
         var mine: Blob = std.mem.zeroes(Blob);
         const ok = want and blk: {
-            g.setup(gpa, io, d, @intCast(group.rank), max_bytes) catch |e| {
+            g.setup(gpa, io, d, group, max_bytes) catch |e| {
                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
             };
             break :blk true;
         };
         if (ok) g.blob(&mine);
-        const theirs = swap(Blob, group, d, s, mine) catch |e| {
+        var all = try gpa.alloc(Blob, group.world);
+        defer gpa.free(all);
+        group.gather(Blob, d, s, mine, all) catch |e| {
             if (ok) g.teardown();
             gpa.destroy(g);
             return e;
         };
-        if (!ok or theirs.ok == 0 or theirs.n_hca != mine.n_hca or theirs.slot_bytes != mine.slot_bytes) {
+        var usable = ok;
+        var cap = mine.max_bytes;
+        for (all) |b| {
+            if (b.ok == 0 or b.n_hca != mine.n_hca or b.slot_bytes != mine.slot_bytes) usable = false;
+            cap = @min(cap, b.max_bytes);
+        }
+        if (!usable) {
             if (ok) g.teardown();
             gpa.destroy(g);
             return null;
         }
-        g.max_bytes = agreedCap(mine.max_bytes, theirs.max_bytes); // one cap for fits on both ranks
+        g.max_bytes = @intCast(cap); // one cap for fits on every rank
         const connected = blk: {
-            g.connect(&theirs) catch |e| {
+            for (0..g.n_peers) |p| g.connect(p, &all[peerRank(g.rank, p, g.world)]) catch |e| {
                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
             };
             break :blk true;
         };
-        const peer_connected = swap(u32, group, d, s, @intFromBool(connected)) catch |e| {
+        const bits = try gpa.alloc(u32, group.world);
+        defer gpa.free(bits);
+        group.gather(u32, d, s, @intFromBool(connected), bits) catch |e| {
             g.teardown();
             gpa.destroy(g);
             return e;
         };
-        if (!connected or peer_connected == 0) {
+        for (bits) |b| if (b == 0) {
             g.teardown();
             gpa.destroy(g);
             return null;
-        }
-        std.log.info("RoCE all-gather: {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.n_hca, g.max_bytes >> 10 });
+        };
+        g.running.store(true, .release);
+        g.thread = try std.Thread.spawn(.{}, proxy, .{g});
+        std.log.info("RoCE all-gather: {d} rank(s), {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.world, g.n_hca, g.max_bytes >> 10 });
         return g;
     }
 
@@ -284,8 +308,8 @@ pub const Gather = struct {
         _ = std.fmt.bufPrint(g.err[0 .. g.err.len - 1], fmt, args) catch {};
     }
 
-    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, rank: u8, max_bytes: usize) !void {
-        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = rank, .layout = .of(max_bytes), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
+    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, max_bytes: usize) !void {
+        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = @intCast(group.rank), .world = group.world, .n_peers = group.world - 1, .layout = .of(max_bytes, group.world), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
         g.lib = platform.DynLib.open("libibverbs.so.1") catch return platform.optional_libraries.unavailable(.verbs);
         errdefer g.lib.close();
         const info = @typeInfo(Api).@"struct";
@@ -312,7 +336,9 @@ pub const Gather = struct {
 
     fn closeHcas(g: *Gather) void {
         for (&g.hcas) |*x| {
-            if (x.qp) |q| _ = g.api.ibv_destroy_qp(q);
+            for (&x.qps) |*q| {
+                if (q.*) |qp| _ = g.api.ibv_destroy_qp(qp);
+            }
             if (x.cq) |q| _ = g.api.ibv_destroy_cq(q);
             if (x.mr) |m| _ = g.api.ibv_dereg_mr(m);
             if (x.pd) |p| _ = g.api.ibv_dealloc_pd(p);
@@ -353,9 +379,11 @@ pub const Gather = struct {
         };
         hca.cq = a.ibv_create_cq(hca.ctx.?, send_depth, null, null, 0) orelse return error.HcaFailed;
         var attr: QpInitAttr = .{ .send_cq = hca.cq, .recv_cq = hca.cq, .qp_type = qpt_rc, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 16 } };
-        hca.qp = a.ibv_create_qp(hca.pd.?, &attr) orelse return error.HcaFailed;
-        var init_attr: QpAttr = .{ .qp_state = qps_init, .port_num = port_num, .qp_access_flags = access_remote_write };
-        if (a.ibv_modify_qp(hca.qp.?, &init_attr, qp_state | qp_pkey_index | qp_port | qp_access_flags) != 0) return error.HcaFailed;
+        for (0..g.n_peers) |p| {
+            hca.qps[p] = a.ibv_create_qp(hca.pd.?, &attr) orelse return error.HcaFailed;
+            var init_attr: QpAttr = .{ .qp_state = qps_init, .port_num = port_num, .qp_access_flags = access_remote_write };
+            if (a.ibv_modify_qp(hca.qps[p].?, &init_attr, qp_state | qp_pkey_index | qp_port | qp_access_flags) != 0) return error.HcaFailed;
+        }
     }
 
     fn blob(g: *Gather, b: *Blob) void {
@@ -367,31 +395,31 @@ pub const Gather = struct {
         for (0..g.n_hca) |h| {
             const x = &g.hcas[h];
             b.rkey[h] = x.mr.?.rkey;
-            b.qpn[h] = x.qp.?.qp_num;
+            for (0..g.n_peers) |p| b.qpn[p][h] = x.qps[p].?.qp_num;
             b.mtu[h] = x.mtu;
             b.lid[h] = x.lid;
             b.gid[h] = x.gid;
         }
     }
 
-    fn connect(g: *Gather, peer: *const Blob) !void {
-        g.peer_addr = peer.addr;
+    fn connect(g: *Gather, p: usize, peer: *const Blob) !void {
+        const r = peerRank(g.rank, p, g.world);
+        const me_there = myIndexAt(g.rank, r, g.world); // my slot in r's peer list: qpn[me_there][h] targets me
+        g.peer_addr[p] = peer.addr;
         for (0..g.n_hca) |h| {
             const x = &g.hcas[h];
-            g.peer_rkey[h] = peer.rkey[h];
-            var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[h], x.mtu), .dest_qp_num = peer.qpn[h], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[h], .port_num = port_num, .grh = .{ .dgid = peer.gid[h], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
-            if (g.api.ibv_modify_qp(x.qp.?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
+            g.peer_rkey[p][h] = peer.rkey[h];
+            var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[h], x.mtu), .dest_qp_num = peer.qpn[me_there][h], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[h], .port_num = port_num, .grh = .{ .dgid = peer.gid[h], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
+            if (g.api.ibv_modify_qp(x.qps[p].?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
                 g.fail("HCA {d}: the queue pair refused RTR", .{h});
                 return error.PeerRefused;
             }
             var rts: QpAttr = .{ .qp_state = qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .max_rd_atomic = 1 };
-            if (g.api.ibv_modify_qp(x.qp.?, &rts, qp_state | qp_timeout | qp_retry_cnt | qp_rnr_retry | qp_sq_psn | qp_max_qp_rd_atomic) != 0) {
+            if (g.api.ibv_modify_qp(x.qps[p].?, &rts, qp_state | qp_timeout | qp_retry_cnt | qp_rnr_retry | qp_sq_psn | qp_max_qp_rd_atomic) != 0) {
                 g.fail("HCA {d}: the queue pair refused RTS", .{h});
                 return error.PeerRefused;
             }
         }
-        g.running.store(true, .release);
-        g.thread = try std.Thread.spawn(.{}, proxy, .{g});
     }
 
     fn ctrl(g: *Gather) [*]u32 {
@@ -413,7 +441,7 @@ pub const Gather = struct {
         }
     }
 
-    /// One sequence's shard to the peer: per HCA a stripe, then its flag (inline, signalled) on the same queue pair.
+    /// One sequence's shard to every peer: per HCA a stripe, then its flag (inline, signalled) on that peer's queue pair.
     fn post(g: *Gather, seq: u32, nbytes: u32) !void {
         if (nbytes == 0 or nbytes % 16 != 0 or nbytes > g.layout.slot_bytes) {
             g.fail("bad shard size {d} at seq {d}", .{ nbytes, seq });
@@ -433,18 +461,22 @@ pub const Gather = struct {
             var n = packs / g.n_hca;
             if (h < packs % g.n_hca) n += 1;
             const bytes: u32 = n * 16;
-            var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
-            var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr + g.layout.flags + (slot * g.n_hca + h) * flag_stride, .rkey = g.peer_rkey[h] };
-            var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
-            var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr + g.layout.recv + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[h] };
-            var bad: ?*SendWr = null;
-            const first: *SendWr = if (bytes != 0) &data else &flag;
-            const rc = opsCall(PostSend, x.ctx.?, ops_post_send)(x.qp.?, first, &bad);
-            if (rc != 0) {
-                g.fail("ibv_post_send: {d}", .{rc});
-                return error.ProxyFailed;
+            for (0..g.n_peers) |p| {
+                const r = peerRank(g.rank, p, g.world);
+                const at_peer = myIndexAt(g.rank, r, g.world);
+                var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
+                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + at_peer * g.layout.flag_peer_stride + (slot * g.n_hca + h) * flag_stride, .rkey = g.peer_rkey[p][h] };
+                var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
+                var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr[p] + g.layout.recv + at_peer * g.layout.recv_peer_stride + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[p][h] };
+                var bad: ?*SendWr = null;
+                const first: *SendWr = if (bytes != 0) &data else &flag;
+                const rc = opsCall(PostSend, x.ctx.?, ops_post_send)(x.qps[p].?, first, &bad);
+                if (rc != 0) {
+                    g.fail("ibv_post_send: {d}", .{rc});
+                    return error.ProxyFailed;
+                }
+                x.outstanding += 1;
             }
-            x.outstanding += 1;
             offset += bytes;
         }
         for (0..g.n_hca) |h| try g.drain(h);
@@ -488,17 +520,12 @@ pub const Gather = struct {
         }
     }
 
-    /// The cap both ranks test in ``fits``: the smaller of the two, which each rank's slot holds.
-    fn agreedCap(mine: u64, theirs: u64) usize {
-        return @intCast(@min(mine, theirs));
-    }
-
-    /// Whether a gather of ``bytes`` a rank goes this way: the size alone decides, so both ranks pick the same path.
+    /// Whether a gather of ``bytes`` a rank goes this way: the size alone decides, so every rank picks the same path.
     pub fn fits(g: *const Gather, bytes: usize) bool {
         return bytes > 0 and bytes <= g.max_bytes and bytes % 16 == 0;
     }
 
-    /// Both ranks' ``bytes`` from ``send`` into ``recv`` in rank order (as ncclAllGather); misaligned is an error.
+    /// Every rank's ``bytes`` from ``send`` into ``recv`` in rank order (as ncclAllGather); misaligned is an error.
     pub fn gather(g: *Gather, stream: abi.Stream, send: abi.DevicePtr, recv: abi.DevicePtr, bytes: usize) !void {
         if (send % 16 != 0 or recv % 16 != 0) return error.Misaligned;
         const packs = bytes / 16;
@@ -520,6 +547,9 @@ pub const Gather = struct {
         a.add(klass);
         a.add(spin_limit);
         a.add(@as(i32, @intCast(g.n_hca)));
+        a.add(@as(i32, @intCast(g.world)));
+        a.add(@as(i64, @intCast(g.layout.recv_peer_stride)));
+        a.add(@as(i64, @intCast(g.layout.flag_peer_stride)));
         try launch.launch(g.f, .{ .grid = .{ .x = grid }, .block = .{ .x = threads } }, .{ .handle = stream, .d = g.d }, &a);
         g.gathers += 1;
     }
@@ -587,11 +617,27 @@ fn gidIndex(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !c_int {
     return error.NoHca;
 }
 
-test "RoCE gather: both ranks agree one cap" {
-    // 511 KiB and 512 KiB round to the same slot; a 512 KiB shard must take the same path on both ranks
-    try std.testing.expectEqual(Layout.of(511 << 10).slot_bytes, Layout.of(512 << 10).slot_bytes);
-    const a = Gather.agreedCap(511 << 10, 512 << 10);
-    const b = Gather.agreedCap(512 << 10, 511 << 10);
+test "RoCE gather: every rank agrees one cap" {
+    // 511 KiB and 512 KiB round to the same slot; a 512 KiB shard must take the same path on every rank
+    try std.testing.expectEqual(Layout.of(511 << 10, 2).slot_bytes, Layout.of(512 << 10, 2).slot_bytes);
+    try std.testing.expectEqual(Layout.of(511 << 10, 3).slot_bytes, Layout.of(512 << 10, 4).slot_bytes);
+    const a = @min(@as(u64, 511 << 10), @as(u64, 512 << 10));
+    const b = @min(@as(u64, 512 << 10), @as(u64, 511 << 10));
     try std.testing.expectEqual(a, b);
-    try std.testing.expectEqual(@as(usize, 511 << 10), a);
+    try std.testing.expectEqual(@as(u64, 511 << 10), a);
+}
+
+test "RoCE gather: peer and slot indices agree at every world" {
+    for (2..max_world_roce + 1) |w| for (0..w) |me| {
+        var seen: [max_world_roce]bool = @splat(false);
+        for (0..w - 1) |p| {
+            const r = peerRank(me, p, w);
+            try std.testing.expect(r != me);
+            try std.testing.expect(r < w);
+            seen[r] = true;
+            // a write to rank r lands in the slot r's peer list holds for me
+            try std.testing.expectEqual(me, peerRank(r, myIndexAt(me, r, w), w));
+        }
+        for (seen[0..w]) |s| try std.testing.expect(s);
+    };
 }
