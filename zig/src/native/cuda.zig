@@ -109,8 +109,7 @@ pub const Host = struct {
         }
     }
     /// The round loop and the lane host over the family's backend, its thread started.
-    /// `copy_proposers`: the family's own copy proposer factory (GLM's TF_GLM_COPY_*), null: the core's SuffixLookup.
-    pub fn serve(h: *Host, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain, copy_proposers: ?api.LaneHost.Proposers) !void {
+    pub fn serve(h: *Host, comptime F: type, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain) !void {
         h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
         errdefer h.cfg.deinit(h.gpa);
         if (h.served.prepare != null) try @import("cuda_startup_costs.zig").open(h, &bound);
@@ -121,7 +120,10 @@ pub const Host = struct {
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
-        h.host.proposers = copy_proposers; // null: lanes.SuffixLookup, as before
+        // a family's own copy proposer (GLM's TF_GLM_COPY_* rules); null or absent: the core's SuffixLookup
+        if (comptime @hasDecl(F, "copyProposers")) if (F.copyProposers()) |cp| {
+            h.host.proposers = .{ .ctx = cp.ctx, .make = cp.make, .free = cp.free };
+        };
         h.host.on_thread = .{ .ctx = h, .run = initThread };
         h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
         h.host.explain = explain;
@@ -447,7 +449,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     errdefer if (h.recording) |r| r.free(gpa);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     const admit: ?api.Admit = if (comptime !@hasDecl(F, "fits")) null else if (paged != null) .{ .ctx = loaded.ctx, .fits = F.fits } else null;
-    try h.serve(io, served.facts, loaded.rows, .{
+    try h.serve(F, io, served.facts, loaded.rows, .{
         .lanes = streams,
         .context_window = @intCast(window),
         .startup = h.startup,
@@ -461,7 +463,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision, o.vision) else null,
         .admit = admit,
         .slide_conversations = conversations,
-    }, .{ .ctx = loaded.ctx, .text = F.explain }, if (comptime @hasDecl(F, "copyProposers")) F.copyProposers() else null);
+    }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     kv_pages.warnCapacity(cache_capacity, o.keep == 0 or o.prompt_cache_gib == 0, std.log);
     if (@hasField(@TypeOf(loaded), "follow")) if (loaded.follow) |f| {

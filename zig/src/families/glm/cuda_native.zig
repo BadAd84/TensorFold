@@ -20,7 +20,7 @@ const kv = @import("core").kv_pool;
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{ "modelopt-nvfp4", "modelopt-mixed" };
 /// GLM's own prompt-lookup copy proposer (TF_GLM_COPY_*), behind the lanes core's Proposers hook; null: off.
-pub fn copyProposers() ?@import("engine_api").LaneHost.Proposers {
+pub fn copyProposers() ?copy.Factory {
     return copy.proposers();
 }
 // cc-defer: a fixed window; the Python family sizes it from free memory (capacity.admit), port that when serving needs

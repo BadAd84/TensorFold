@@ -17,7 +17,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lanes = @import("lanes");
-const api = @import("engine_api");
 
 /// The most drafts a round: a 16-row window (the GLM family's max_rows - 1).
 pub const max_drafts = 15;
@@ -194,8 +193,17 @@ fn freeProposer(_: *anyopaque, p: lanes.proposer.Proposer) void {
     gpa.destroy(glm_p);
 }
 
+/// The factory `cuda_native.copyProposers` hands `native/cuda.zig`'s Host.serve. The glm_cuda module
+/// cannot name the core's Proposers type (no engine_api dep), so this mirrors its three fields; the
+/// anonymous literal serve builds from them coerces (function pointer types match structurally).
+pub const Factory = struct {
+    ctx: *anyopaque,
+    make: *const fn (ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer,
+    free: *const fn (ctx: *anyopaque, p: lanes.proposer.Proposer) void,
+};
+
 /// The family's copy-proposer factory for `native/cuda.zig`'s Host.serve (null: TF_GLM_COPY_DRAFTS=0).
-pub fn proposers() ?api.LaneHost.Proposers {
+pub fn proposers() ?Factory {
     const s = Settings.fromEnv() catch |e| {
         std.log.err("glm copy drafts: bad TF_GLM_COPY_* settings ({s})", .{@errorName(e)});
         return null;
