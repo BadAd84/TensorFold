@@ -14,6 +14,7 @@ const modelopt = @import("core").modelopt;
 const exl3 = @import("cuda_exl3.zig");
 const images_mod = @import("cuda_images.zig");
 const tile = @import("cuda_tile.zig");
+const l2pf_mod = @import("cuda_l2pf.zig");
 const mm_mod = @import("cuda_mm.zig");
 const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
@@ -63,6 +64,7 @@ pub const Engine = struct {
     profiling_prompt: ?*prof_mod.Prof = null,
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
     checkpoint_digest: [32]u8,
+    l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -165,6 +167,17 @@ pub const Engine = struct {
             gpa.free(e.packs.bits);
         }
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
+        var l2pf_problem: []const u8 = "";
+        const l2pf_settings = l2pf_mod.Settings.read(&ranks.environment, &l2pf_problem) catch |err| {
+            std.log.err("glm: {s}", .{l2pf_problem});
+            return err;
+        };
+        if (l2pf_settings.on()) {
+            e.l2pf = try l2pf_mod.Prefetch.build(gpa, d, &e.w, l2pf_settings);
+            const p = &e.l2pf.?;
+            std.log.info("glm: L2 prefetch beside decode windows: sites a {d} MiB, f {d} MiB, o {d} MiB each layer", .{ p.bytes[0] >> 20, p.bytes[1] >> 20, p.bytes[2] >> 20 });
+        }
+        errdefer if (e.l2pf) |*p| p.deinit();
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
@@ -204,6 +217,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.stream.synchronize() catch {};
+        if (e.l2pf) |*p| p.deinit();
         e.gpa.free(e.packs.ptrs);
         e.gpa.free(e.packs.bits);
         if (e.drafter) |dr| dr.deinit();
@@ -243,7 +257,7 @@ pub const Engine = struct {
     fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -494,7 +508,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(false) else null };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .taps = if (e.drafter) |dr| dr.taps(false) else null };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         for (parts, segs[0..parts.len]) |p, g| {

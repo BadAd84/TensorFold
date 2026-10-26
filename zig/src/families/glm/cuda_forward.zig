@@ -23,6 +23,7 @@ const mm_mod = @import("cuda_mm.zig");
 const prof_mod = @import("cuda_prof.zig");
 const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
+const l2pf_mod = @import("cuda_l2pf.zig");
 const shared = @import("cuda_shared.zig");
 
 pub const prefill_rows = state.prefill_rows;
@@ -181,6 +182,7 @@ pub const Forward = struct {
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
     images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
+    l2pf: ?*l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch beside the stream
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
 
     pub fn set(f: *const Forward) glue.Set {
@@ -414,12 +416,14 @@ pub const Forward = struct {
         var di: usize = 0;
         for (f.ranks[0].w.layers, 0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
+            try f.prefetch(j, 2); // L2PF site `o`: the mixer's output projection while it runs
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
                 try f.pre(r, l.attn_hc, l.in_norm, R);
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
+            try f.prefetch(j, 0); // L2PF site `a`: this layer's FFN across the mixer's all-gather
             try f.gather(R);
             if (f.prof) |p| p.mark(f.stream, .gather_a);
             prof_mod.context(f.prof, j, null, .ffn);
@@ -430,6 +434,7 @@ pub const Forward = struct {
                 try f.ffn(r, l, R, slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
+            try f.prefetch(j, 1); // L2PF site `f`: the next layer's mixer across the FFN's all-gather
             try f.gather(R);
             for (f.ranks) |r| try f.post(r, R);
             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
@@ -439,7 +444,15 @@ pub const Forward = struct {
                 .mla => di += 1,
             }
         }
+        if (f.l2pf) |p| try p.join(f.stream); // the side stream's forks rejoin before the window ends
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+    }
+
+    /// TF_GLM_L2PF site `which` of layer `j` (a decode window's weight prefetch; off for prompt chunks).
+    fn prefetch(f: *const Forward, j: usize, which: usize) !void {
+        const p = f.l2pf orelse return;
+        if (f.ranks[0].b.prefill) return;
+        try p.site(f.stream, @intCast(j), which);
     }
 
     /// The final norm and this rank's rows of the head (a prompt buffer's last row only).
