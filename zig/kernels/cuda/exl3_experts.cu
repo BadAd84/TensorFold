@@ -49,8 +49,46 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
     }
 }
 
+// The same walk with the next k tile's words loaded before the current tile's mma chain (a software pipeline:
+// the loads of i + 1 issue while the decode and mma of i run). The same tiles, lanes and mma order - bit-identical.
+template <int CB, int K2, int NT>
+__device__ __forceinline__ void warp_tiles_pipe(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0,
+                                                const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                                float (&acc)[NT][2][4]) {
+    constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
+    const size_t kstride = (size_t)ntiles * TW;
+    uint32_t w[NT][LW], wn[NT][LW];
+    const uint32_t* t0 = T + (size_t)kt0 * kstride + (size_t)nt0 * TW;
+    if (nkt > 0)
+#pragma unroll
+        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+    for (int i = 0; i < nkt; ++i) {
+        t0 = T + (size_t)(kt0 + i + 1) * kstride + (size_t)nt0 * TW;
+        if (i + 1 < nkt)
+#pragma unroll
+            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, wn[j]);
+        const int k = (kt0 + i) * 16;
+        const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
+                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
+                               ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u,
+                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u};
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            uint32_t b0[2], b1[2];
+            decode_lane<K2, CB>(w[j], lane, b0, b1);
+            mma16816(acc[j][0], a, b0);
+            mma16816(acc[j][1], a, b1);
+        }
+        if (i + 1 < nkt)
+#pragma unroll
+            for (int j = 0; j < NT; ++j)
+#pragma unroll
+                for (int q = 0; q < LW; ++q) w[j][q] = wn[j][q];
+    }
+}
+
 // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-template <int CB, int NT, int W>
+template <int CB, int NT, int W, bool PIPE = false>
 __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
     if (u >= a.ucount[0]) return;
     const int MT = (a.maxm + 15) / 16;
@@ -95,7 +133,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);          \
+        if (PIPE) warp_tiles_pipe<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); else warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
         break;
         TF_EXL3X_CASE(2)
         TF_EXL3X_CASE(3)
@@ -154,6 +192,12 @@ extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, 
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
     tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
 }
+
+// The pipelined walkers (TF_EXL3_PIPE=1 selects these on the host): the same grouped bodies with
+// warp_tiles_pipe, bit-identical to the plain entries above.
+extern "C" __global__ void tf_exl3_grouped_p0(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<0, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z); }
+extern "C" __global__ void tf_exl3_grouped_p1(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<1, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z); }
+extern "C" __global__ void tf_exl3_grouped_p2(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<2, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z); }
 
 namespace tf_exl3 {
 

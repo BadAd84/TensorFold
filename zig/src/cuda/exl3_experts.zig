@@ -66,6 +66,19 @@ fn forcedSplit(k: usize, n: usize) ?u8 {
     return if (k % (16 * @as(usize, sk) * 4) == 0 and n % 128 == 0) sk else null;
 }
 
+/// TF_EXL3_PIPE=1 walks the trellis with the software-pipelined kernel (the next k tile's words load while
+/// the current tile's decode and mma run; bit-identical). Unset or 0: the plain walker.
+var pipe_env: ?bool = null;
+fn pipe() bool {
+    if (pipe_env == null) {
+        const v = if (std.c.getenv("TF_EXL3_PIPE")) |p| std.mem.span(p) else "";
+        if (v.len != 0 and !std.mem.eql(u8, v, "0") and !std.mem.eql(u8, v, "1") and !std.mem.eql(u8, v, "true"))
+            std.log.err("TF_EXL3_PIPE: 0 or 1, not \"{s}\"; ignored", .{v});
+        pipe_env = std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true");
+    }
+    return pipe_env.?;
+}
+
 /// One call's buffers (exl3/experts.py Scratch), laid out in scratch()'s order, each 256-byte aligned.
 pub const Scratch = struct {
     xg: u64, // fp16 [P, D], the rotated gate inputs
@@ -126,6 +139,7 @@ pub const Experts = struct {
     group: Function,
     rot_in: Function,
     grouped: [3]Function, // one per codebook
+    grouped_pipe: [3]Function, // the software-pipelined walkers (TF_EXL3_PIPE=1), bit-identical
     gateup: Function,
     down_combine: Function,
     prompt: prompt.Kernels = undefined,
@@ -139,6 +153,7 @@ pub const Experts = struct {
             .group = undefined,
             .rot_in = undefined,
             .grouped = undefined,
+            .grouped_pipe = undefined,
             .gateup = undefined,
             .down_combine = undefined,
         };
@@ -153,6 +168,11 @@ pub const Experts = struct {
             try e.mod.function("tf_exl3_grouped_0"),
             try e.mod.function("tf_exl3_grouped_1"),
             try e.mod.function("tf_exl3_grouped_2"),
+        };
+        e.grouped_pipe = .{
+            try e.mod.function("tf_exl3_grouped_p0"),
+            try e.mod.function("tf_exl3_grouped_p1"),
+            try e.mod.function("tf_exl3_grouped_p2"),
         };
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
@@ -234,7 +254,7 @@ pub const Experts = struct {
         g.add(i32d(l.gu_stride));
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -273,7 +293,7 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
-        try launch_.launch(e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);
