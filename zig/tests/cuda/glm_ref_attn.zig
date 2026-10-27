@@ -106,7 +106,7 @@ pub fn dense(r: *Rig, set: glm.glue.Set) !void {
     try ref.sameRows(r, "latent attention: 16-head blocks equal the 32-head blocks", wide, narrow, rows * heads * lw * 2);
     const all = try r.back(wide, rows * heads * lw * 2);
     for ([_]usize{ 0, 37, 69 }) |row| {
-        const one = try attend(r, set, dq + row * heads * lw * 2, c.dev, pos + row, 1, scale, latent.headBlock(1));
+        const one = try attend(r, set, dq + row * heads * lw * 2, c.dev, pos + row, 1, scale, latent.headBlock(1, heads));
         try sameRow(r, try std.fmt.bufPrint(&name, "latent attention: row {d} alone equals its row in the {d}-row call", .{ row, rows }), all, one, row);
     }
     check.pass("latent attention over {d} keys: within float64 tolerance, both head blocks and one-row windows equal", .{pos + rows});
