@@ -166,6 +166,14 @@ fn myIndexAt(me: usize, r: usize, world: usize) usize {
     return (me + world - 1 - r) % world;
 }
 
+/// Whether two IPv4-mapped RoCE GIDs share a /24: the cable that joins the two adjacent ports. Non-mapped
+/// (IPv6) GIDs never match, which keeps a fabric without per-link subnets on the index-h pairing.
+fn sameSubnet(a: [16]u8, b: [16]u8) bool {
+    const mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
+    if (!std.mem.eql(u8, a[0..12], &mapped) or !std.mem.eql(u8, b[0..12], &mapped)) return false;
+    return a[12] == b[12] and a[13] == b[13] and a[14] == b[14];
+}
+
 // -- the region's layout (the same on every rank) ---------------------------------------------------------------------
 const Layout = struct {
     slot_bytes: usize,
@@ -184,8 +192,7 @@ const Layout = struct {
         const recv = peers * slots * s;
         const flags = recv + peers * slots * max_hcas * flag_stride;
         const send = flags + slots * s;
-        return .{ .slot_bytes = s, .world = world, .recv = 0, .flags = flags, .send = send, .ctrl = send + slots * s,
-                  .total = send + slots * s + flag_stride, .recv_peer_stride = slots * s, .flag_peer_stride = slots * max_hcas * flag_stride };
+        return .{ .slot_bytes = s, .world = world, .recv = 0, .flags = flags, .send = send, .ctrl = send + slots * s, .total = send + slots * s + flag_stride, .recv_peer_stride = slots * s, .flag_peer_stride = slots * max_hcas * flag_stride };
     }
 };
 // ctrl words
@@ -231,6 +238,12 @@ pub const Gather = struct {
     n_peers: usize = 1,
     hcas: [max_hcas]Hca = @splat(.{}),
     n_hca: u32 = 0,
+    /// Links actually used per peer: index 0..n_links-1 gives my HCA and the peer's HCA on the same cable.
+    /// A crossed mesh (port h on one box is a different cable from port h on its peer) makes the plain
+    /// index-h pairing wrong, so the pairing is derived from the GIDs' shared /24 instead.
+    links: [max_peers][max_hcas]u8 = @splat(@splat(0)),
+    peer_links: [max_peers][max_hcas]u8 = @splat(@splat(0)),
+    n_links: u32 = 0,
     layout: Layout,
     region: memory.HostBuffer,
     region_dev: abi.DevicePtr,
@@ -279,6 +292,12 @@ pub const Gather = struct {
             return null;
         }
         g.max_bytes = @intCast(cap); // one cap for fits on every rank
+        g.selectLinks(all) catch |e| {
+            std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
+            g.teardown();
+            gpa.destroy(g);
+            return null;
+        };
         const connected = blk: {
             for (0..g.n_peers) |p| g.connect(p, &all[peerRank(g.rank, p, g.world)]) catch |e| {
                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
@@ -300,7 +319,7 @@ pub const Gather = struct {
         };
         g.running.store(true, .release);
         g.thread = try std.Thread.spawn(.{}, proxy, .{g});
-        std.log.info("RoCE all-gather: {d} rank(s), {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.world, g.n_hca, g.max_bytes >> 10 });
+        std.log.info("RoCE all-gather: {d} rank(s), {d} link(s) over {d} HCA(s), shards up to {d} KiB by RDMA writes", .{ g.world, g.n_links, g.n_hca, g.max_bytes >> 10 });
         return g;
     }
 
@@ -402,21 +421,70 @@ pub const Gather = struct {
         }
     }
 
+    /// Pair my HCAs with each peer's by the /24 their GIDs share: that is the cable joining the two boxes. A
+    /// crossed mesh (port h on one box is a different cable from port h on its peer) makes the plain index-h
+    /// pairing wrong, which is what refused RTR on the spark4-6 triangle. Falls back to index-h when no
+    /// subnet matches (a switched fabric), and refuses when the peers disagree on the count, since the
+    /// kernel waits on one link count for every peer.
+    fn selectLinks(g: *Gather, all: []const Blob) !void {
+        var count: usize = 0;
+        for (0..g.n_peers) |p| {
+            const peer = &all[peerRank(g.rank, p, g.world)];
+            var n: usize = 0;
+            for (0..g.n_hca) |h| {
+                var q: usize = 0;
+                var best: ?usize = null;
+                while (q < peer.n_hca) : (q += 1) {
+                    if (!sameSubnet(g.hcas[h].gid, peer.gid[q])) continue;
+                    var taken = false;
+                    for (g.peer_links[p][0..n]) |u| {
+                        if (@as(usize, u) == q) taken = true;
+                    }
+                    if (taken) continue;
+                    best = q;
+                    break;
+                }
+                if (best) |pq| {
+                    g.links[p][n] = @intCast(h);
+                    g.peer_links[p][n] = @intCast(pq);
+                    n += 1;
+                    if (n == max_hcas) break;
+                }
+            }
+            if (n == 0) { // no shared subnet: keep the plain index-h pairing
+                n = @min(@as(usize, g.n_hca), max_hcas);
+                for (0..n) |i| {
+                    g.links[p][i] = @intCast(i);
+                    g.peer_links[p][i] = @intCast(i);
+                }
+            }
+            if (p == 0) {
+                count = n;
+            } else if (n != count) {
+                g.fail("peer {d} has {d} link(s) where peer 0 has {d}", .{ p, n, count });
+                return error.PeerRefused;
+            }
+        }
+        g.n_links = @intCast(count);
+    }
+
     fn connect(g: *Gather, p: usize, peer: *const Blob) !void {
         const r = peerRank(g.rank, p, g.world);
-        const me_there = myIndexAt(g.rank, r, g.world); // my slot in r's peer list: qpn[me_there][h] targets me
+        const me_there = myIndexAt(g.rank, r, g.world); // my slot in r's peer list: qpn[me_there][q] targets me
         g.peer_addr[p] = peer.addr;
-        for (0..g.n_hca) |h| {
+        for (0..g.n_links) |i| {
+            const h = g.links[p][i];
+            const q = g.peer_links[p][i];
             const x = &g.hcas[h];
-            g.peer_rkey[p][h] = peer.rkey[h];
-            var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[h], x.mtu), .dest_qp_num = peer.qpn[me_there][h], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[h], .port_num = port_num, .grh = .{ .dgid = peer.gid[h], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
+            g.peer_rkey[p][h] = peer.rkey[q];
+            var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[q], x.mtu), .dest_qp_num = peer.qpn[me_there][q], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[q], .port_num = port_num, .grh = .{ .dgid = peer.gid[q], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
             if (g.api.ibv_modify_qp(x.qps[p].?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
-                g.fail("HCA {d}: the queue pair refused RTR (errno {d})", .{ h, std.c._errno().* });
+                g.fail("HCA {d} to peer {d} HCA {d}: the queue pair refused RTR (errno {d})", .{ h, p, q, std.c._errno().* });
                 return error.PeerRefused;
             }
             var rts: QpAttr = .{ .qp_state = qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .max_rd_atomic = 1 };
             if (g.api.ibv_modify_qp(x.qps[p].?, &rts, qp_state | qp_timeout | qp_retry_cnt | qp_rnr_retry | qp_sq_psn | qp_max_qp_rd_atomic) != 0) {
-                g.fail("HCA {d}: the queue pair refused RTS", .{h});
+                g.fail("HCA {d} to peer {d} HCA {d}: the queue pair refused RTS", .{ h, p, q });
                 return error.PeerRefused;
             }
         }
@@ -441,7 +509,9 @@ pub const Gather = struct {
         }
     }
 
-    /// One sequence's shard to every peer: per HCA a stripe, then its flag (inline, signalled) on that peer's queue pair.
+    /// One sequence's shard to every peer: per peer, one stripe per link to that peer, then the stripe's flag
+    /// (inline, signalled) on that link's queue pair. Each peer's stripes tile its whole shard, so the layout
+    /// stays a plain contiguous copy per peer.
     fn post(g: *Gather, seq: u32, nbytes: u32) !void {
         if (nbytes == 0 or nbytes % 16 != 0 or nbytes > g.layout.slot_bytes) {
             g.fail("bad shard size {d} at seq {d}", .{ nbytes, seq });
@@ -451,21 +521,22 @@ pub const Gather = struct {
         const base = @intFromPtr(g.region.bytes.ptr);
         const packs = nbytes / 16;
         var seq_copy: u32 = seq;
-        var offset: u64 = 0;
-        for (0..g.n_hca) |h| {
-            const x = &g.hcas[h];
-            while (x.outstanding >= send_depth / 4) {
-                try g.drain(h);
-                if (!g.running.load(.monotonic)) return error.ProxyFailed;
-            }
-            var n = packs / g.n_hca;
-            if (h < packs % g.n_hca) n += 1;
-            const bytes: u32 = n * 16;
-            for (0..g.n_peers) |p| {
-                const r = peerRank(g.rank, p, g.world);
-                const at_peer = myIndexAt(g.rank, r, g.world);
+        for (0..g.n_peers) |p| {
+            const r = peerRank(g.rank, p, g.world);
+            const at_peer = myIndexAt(g.rank, r, g.world);
+            var offset: u64 = 0;
+            for (0..g.n_links) |i| {
+                const h = g.links[p][i];
+                const x = &g.hcas[h];
+                while (x.outstanding >= send_depth / 4) {
+                    try g.drain(h);
+                    if (!g.running.load(.monotonic)) return error.ProxyFailed;
+                }
+                var n = packs / g.n_links;
+                if (i < packs % g.n_links) n += 1;
+                const bytes: u32 = n * 16;
                 var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
-                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + at_peer * g.layout.flag_peer_stride + (slot * g.n_hca + h) * flag_stride, .rkey = g.peer_rkey[p][h] };
+                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + at_peer * g.layout.flag_peer_stride + (slot * g.n_links + i) * flag_stride, .rkey = g.peer_rkey[p][h] };
                 var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
                 var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr[p] + g.layout.recv + at_peer * g.layout.recv_peer_stride + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[p][h] };
                 var bad: ?*SendWr = null;
@@ -476,8 +547,8 @@ pub const Gather = struct {
                     return error.ProxyFailed;
                 }
                 x.outstanding += 1;
+                offset += bytes;
             }
-            offset += bytes;
         }
         for (0..g.n_hca) |h| try g.drain(h);
     }
@@ -546,7 +617,7 @@ pub const Gather = struct {
         a.add(g.counters.ptr);
         a.add(klass);
         a.add(spin_limit);
-        a.add(@as(i32, @intCast(g.n_hca)));
+        a.add(@as(i32, @intCast(g.n_links)));
         a.add(@as(i32, @intCast(g.world)));
         a.add(@as(i64, @intCast(g.layout.recv_peer_stride)));
         a.add(@as(i64, @intCast(g.layout.flag_peer_stride)));
