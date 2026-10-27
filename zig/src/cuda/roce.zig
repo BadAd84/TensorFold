@@ -411,7 +411,7 @@ pub const Gather = struct {
             g.peer_rkey[p][h] = peer.rkey[h];
             var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[h], x.mtu), .dest_qp_num = peer.qpn[me_there][h], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[h], .port_num = port_num, .grh = .{ .dgid = peer.gid[h], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
             if (g.api.ibv_modify_qp(x.qps[p].?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
-                g.fail("HCA {d}: the queue pair refused RTR", .{h});
+                g.fail("HCA {d}: the queue pair refused RTR (errno {d})", .{ h, std.c._errno().* });
                 return error.PeerRefused;
             }
             var rts: QpAttr = .{ .qp_state = qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .max_rd_atomic = 1 };
