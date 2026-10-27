@@ -709,6 +709,7 @@ test "RoCE gather: peer and slot indices agree at every world" {
             // a write to rank r lands in the slot r's peer list holds for me
             try std.testing.expectEqual(me, peerRank(r, myIndexAt(me, r, w), w));
         }
-        for (seen[0..w]) |s| try std.testing.expect(s);
+        // A rank is its own peer never, so the w-1 peers must cover exactly the other ranks.
+        for (seen[0..w], 0..) |s, i| if (i != me) try std.testing.expect(s) else try std.testing.expect(!s);
     };
 }
