@@ -50,8 +50,7 @@ pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
     return error.TileNotBuilt;
 }
 
-/// TF_EXL3_SPLITK forces both projections' K split when the shape holds (an A/B knob; unset: the built
-/// order). The kernel takes `sk` at launch, so any divisor of the K tiles works; the checks mirror plan's.
+/// TF_EXL3_SPLITK forces both projections' K split (an A/B knob; unset: the built order).
 var splitk_env: ?u8 = null; // parsed once: null unset, 0 invalid-and-ignored, else the forced split
 fn forcedSplit(k: usize, n: usize) ?u8 {
     if (splitk_env == null) {
