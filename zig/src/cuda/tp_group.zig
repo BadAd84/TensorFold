@@ -49,9 +49,9 @@ pub const Group = struct {
         if (!g.aborted.swap(true, .acq_rel)) _ = g.lib.api.ncclCommAbort(g.comm);
     }
 
-    /// Two ranks: gathers up to `max_bytes` a rank go by RoCE writes if both ranks bring it up; else NCCL keeps them.
+    /// Two to four ranks: gathers up to `max_bytes` go by RoCE writes when every rank brings it up; else NCCL.
     pub fn openRoce(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream, max_bytes: usize) !void {
-        if (g.world != 2 or g.fast != null) return;
+        if (g.world < 2 or g.world > roce.max_world_roce or g.fast != null) return;
         g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes);
     }
 

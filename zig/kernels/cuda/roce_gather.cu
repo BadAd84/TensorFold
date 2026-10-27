@@ -1,4 +1,4 @@
-// Two-rank one-shot RoCE all-gather after b12x (github.com/local-inference-lab/b12x, Apache-2.0): docs/roce-gather.md.
+// One-shot RoCE all-gathers for two to four ranks, after b12x (local-inference-lab, Apache-2.0): docs/roce-gather.md.
 
 #include <stdint.h>
 
@@ -46,11 +46,13 @@ __device__ __forceinline__ void fence_gpu() { asm volatile("fence.sc.gpu;" ::: "
 
 }  // namespace
 
-// in: this rank's shard (packs of 16 bytes); out: [rank 0's shard | rank 1's shard]. klass: log2(gridDim.x).
+// in: this rank's shard (16-byte packs); out: every rank's shard in rank order; klass: log2(gridDim.x).
 extern "C" __global__ void __launch_bounds__(512) roce_gather(
     const uint4* __restrict__ in, uint4* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
-    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca) {
+    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca,
+    int world, long long recv_peer_stride, long long flag_peer_stride) {
     const int tid = threadIdx.x;
+    const int peers = world - 1;
     uint32_t* stage = counters + 2 + klass;
     uint32_t* tail = counters + 2 + K_CLASSES + klass;
     if (ld_relaxed_gpu(counters + K_POISON) != 0u) return;
@@ -69,12 +71,14 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
             st_relaxed_sys(ctrl + C_SEQ, seq);
         }
     }
-    if (tid < n_hca) {  // 3. the peer's stripes
-        const uint32_t* flag = reinterpret_cast<const uint32_t*>(flags + ((long long)slot * n_hca + tid) * FLAG_STRIDE);
+    if (tid < n_hca * peers) {  // 3. every peer's stripes
+        const int p = tid / n_hca, h = tid % n_hca;
+        const uint32_t* flag = reinterpret_cast<const uint32_t*>(
+            flags + (long long)p * flag_peer_stride + ((long long)slot * n_hca + h) * FLAG_STRIDE);
         uint32_t polls = 0;
         while (ld_acquire_sys(flag) != seq) {
             if (++polls >= spin_limit) {
-                st_relaxed_sys(ctrl + C_HCA, (uint32_t)tid);
+                st_relaxed_sys(ctrl + C_HCA, (uint32_t)tid);  // peer p's HCA h (p * n_hca + h)
                 st_relaxed_sys(ctrl + C_ERROR, seq);
                 st_release_gpu(counters + K_POISON, seq);
                 break;
@@ -82,13 +86,15 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
         }
     }
     __syncthreads();
-    if (ld_relaxed_gpu(counters + K_POISON) == 0u) {  // 4. both shards in rank order
-        const uint4* theirs = reinterpret_cast<const uint4*>(recv + (long long)slot * slot_bytes);
+    if (ld_relaxed_gpu(counters + K_POISON) == 0u) {  // 4. every shard in rank order
         uint4* own_out = out + (long long)rank * packs;
-        uint4* peer_out = out + (long long)(1 - rank) * packs;
-        for (int i = at; i < packs; i += stride) {
-            own_out[i] = in[i];
-            peer_out[i] = ld_relaxed_sys4(theirs + i);
+        for (int i = at; i < packs; i += stride) own_out[i] = in[i];
+        for (int p = 0; p < peers; ++p) {
+            const int r = (rank + 1 + p) % world;
+            const uint4* theirs = reinterpret_cast<const uint4*>(
+                recv + (long long)p * recv_peer_stride + (long long)slot * slot_bytes);
+            uint4* peer_out = out + (long long)r * packs;
+            for (int i = at; i < packs; i += stride) peer_out[i] = ld_relaxed_sys4(theirs + i);
         }
     }
     fence_gpu();  // 5. the epoch, by the last block to finish
