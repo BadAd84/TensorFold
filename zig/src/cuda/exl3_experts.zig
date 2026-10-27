@@ -42,11 +42,28 @@ pub const Layer = struct {
 
 /// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
 pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
+    if (forcedSplit(k, n)) |sk| return sk;
     const cands = [_]usize{ if (gateup) 4 else 1, 2, 1 };
     for (cands) |sk| {
         if (k % (16 * sk * 4) == 0 and n % 128 == 0) return @intCast(sk);
     }
     return error.TileNotBuilt;
+}
+
+/// TF_EXL3_SPLITK forces both projections' K split when the shape holds (an A/B knob; unset: the built
+/// order). The kernel takes `sk` at launch, so any divisor of the K tiles works; the checks mirror plan's.
+var splitk_env: ?u8 = null; // parsed once: null unset, 0 invalid-and-ignored, else the forced split
+fn forcedSplit(k: usize, n: usize) ?u8 {
+    if (splitk_env == null) {
+        const v = if (std.c.getenv("TF_EXL3_SPLITK")) |p| std.mem.span(p) else "";
+        splitk_env = std.fmt.parseInt(u8, v, 10) catch b: {
+            if (v.len != 0) std.log.err("TF_EXL3_SPLITK: a K split 1 to 16, not \"{s}\"; ignored", .{v});
+            break :b 0;
+        };
+    }
+    const sk = splitk_env orelse return null;
+    if (sk == 0 or sk > 16) return null;
+    return if (k % (16 * @as(usize, sk) * 4) == 0 and n % 128 == 0) sk else null;
 }
 
 /// One call's buffers (exl3/experts.py Scratch), laid out in scratch()'s order, each 256-byte aligned.
