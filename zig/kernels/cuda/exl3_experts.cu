@@ -20,7 +20,7 @@ struct GroupedArgs {
     const int* ucount; // int32 [1]
     const int* members; // int32 [nexp_max, maxm], row * 32 + slot, -1 after the last member
     float* z; // fp32 partials, [(mat * sk + split) * P + p] * N + col
-    int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip;
+    int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip, ord;
 };
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
@@ -182,22 +182,22 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
 // ---------------------------------------------------------------------------------------------------------------
 
 extern "C" __global__ void tf_exl3_grouped_0(tf_exl3::GroupedArgs a) {  // 3inst, any width
-    tf_exl3::grouped_body<0, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+    tf_exl3::grouped_body<0, 8, 4>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z);
 }
 
 extern "C" __global__ void tf_exl3_grouped_1(tf_exl3::GroupedArgs a) {  // mcg, any width
-    tf_exl3::grouped_body<1, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+    tf_exl3::grouped_body<1, 8, 4>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z);
 }
 
 extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1, any width (RED-SNOW's experts)
-    tf_exl3::grouped_body<2, 8, 4>(a, blockIdx.x, blockIdx.y, blockIdx.z);
+    tf_exl3::grouped_body<2, 8, 4>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z);
 }
 
 // The pipelined walkers (TF_EXL3_PIPE=1 selects these on the host): the same grouped bodies with
 // warp_tiles_pipe, bit-identical to the plain entries above.
-extern "C" __global__ void tf_exl3_grouped_p0(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<0, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z); }
-extern "C" __global__ void tf_exl3_grouped_p1(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<1, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z); }
-extern "C" __global__ void tf_exl3_grouped_p2(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<2, 8, 4, true>(a, blockIdx.x, blockIdx.y, blockIdx.z); }
+extern "C" __global__ void tf_exl3_grouped_p0(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<0, 8, 4, true>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z); }
+extern "C" __global__ void tf_exl3_grouped_p1(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<1, 8, 4, true>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z); }
+extern "C" __global__ void tf_exl3_grouped_p2(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<2, 8, 4, true>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z); }
 
 namespace tf_exl3 {
 

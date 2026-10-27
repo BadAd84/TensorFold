@@ -52,6 +52,14 @@ pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
 
 /// TF_EXL3_SPLITK forces both projections' K split when the shape holds (an A/B knob; unset: the built
 /// order). The kernel takes `sk` at launch, so any divisor of the K tiles works; the checks mirror plan's.
+/// TF_EXL3_DEC_ORDER: 1 launches each k slice's 128-column blocks before the items, for locality in the
+/// expert stream. The values are identical either way; only the order the blocks reach the SMs changes.
+fn decOrder() u32 {
+    const v = std.c.getenv("TF_EXL3_DEC_ORDER") orelse return 0;
+    const t = std.mem.trim(u8, std.mem.span(v), " ");
+    return if (std.mem.eql(u8, t, "1")) 1 else 0;
+}
+
 var splitk_env: ?u8 = null; // parsed once: null unset, 0 invalid-and-ignored, else the forced split
 fn forcedSplit(k: usize, n: usize) ?u8 {
     if (splitk_env == null) {
@@ -254,7 +262,11 @@ pub const Experts = struct {
         g.add(i32d(l.gu_stride));
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
-        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(w / 128), .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        g.add(i32d(decOrder()));
+        const ord_g: u32 = decOrder();
+        const gx: u32 = @intCast(if (ord_g == 1) w / 128 else maxu);
+        const gy: u32 = @intCast(if (ord_g == 1) maxu else w / 128);
+        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = gx, .y = gy, .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -293,7 +305,11 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
-        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = @intCast(maxu), .y = @intCast(d / 128), .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        dn.add(i32d(decOrder()));
+        const ord_d: u32 = decOrder();
+        const dx: u32 = @intCast(if (ord_d == 1) d / 128 else maxu);
+        const dy: u32 = @intCast(if (ord_d == 1) maxu else d / 128);
+        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = dx, .y = dy, .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);
