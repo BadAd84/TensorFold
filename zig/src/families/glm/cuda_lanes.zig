@@ -392,6 +392,12 @@ pub const Lanes = struct {
     /// Each window in its own forward on its stream's sequence (the core sends one when no forward is shared).
     fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const self = of(ptr);
+        // TF_GLM_LANES_LOG: how many streams' windows actually arrive in one call (the batching question)
+        if (std.c.getenv("TF_GLM_LANES_LOG") != null) {
+            var rows: usize = 0;
+            for (windows) |w| rows += w.rows();
+            std.log.info("glm lanes: {d} window(s), {d} row(s) in one verify", .{ windows.len, rows });
+        }
         if (windows.len > 1) return self.verifyShared(windows, out);
         for (windows, out) |w, *o| {
             if (w.parents != null) return error.TreesNotBuilt;
