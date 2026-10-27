@@ -171,13 +171,16 @@ pub const Gather = struct {
             return null;
         }
         g.max_bytes = @intCast(cap); // one cap for fits on every rank
-        g.selectLinks(all) catch |e| {
-            std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
-            g.teardown();
-            gpa.destroy(g);
-            return null;
+        // A refusal must be reported to the peers, not returned from: every rank reaches the agreement gather
+        // below, and a rank that returned here would leave the others waiting in it.
+        const selected = blk: {
+            g.selectLinks(all) catch |e| {
+                std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
+                break :blk false;
+            };
+            break :blk true;
         };
-        const connected = blk: {
+        const connected = if (!selected) false else blk: {
             for (0..g.n_peers) |p| g.connect(p, &all[peerRank(g.rank, p, g.world)]) catch |e| {
                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
