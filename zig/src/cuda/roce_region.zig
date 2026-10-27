@@ -41,7 +41,7 @@ pub const Layout = struct {
         const peers = world - 1;
         const recv = peers * slots * s;
         const flags = recv + peers * slots * max_hcas * flag_stride;
-        const send = flags + slots * s;
+        const send = flags + peers * slots * max_hcas * flag_stride; // after the flags, not past a gap of their size
         return .{ .slot_bytes = s, .world = world, .recv = 0, .flags = flags, .send = send, .ctrl = send + slots * s, .total = send + slots * s + flag_stride, .recv_peer_stride = slots * s, .flag_peer_stride = slots * max_hcas * flag_stride };
     }
 };

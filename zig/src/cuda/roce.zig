@@ -303,6 +303,7 @@ pub const Gather = struct {
     /// Pair each peer's HCAs by the /24 their GIDs share; no match falls back to index-h.
     fn selectLinks(g: *Gather, all: []const Blob) !void {
         var count: usize = 0;
+        var taken_h: [max_hcas]bool = @splat(false); // a port faces one peer: never lend it to a second
         for (0..g.n_peers) |p| {
             const peer = &all[peerRank(g.rank, p, g.world)];
             var n: usize = 0;
@@ -320,18 +321,23 @@ pub const Gather = struct {
                     break;
                 }
                 if (best) |pq| {
+                    taken_h[h] = true;
                     g.links[p][n] = @intCast(h);
                     g.peer_links[p][n] = @intCast(pq);
                     n += 1;
                     if (n == max_hcas) break;
                 }
             }
-            if (n == 0) { // no shared subnet: keep the plain index-h pairing
-                n = @min(@as(usize, g.n_hca), max_hcas);
-                for (0..n) |i| {
-                    g.links[p][i] = @intCast(i);
-                    g.peer_links[p][i] = @intCast(i);
+            if (n == 0) { // no shared subnet: index-h among the ports no earlier peer took
+                for (0..@min(g.n_hca, max_hcas)) |h| {
+                    if (taken_h[h]) continue;
+                    taken_h[h] = true;
+                    g.links[p][n] = @intCast(h);
+                    g.peer_links[p][n] = @intCast(h);
+                    n += 1;
+                    if (n == max_hcas) break;
                 }
+                if (n == 0) return error.PeerRefused; // every port already faces another peer
             }
             if (p == 0) {
                 count = n;
