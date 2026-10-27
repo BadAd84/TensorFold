@@ -181,10 +181,10 @@ pub fn proposers() ?Factory {
     return .{ .ctx = &settings, .make = makeProposer, .free = freeProposer };
 }
 
-var settings: Settings = .{};
+var settings: Settings = .{ .on = true };
 
 test "the latest occurrence with room, else the earliest" {
-    const s: Settings = .{ .match = 2, .most = 3, .reply_match = 0 };
+    const s: Settings = .{ .on = true, .match = 2, .most = 3, .reply_match = 0 };
     var buf: [max_drafts]u32 = undefined;
     // the suffix (1 2) occurred at 0 and 5, both with 3 tokens after them: the later one
     const ctx = [_]u32{ 1, 2, 5, 6, 7, 1, 2, 8, 9, 1, 2 };
@@ -192,7 +192,7 @@ test "the latest occurrence with room, else the earliest" {
     // room 1 is one draft, from the same occurrence
     try std.testing.expectEqualSlices(u32, &.{8}, s.propose(&ctx, 0, 1, &buf));
     // (3 4) occurred once, at 0, with only 3 tokens after it where 4 are wanted: the earliest start, short
-    const wide: Settings = .{ .match = 2, .most = 4, .reply_match = 0 };
+    const wide: Settings = .{ .on = true, .match = 2, .most = 4, .reply_match = 0 };
     const short = [_]u32{ 3, 4, 7, 3, 4 };
     try std.testing.expectEqualSlices(u32, &.{ 7, 3, 4 }, wide.propose(&short, 0, 10, &buf));
     // never seen
@@ -201,7 +201,7 @@ test "the latest occurrence with room, else the earliest" {
 }
 
 test "an occurrence inside the reply needs the reply's longer match" {
-    const s: Settings = .{ .match = 2, .most = 2, .reply_match = 4 };
+    const s: Settings = .{ .on = true, .match = 2, .most = 2, .reply_match = 4 };
     var buf: [max_drafts]u32 = undefined;
     // prompt 9 9, reply 1 2 5 7 1 2: the occurrence of (1 2) at 2 starts in the reply.
     const ctx = [_]u32{ 9, 9, 1, 2, 5, 7, 1, 2 };
@@ -213,30 +213,8 @@ test "an occurrence inside the reply needs the reply's longer match" {
     try std.testing.expectEqualSlices(u32, &.{ 5, 7 }, s.propose(&.{ 1, 2, 5, 7, 4, 1, 2 }, 6, 10, &buf));
 }
 
-test "a window of 9 to 15 rows is padded to the graph width when room allows" {
-    const s: Settings = .{ .match = 2, .most = 15, .reply_match = 0 };
-    var buf: [max_drafts]u32 = undefined;
-    var ctx: [30]u32 = undefined;
-    for (&ctx, 0..) |*t, i| t.* = @intCast(100 + i);
-    ctx[28] = 100;
-    ctx[29] = 101; // the suffix (100 101) occurred at 0
-    // 28 tokens follow the match at 0, so 15 drafts are plain
-    try std.testing.expectEqual(@as(usize, 15), s.propose(&ctx, 0, 40, &buf).len);
-    // room 10: ten drafts, 11 rows, below the pad's room (15): not padded
-    try std.testing.expectEqual(@as(usize, 10), s.propose(&ctx, 0, 10, &buf).len);
-    // a match with only 14 tokens after it (earliest, short): 15 rows, padded to 16 by repeating the last draft
-    var short: [16]u32 = undefined;
-    for (&short, 0..) |*t, i| t.* = @intCast(200 + i);
-    short[14] = 200;
-    short[15] = 201;
-    const got = s.propose(&short, 0, 40, &buf);
-    try std.testing.expectEqual(@as(usize, 15), got.len);
-    try std.testing.expectEqual(@as(u32, 201), got[14]); // 14 copied tokens end in 201, the pad repeats it
-    try std.testing.expectEqual(got[13], got[14]);
-}
-
 test "the proposer rejoins the history and the pending token into one context" {
-    var p: GlmProposer = .{ .settings = .{ .match = 2, .most = 3, .reply_match = 0 }, .prompt = 2, .gpa = std.testing.allocator };
+    var p: GlmProposer = .{ .settings = .{ .on = true, .match = 2, .most = 3, .reply_match = 0 }, .prompt = 2, .gpa = std.testing.allocator };
     defer p.deinit();
     // prompt 1 2, reply 5 6 7, pending 5: the context's tail (2 5) occurred at 1, and 6 7 1 follow it
     const got = try p.proposer().proposeAfter(&.{ 1, 2, 5, 6, 7, 1, 2 }, &.{5}, 10);

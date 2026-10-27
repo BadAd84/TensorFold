@@ -59,4 +59,5 @@ test "GLM frozen BF16 exports match every replacement and resource registration"
 test {
     _ = @import("tests/cuda/contract_glm_f32w_host.zig");
     _ = @import("tests/cuda/glm_loader_control.zig");
+    _ = @import("src/families/glm/copy.zig"); // its rule tests must be reachable, or breaking one passes
 }
