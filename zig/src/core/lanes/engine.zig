@@ -138,6 +138,10 @@ pub const Engine = struct {
         if (!e.alone) for (live.items) |s| {
             s.shared_round = true;
         };
+        if (std.c.getenv("TENSORFOLD_LANES_LOG") != null) std.log.info(
+            "lanes: live {d}, family_streams {}, batch_streams {d}, batch_rows {d}",
+            .{ live.items.len, e.cfg.family_streams, e.cfg.batch_streams, e.cfg.batch_rows },
+        );
         if (live.items.len > 1 and e.cfg.family_streams) {
             const chosen = try e.takeTurns(live.items);
             e.shared_rounds += 1;
