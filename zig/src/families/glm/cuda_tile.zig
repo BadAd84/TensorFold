@@ -136,6 +136,11 @@ pub fn tileLinears(gpa: std.mem.Allocator, w: *Weights, mk: *const mm_mod.Kernel
         const raw = 3 * max_heads * dk + 2 * dk + max_heads;
         @import("cuda_kda_block.zig").pad_to = std.mem.alignForward(usize, raw, 8);
     }
+    if (std.c.getenv("TF_GLM_KDA_DUMP")) |v| {
+        const kb = @import("cuda_kda_block.zig");
+        kb.dump_driver = d;
+        kb.dump_path = v;
+    }
     try padKdaInputs(w, d, s);
     var list: std.ArrayList(Lin) = .empty;
     defer list.deinit(w.gpa);

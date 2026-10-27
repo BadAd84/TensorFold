@@ -65,6 +65,11 @@ pub fn padOn() bool {
 /// would disagree - which is exactly how this failed: descriptor 8,341 against buffers of 8,732.
 pub var pad_to: usize = 0;
 
+/// TF_GLM_KDA_DUMP: driver and path for one dump of a projection's output, set at load, spent on first use.
+pub var dump_driver: ?*const cuda.Driver = null;
+pub var dump_path: ?[*:0]const u8 = null;
+
+
 pub fn rowWidth(own_heads: usize, max_heads: usize) usize {
     if (pad_to != 0) return pad_to;
     const heads = @max(own_heads, max_heads);
@@ -124,6 +129,23 @@ pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
     }
     try b16.matmul(selected, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
     try b16.matmul(selected, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
+    try dumpOnce(stream, s.p, w, rows);
+}
+
+/// The float64 gate's input: the projected fused stack (`rows` x `w` bf16, row stride `w`), written once.
+fn dumpOnce(stream: cuda.Stream, src: u64, w: usize, rows: usize) !void {
+    const path = dump_path orelse return;
+    const d = dump_driver orelse return;
+    dump_path = null; // one dump a process: the gate compares a single round
+    const bytes = rows * w * 2;
+    const host = try std.heap.page_allocator.alloc(u8, bytes);
+    defer std.heap.page_allocator.free(host);
+    try stream.synchronize();
+    try d.check(d.api.cuMemcpyDtoH_v2(@ptrCast(host.ptr), src, bytes), "cuMemcpyDtoH");
+    const f = std.c.fopen(path, "wb") orelse return error.DumpOpen;
+    defer _ = std.c.fclose(f);
+    _ = std.c.fwrite(host.ptr, 1, host.len, f);
+    std.log.info("glm: kda dump {d} rows x {d} cols", .{ rows, w });
 }
 
 /// `rows` rows of `cols` bf16 packed at `src` into `dst`, rows `stride` apart (tf_glm_copy_rows).
