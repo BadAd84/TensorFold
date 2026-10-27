@@ -7,11 +7,10 @@ const lanes = @import("lanes");
 pub const max_drafts = 15;
 
 pub const Settings = struct {
-    on: bool = true, // TF_GLM_COPY_DRAFTS (production: 1)
+    on: bool = false, // TF_GLM_COPY_DRAFTS (off unless 1; the production stack runs it on)
     match: usize = 8, // TF_GLM_COPY_MATCH
     most: usize = max_drafts, // TF_GLM_COPY_MAX (production: 15; Python's own default is 5)
     reply_match: usize = 16, // TF_GLM_COPY_REPLY_MATCH (production COPY_CODE=1: 16; 0: the prompt's rule everywhere)
-    pad: usize = 0, // TF_GLM_COPY_PAD (the old graph width, 16; 0: no padding, upstream's family runs no graphs)
 
     /// The production settings, from the TF_GLM_COPY_* variables.
     pub fn fromEnv() !Settings {
@@ -19,7 +18,7 @@ pub const Settings = struct {
         const on = std.c.getenv("TF_GLM_COPY_DRAFTS");
         if (on) |v| {
             const t = std.mem.trim(u8, std.mem.span(v), " ");
-            if (t.len == 0 or std.mem.eql(u8, t, "0")) s.on = false else if (!std.mem.eql(u8, t, "1")) {
+            if (t.len == 0 or std.mem.eql(u8, t, "0")) s.on = false else if (std.mem.eql(u8, t, "1")) s.on = true else {
                 std.log.err("TF_GLM_COPY_DRAFTS is 0 or 1, not {s}", .{t});
                 return error.BadCopySettings;
             }
@@ -27,7 +26,6 @@ pub const Settings = struct {
         s.match = try number("TF_GLM_COPY_MATCH", s.match, 2, 64);
         s.most = try number("TF_GLM_COPY_MAX", s.most, 1, max_drafts);
         s.reply_match = try number("TF_GLM_COPY_REPLY_MATCH", s.reply_match, 0, 64);
-        s.pad = try number("TF_GLM_COPY_PAD", s.pad, 0, max_drafts + 1);
         if (s.reply_match != 0 and s.reply_match <= s.match) {
             std.log.err("TF_GLM_COPY_REPLY_MATCH is 0 (off) or more than TF_GLM_COPY_MATCH ({d}), not {d}", .{ s.match, s.reply_match });
             return error.BadCopySettings;
@@ -90,12 +88,6 @@ pub const Settings = struct {
         const at = (found orelse return buf[0..0]) + n;
         const count = @min(k, len - at);
         @memcpy(buf[0..count], ctx[at..][0..count]);
-        const rows = 1 + count;
-        const graphed = 8;
-        if (s.pad > graphed and rows > graphed and rows < s.pad and s.pad - 1 <= room) {
-            @memset(buf[count .. s.pad - 1], buf[count - 1]);
-            return buf[0 .. s.pad - 1];
-        }
         return buf[0..count];
     }
 };
@@ -192,7 +184,7 @@ pub fn proposers() ?Factory {
 var settings: Settings = .{};
 
 test "the latest occurrence with room, else the earliest" {
-    const s: Settings = .{ .match = 2, .most = 3, .reply_match = 0, .pad = 0 };
+    const s: Settings = .{ .match = 2, .most = 3, .reply_match = 0 };
     var buf: [max_drafts]u32 = undefined;
     // the suffix (1 2) occurred at 0 and 5, both with 3 tokens after them: the later one
     const ctx = [_]u32{ 1, 2, 5, 6, 7, 1, 2, 8, 9, 1, 2 };
@@ -200,7 +192,7 @@ test "the latest occurrence with room, else the earliest" {
     // room 1 is one draft, from the same occurrence
     try std.testing.expectEqualSlices(u32, &.{8}, s.propose(&ctx, 0, 1, &buf));
     // (3 4) occurred once, at 0, with only 3 tokens after it where 4 are wanted: the earliest start, short
-    const wide: Settings = .{ .match = 2, .most = 4, .reply_match = 0, .pad = 0 };
+    const wide: Settings = .{ .match = 2, .most = 4, .reply_match = 0 };
     const short = [_]u32{ 3, 4, 7, 3, 4 };
     try std.testing.expectEqualSlices(u32, &.{ 7, 3, 4 }, wide.propose(&short, 0, 10, &buf));
     // never seen
@@ -209,7 +201,7 @@ test "the latest occurrence with room, else the earliest" {
 }
 
 test "an occurrence inside the reply needs the reply's longer match" {
-    const s: Settings = .{ .match = 2, .most = 2, .reply_match = 4, .pad = 0 };
+    const s: Settings = .{ .match = 2, .most = 2, .reply_match = 4 };
     var buf: [max_drafts]u32 = undefined;
     // prompt 9 9, reply 1 2 5 7 1 2: the occurrence of (1 2) at 2 starts in the reply.
     const ctx = [_]u32{ 9, 9, 1, 2, 5, 7, 1, 2 };
@@ -222,7 +214,7 @@ test "an occurrence inside the reply needs the reply's longer match" {
 }
 
 test "a window of 9 to 15 rows is padded to the graph width when room allows" {
-    const s: Settings = .{ .match = 2, .most = 15, .reply_match = 0, .pad = 16 };
+    const s: Settings = .{ .match = 2, .most = 15, .reply_match = 0 };
     var buf: [max_drafts]u32 = undefined;
     var ctx: [30]u32 = undefined;
     for (&ctx, 0..) |*t, i| t.* = @intCast(100 + i);
@@ -244,7 +236,7 @@ test "a window of 9 to 15 rows is padded to the graph width when room allows" {
 }
 
 test "the proposer rejoins the history and the pending token into one context" {
-    var p: GlmProposer = .{ .settings = .{ .match = 2, .most = 3, .reply_match = 0, .pad = 0 }, .prompt = 2, .gpa = std.testing.allocator };
+    var p: GlmProposer = .{ .settings = .{ .match = 2, .most = 3, .reply_match = 0 }, .prompt = 2, .gpa = std.testing.allocator };
     defer p.deinit();
     // prompt 1 2, reply 5 6 7, pending 5: the context's tail (2 5) occurred at 1, and 6 7 1 follow it
     const got = try p.proposer().proposeAfter(&.{ 1, 2, 5, 6, 7, 1, 2 }, &.{5}, 10);
