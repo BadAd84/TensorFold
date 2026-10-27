@@ -12,9 +12,11 @@ pub const heads_tile_wide = 32;
 pub const prompt_rows = 64;
 pub const prompt_rb = 64;
 
-/// latent.head_block: a rank's 32 heads a program in prompt chunks (each key read once), 16 in decode windows.
-pub fn headBlock(rows: usize) usize {
-    return if (rows >= 64) heads_tile_wide else heads_tile;
+/// latent.head_block: 32 heads a program in prompt chunks (each key read once) and, from five rows, when a rank
+/// carries 17-24 heads; 16 otherwise. The second rule is patch 0104: 0.3-0.5 ms a round at three Sparks' 22/21/21.
+pub fn headBlock(rows: usize, heads: usize) usize {
+    if (rows >= prompt_rows) return heads_tile_wide;
+    return if (rows >= 5 and heads >= 17 and heads <= 24) heads_tile_wide else heads_tile;
 }
 
 /// latent.chunks_for: 512-key chunks to cover `length` keys.
@@ -115,7 +117,7 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 
 pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
-    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows), true);
+    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows, heads), true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
 }
 
@@ -127,8 +129,10 @@ fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64,
 }
 
 test "latent.py's tiling rules" {
-    try std.testing.expectEqual(@as(usize, 16), headBlock(8));
-    try std.testing.expectEqual(@as(usize, 32), headBlock(64));
+    try std.testing.expectEqual(@as(usize, 16), headBlock(8, 32)); // unchanged away from 17-24 heads
+    try std.testing.expectEqual(@as(usize, 32), headBlock(64, 22)); // prompt chunks
+    try std.testing.expectEqual(@as(usize, 32), headBlock(5, 22)); // TP=3 decode window from five rows
+    try std.testing.expectEqual(@as(usize, 16), headBlock(4, 22)); // below five rows it stays narrow
     try std.testing.expectEqual(@as(usize, 3), chunksFor(1025));
     try std.testing.expectEqual(@as(usize, 1), chunksFor(512));
 }

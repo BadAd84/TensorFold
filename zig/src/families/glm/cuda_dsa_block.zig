@@ -157,7 +157,7 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
 
 /// forward.dense_attention: latent.attention in `part_rows`-row blocks, each at its first row's position.
 fn denseAttention(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, pos: u64, rows: usize, nch: usize, part_rows: usize, scale: f32) !void {
-    const hb = latent.headBlock(rows);
+    const hb = latent.headBlock(rows, l.heads);
     var r0: usize = 0;
     while (r0 < rows) : (r0 += part_rows) {
         const n = @min(part_rows, rows - r0);
