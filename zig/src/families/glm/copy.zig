@@ -1,19 +1,4 @@
-//! GLM's prompt-lookup ("copy") drafts, ported from our glm-cuda family's `cuda/glm_copy.zig` (fork main 55d5636d,
-//! itself from v1.8's glm5_next/cuda/copy_drafts.py, patches 0007, 0013 and 0032): when the context's last `match`
-//! tokens (the pending token included) occurred before, the tokens that followed their latest earlier occurrence
-//! are verified in place of the DFlash2 head's drafts. They only propose; verification keeps the serial sample.
-//!
-//! Upstream's lanes core already carries a copy proposer (`lanes.proposer.SuffixLookup`, a 3-gram index with a
-//! silence rule) and the family hook for one (`LaneHost.proposers`, as deepseek_v41's priced lookup uses). GLM's
-//! three rules differ from it, so this family brings its own behind the same `Proposer` interface:
-//! - which occurrence: the latest one with `k` tokens after it, else the earliest (not the longest match);
-//! - an occurrence that starts inside the reply must match `reply_match` tokens (COPY_CODE: 16), not `match` (8):
-//!   code replies repeat short boilerplate whose continuations differ;
-//! - a window of 9 to 15 rows is padded to the CUDA-graph width (16) by repeating its last draft, when the room
-//!   allows. Upstream's GLM family has no CUDA-graph replay (the graphs knob was not ported), so the pad is off
-//!   unless TF_GLM_COPY_PAD asks for it.
-//! There is no silence, and a copy of one token is a copy (the lanes core wants two): the proposer is `priced`,
-//! so the round loop takes its drafts as given.
+// ! GLM's prompt-lookup ("copy") drafts, ported from our glm-cuda family's `cuda/glm_copy.zig` (fork main 55d5636d.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lanes = @import("lanes");
@@ -62,8 +47,7 @@ pub const Settings = struct {
         return n;
     }
 
-    /// Whether `ctx[i .. i + match]` is an earlier occurrence of the context's last `match` tokens (`prompt` leading
-    /// tokens are the prompt's: an occurrence starting past them also needs the tokens before it to match).
+    /// Whether `ctx[i .. i + match]` is an earlier occurrence of the context's last `match` tokens (`prompt` leading.
     fn occurs(s: Settings, ctx: []const u32, prompt: usize, i: usize) bool {
         const n = s.match;
         const len = ctx.len;
@@ -76,10 +60,7 @@ pub const Settings = struct {
         return true;
     }
 
-    /// CopyDrafts.propose: up to `min(most, room)` drafts, what followed the latest earlier occurrence that has that many
-    /// tokens after it, else the most after any occurrence (the earliest); none when the suffix never occurred before. A
-    /// window of more than `graphed` (8) rows short of the `pad` width is filled up to it by repeating the last draft,
-    /// when `room` allows. `ctx` is the prompt, the reply so far and the pending token; the result lives in `buf`.
+    /// CopyDrafts.propose: up to `min(most, room)` drafts.
     pub fn propose(s: Settings, ctx: []const u32, prompt: usize, room: usize, buf: *[max_drafts]u32) []const u32 {
         const k = @min(s.most, room);
         const n = s.match;
@@ -119,9 +100,7 @@ pub const Settings = struct {
     }
 };
 
-/// One request's proposer: the family's rules over the stream's own context, behind lanes.proposer.Proposer.
-/// The lanes core hands `proposeAfter` the history and the pending token as a query; this proposer rejoins
-/// them into the `ctx` its rules expect (the reply's tail inclusive) and reports `match` as its evidence.
+/// One request's proposer: the family's rules over the stream's own context, behind lanes.proposer.Proposer..
 pub const GlmProposer = struct {
     settings: Settings,
     prompt: usize, // the request's prompt tokens, the reply boundary `reply_match` needs
@@ -138,8 +117,7 @@ pub const GlmProposer = struct {
         const room: usize = if (max_draft < 0) 0 else @intCast(@min(max_draft, max_drafts));
         const n = p.settings.match;
         if (n == 0 or n > history.len + tail.len or tail.len >= n) return error.BadCopyContext;
-        // the context the rules see: the history with the pending token (and any forced tail) joined on,
-        // so the reply's tail is the context's tail as CopyDrafts.propose expects
+        // the context the rules see: the history with the pending token (and any forced tail) joined on.
         const ctx = try p.gpa.alloc(u32, history.len + tail.len);
         defer p.gpa.free(ctx);
         @memcpy(ctx[0..history.len], history);
@@ -193,9 +171,7 @@ fn freeProposer(_: *anyopaque, p: lanes.proposer.Proposer) void {
     gpa.destroy(glm_p);
 }
 
-/// The factory `cuda_native.copyProposers` hands `native/cuda.zig`'s Host.serve. The glm_cuda module
-/// cannot name the core's Proposers type (no engine_api dep), so this mirrors its three fields; the
-/// anonymous literal serve builds from them coerces (function pointer types match structurally).
+/// The factory `cuda_native.copyProposers` hands `native/cuda.zig`'s Host.serve..
 pub const Factory = struct {
     ctx: *anyopaque,
     make: *const fn (ctx: *anyopaque, gpa: Allocator, prompt: []const u32, eos: []const u32) anyerror!lanes.proposer.Proposer,
@@ -235,8 +211,7 @@ test "the latest occurrence with room, else the earliest" {
 test "an occurrence inside the reply needs the reply's longer match" {
     const s: Settings = .{ .match = 2, .most = 2, .reply_match = 4, .pad = 0 };
     var buf: [max_drafts]u32 = undefined;
-    // prompt 9 9, reply 1 2 5 7 1 2: the occurrence of (1 2) at 2 starts in the reply, and the token before it (9) is not
-    // the one before the suffix (7)
+    // prompt 9 9, reply 1 2 5 7 1 2: the occurrence of (1 2) at 2 starts in the reply.
     const ctx = [_]u32{ 9, 9, 1, 2, 5, 7, 1, 2 };
     try std.testing.expectEqual(@as(usize, 0), s.propose(&ctx, 2, 10, &buf).len);
     // with the tokens before it equal, it copies
