@@ -32,13 +32,25 @@ pub const Share = struct {
         return .{
             .rank = rank,
             .world = world,
-            .kda = try span(c.kda_heads, 1, rank, world),
+            .kda = try span(c.kda_heads, kdaUnit(world), rank, world),
             .mla = try span(c.mla_heads, 1, rank, world),
             .dense = try span(c.dense_inter, unit, rank, world),
             .moe = try span(c.moe_inter, if (c.exl3) 128 else unit, rank, world), // EXL3 tiles and rotations: 128
             .shared = try span(c.shared_inter, unit, rank, world),
             .vocab = try span(c.vocab, c.head_unit, rank, world),
         };
+    }
+
+    /// KDA heads a rank takes, in units of this many heads. TF_GLM_KDA_ALIGN=8 makes every rank's KDA count a
+    /// multiple of 8, which is what keeps the fused input stack on glm_mm: its width is 385*heads + 256, so
+    /// width % 8 == 0 exactly when heads % 8 == 0. Unset or 1 keeps the Python family's heads-one-by-one split
+    /// (TP=3: 22/21/21 heads, whose 8,726 and 8,341 widths fall back to bf16 row-major glue matmuls).
+    fn kdaUnit(world: usize) usize {
+        if (world < 3) return 1; // TP=1 and TP=2 already land on whole numbers of eights (64, 32)
+        const v = std.c.getenv("TF_GLM_KDA_ALIGN") orelse return 1;
+        const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return 1;
+        if (n <= 1 or n > 64 or n % 8 != 0) return 1;
+        return n;
     }
 
     /// This rank's largest fraction of an axis as (part, whole): its weights are at most that much of the checkpoint.
