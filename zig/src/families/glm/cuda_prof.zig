@@ -3,8 +3,8 @@ const std = @import("std");
 const cuda = @import("cuda");
 pub const prompt_trace = @import("cuda_prompt_trace.zig");
 
-pub const Section = enum { gate, embed, kda, mla, gather_a, dense, router, routed, shared, gather_b, head, draw, mtp, commit };
-const names = [_][]const u8{ "gate", "embed", "kda", "mla", "gather_a", "dense", "router", "routed", "shared", "gather_b", "head", "draw", "mtp", "commit" };
+pub const Section = enum { gate, embed, kda, mla, mla_chunks, mla_merge, gather_a, dense, router, routed, shared, gather_b, head, draw, mtp, commit };
+const names = [_][]const u8{ "gate", "embed", "kda", "mla", "mla_chunks", "mla_merge", "gather_a", "dense", "router", "routed", "shared", "gather_b", "head", "draw", "mtp", "commit" };
 const max_marks = 512;
 
 pub const Prof = struct {
