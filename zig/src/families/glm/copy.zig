@@ -1,4 +1,4 @@
-// ! GLM's prompt-lookup ("copy") drafts, ported from our glm-cuda family's `cuda/glm_copy.zig` (fork main 55d5636d.
+//! GLM's prompt-lookup ("copy") drafts: spans the reply shares with its prompt propose the tokens that followed them.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lanes = @import("lanes");
@@ -7,12 +7,12 @@ const lanes = @import("lanes");
 pub const max_drafts = 15;
 
 pub const Settings = struct {
-    on: bool = false, // TF_GLM_COPY_DRAFTS (off unless 1; the production stack runs it on)
+    on: bool = false, // TF_GLM_COPY_DRAFTS (off unless 1)
     match: usize = 8, // TF_GLM_COPY_MATCH
-    most: usize = max_drafts, // TF_GLM_COPY_MAX (production: 15; Python's own default is 5)
-    reply_match: usize = 16, // TF_GLM_COPY_REPLY_MATCH (production COPY_CODE=1: 16; 0: the prompt's rule everywhere)
+    most: usize = max_drafts, // TF_GLM_COPY_MAX (up to max_drafts)
+    reply_match: usize = 16, // TF_GLM_COPY_REPLY_MATCH (0: the prompt's rule everywhere)
 
-    /// The production settings, from the TF_GLM_COPY_* variables.
+    /// The settings TF_GLM_COPY_* carries.
     pub fn fromEnv() !Settings {
         var s: Settings = .{};
         const on = std.c.getenv("TF_GLM_COPY_DRAFTS");
@@ -224,4 +224,12 @@ test "the proposer rejoins the history and the pending token into one context" {
     const none = try p.proposer().proposeAfter(&.{ 5, 6, 7, 8 }, &.{9}, 10);
     try std.testing.expectEqual(@as(usize, 0), none.len);
     try std.testing.expectEqual(@as(i64, 0), p.matched);
+}
+
+test "no TF_GLM_COPY_* set leaves copy drafting off" {
+    // A plain serve sets none of the knobs: the feature must be off and offer no proposer. This test fails on the
+    // head where Settings.on started true, which is the defect it exists for.
+    if (std.c.getenv("TF_GLM_COPY_DRAFTS") != null) return error.SkipZigTest; // a dev shell may set it
+    try std.testing.expect(!(try Settings.fromEnv()).on);
+    try std.testing.expect(proposers() == null);
 }
