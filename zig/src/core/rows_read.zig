@@ -8,6 +8,7 @@ const file = @import("rows_file.zig");
 const rows_store = @import("rows_store.zig");
 const write = @import("rows_write.zig");
 const select = @import("rows_select.zig");
+const prefetch = @import("rows_prefetch.zig");
 const Rows = rows_store.Rows;
 const Name = chain.Name;
 
@@ -16,30 +17,22 @@ pub fn read(r: *Rows, i: usize) !pc.Saved {
     const f = r.family.vtable;
     const s = r.states.items[i];
     const t0 = write.nowNs();
-    const parts = try r.parts(r.gpa, s.at);
-    defer r.gpa.free(parts);
-    var wants: std.ArrayList(write.Want) = .empty;
-    defer wants.deinit(r.gpa);
-    try r.blockNames(r.gpa, parts, s.tokens, s.spans, s.starts, s.at, &wants);
+    var plan = try prefetch.Plan.of(r, r.gpa, &s);
+    defer plan.deinit(r.gpa);
+    const ahead = if (r.fetch) |p| p.take(s.name, &plan) else null; // read on the I/O thread, its files checked there
     const saved = try r.img.blank(r.family.ptr, s.at);
     errdefer f.drop(r.family.ptr, saved);
-    var ranges: std.ArrayList(image.Range) = .empty;
-    defer ranges.deinit(r.gpa);
     var bytes: u64 = 0;
-    for (wants.items) |w| {
-        ranges.clearRetainingCapacity();
-        try image.blockRanges(parts, r.keying.block, w.window, w.k, &ranges, r.gpa);
-        bytes += try one(r, w.name, .block, ".blk", 0, ranges.items, saved);
+    for (plan.pieces) |p| {
+        if (ahead) |a| try r.img.scatter(r.family.ptr, saved, plan.rangesOf(p), a.payload(p)) else bytes += try one(r, p.name, p.kind, prefetch.ext(p.kind), p.at, plan.rangesOf(p), saved);
     }
-    ranges.clearRetainingCapacity();
-    try image.ownRanges(parts, s.at, r.keying.block, &ranges, r.gpa);
-    bytes += try one(r, s.name, .state, ".st", s.at, ranges.items, saved);
-    const ns = write.nowNs() - t0;
+    if (ahead) |a| bytes = a.disk;
+    const ns = if (ahead) |a| a.ns else write.nowNs() - t0;
     if (ns > 0 and bytes > 64 << 20) r.read_rate = 0.5 * r.read_rate + 0.5 * @as(f64, @floatFromInt(bytes)) / (@as(f64, @floatFromInt(ns)) / 1e9);
     r.counts.read += bytes;
     r.counts.reads += 1;
     r.touch(i);
-    if (!@import("builtin").is_test) std.log.info("imprint: read {d} tokens from disk ({d} MiB in {d:.0} ms)", .{ s.at, bytes >> 20, @as(f64, @floatFromInt(ns)) / 1e6 });
+    if (!@import("builtin").is_test) std.log.info("imprint: read {d} tokens from disk ({d} MiB in {d:.0} ms{s})", .{ s.at, bytes >> 20, @as(f64, @floatFromInt(ns)) / 1e6, if (ahead != null) ", read ahead" else "" });
     return saved;
 }
 
@@ -61,6 +54,7 @@ fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: 
 fn bad(r: *Rows, name: Name, ext: []const u8, err: anyerror) anyerror {
     r.counts.failed += 1;
     pc.note("imprint: a disk {s} failed its check ({s}); it and the states naming it are forgotten", .{ if (std.mem.eql(u8, ext, ".blk")) "block" else "state", @errorName(err) });
+    write.fence(r);
     rows_store.unlinkName(r.dir, name, ext);
     if (std.mem.eql(u8, ext, ".blk")) _ = r.blocks.remove(chain.stem(name));
     var i: usize = 0;
@@ -92,11 +86,13 @@ fn present(r: *Rows, i: usize) !void {
 /// A disk state reaching further than `have`, read back into a new RAM entry where that costs less than prefilling.
 pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry) ?*pc.Entry {
     const r = s.disk orelse return have;
-    const i = select.choose(s, prompt, starts, spans, have).restore orelse return have;
-    const st = r.states.items[i];
-    const bytes = s.family.vtable.bytes(s.family.ptr, st.at);
+    write.reap(r);
+    const chosen = select.choose(s, prompt, starts, spans, have).restore orelse return have;
+    const name = r.states.items[chosen].name;
+    const bytes = s.family.vtable.bytes(s.family.ptr, r.states.items[chosen].at);
     if (bytes > s.budget or s.most == 0) return have;
-    if (!ready(s, bytes)) present(r, i) catch return have; // nothing goes to make room for a state whose file is gone
+    if (!ready(s, bytes)) present(r, chosen) catch return have; // nothing goes to make room for a state whose file is gone
+    if (r.spill != .off) r.touch(chosen); // the newest: the spills that make room for it push older states off first
     while (!ready(s, bytes)) {
         if (s.family.vtable.trim) |trim| {
             const spare = s.spare();
@@ -106,6 +102,8 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
         s.remove(s.victimBut(have, prompt, born) orelse return have);
         s.counts.evicted += 1;
     }
+    const i = r.find(name) orelse return have; // a spill that made room went past the disk cap and took it
+    const st = r.states.items[i];
     const e = s.gpa.create(pc.Entry) catch return have;
     e.* = .{ .tokens = &.{}, .at = st.at, .saved = undefined, .bytes = bytes, .born = born, .used = s.clock, .last = &.{}, .shared = st.shared };
     var ok = false;
@@ -120,10 +118,11 @@ pub fn recall(s: *pc.Store, prompt: []const u32, born: u32, starts: []const u32,
     e.last = s.gpa.dupe(u32, prompt) catch return have;
     e.saved = read(r, i) catch return have;
     if (s.family.vtable.charged) |f| e.bytes = f(s.family.ptr, e.saved);
-    s.entries.append(s.gpa, e) catch {
+    @import("prompt_cache_index.zig").add(s, e) catch {
         s.family.vtable.drop(s.family.ptr, e.saved);
         return have;
     };
+    @import("prompt_cache_policy.zig").link(s, e);
     ok = true;
     s.held += e.bytes;
     return e;
