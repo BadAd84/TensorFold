@@ -51,6 +51,27 @@ test "settings from the environment: the defaults, the choices, and a refusal na
     try std.testing.expectEqualStrings("TF_GLM_DENSE_BITS: 4, 6, 8 or 16", problem);
 }
 
+fn splitMin(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_SPLIT_MIN")) return "256";
+    return null;
+}
+
+fn splitMinBad(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_SPLIT_MIN")) return "many";
+    return null;
+}
+
+test "TF_GLM_SPLIT_MIN is read, refused when not a row count, and part of what the ranks agree on" {
+    var problem: []const u8 = "";
+    const s = try Settings.read(&splitMin, &problem);
+    try std.testing.expect(s.split and s.split_min == 256);
+    const d = try Settings.read(&ringed, &problem);
+    const fs = Fingerprint.of(2, 0, s, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
+    const fd = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
+    try std.testing.expect(fs.split != fd.split and fd.split == 1 and d.split_min == 0);
+    try std.testing.expectError(error.BadSetting, Settings.read(&splitMinBad, &problem));
+}
+
 test "fingerprints: agreeing ranks pass; the first differing field and rank are named" {
     const h0: [32]u8 = @splat(1);
     const h1: [32]u8 = @splat(2);

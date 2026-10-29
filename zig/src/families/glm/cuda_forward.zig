@@ -201,6 +201,7 @@ pub const Forward = struct {
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
+    split_min: usize = 0, // TF_GLM_SPLIT_MIN: a piece of fewer rows glues whole (its exchanges cost more than they save)
     images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections
     l2pf: ?*l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch beside the stream
@@ -347,9 +348,9 @@ pub const Forward = struct {
         return cuda.rank_scatter.share(n, world, rank);
     }
 
-    /// Whether piece [lo, lo + n) splits (TF_GLM_PREFILL_REDUCE=split): at least one row for every rank.
+    /// Whether piece [lo, lo + n) splits (TF_GLM_PREFILL_REDUCE=split): a row for every rank and TF_GLM_SPLIT_MIN rows.
     pub fn splits(f: *const Forward, n: usize) bool {
-        return f.split and n >= f.ranks[0].w.share.world;
+        return f.split and n >= @max(f.ranks[0].w.share.world, f.split_min);
     }
 
     pub fn copy(f: *const Forward, stream: cuda.Stream, dst: u64, src: u64, bytes: usize) !void {

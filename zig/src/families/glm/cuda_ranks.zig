@@ -13,6 +13,7 @@ pub const Settings = struct {
     tiled: bool = true, // TF_GLM_MM: 1 (the bf16 linears on glm_mm, tiled at load) or 0
     split: bool = true, // TF_GLM_PREFILL_REDUCE: split (each rank glues its own rows), ring or gather
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
+    split_min: u32 = 0, // TF_GLM_SPLIT_MIN: a prompt piece of fewer rows glues whole (0: every piece of world rows splits)
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
@@ -62,6 +63,13 @@ pub const Settings = struct {
             s.pieces = std.fmt.parseInt(u32, v, 10) catch 0;
             if (s.pieces < 1 or s.pieces > 8) {
                 problem.* = "TF_GLM_OVERLAP_PIECES: 1 to 8";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_SPLIT_MIN")) |v| {
+            s.split_min = std.fmt.parseInt(u32, v, 10) catch 1 << 31;
+            if (s.split_min > 1 << 20) {
+                problem.* = "TF_GLM_SPLIT_MIN: the rows a prompt piece needs before its glue splits, 0 to 1048576";
                 return error.BadSetting;
             }
         }
@@ -121,7 +129,7 @@ pub const Fingerprint = extern struct {
     pages: u32 = 0, // TF_KV_PAGES: the engine's own sequence is made on pages at init, so every rank pages alike
     prompt_fixed_k: u32,
     tiled: u32,
-    split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring
+    split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring; TF_GLM_SPLIT_MIN above bit 4
     kda_wide: u32,
     pieces: u32,
     pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
@@ -185,7 +193,7 @@ pub const Fingerprint = extern struct {
             .rank = @intCast(rank),
             .prompt_fixed_k = @intFromBool(s.prompt_fixed_k),
             .tiled = @intFromBool(s.tiled),
-            .split = if (!s.split) 0 else if (s.ring) 2 else 1,
+            .split = @as(u32, if (!s.split) 0 else if (s.ring) 2 else 1) | s.split_min << 4,
             .kda_wide = @intFromBool(s.kda_wide),
             .pieces = s.pieces,
             .pair = @intFromBool(s.pair),

@@ -29,6 +29,7 @@ const fw = struct {
         split: bool,
         kda_wide: bool,
         ring: bool = false,
+        split_min: usize = 0,
         taps: ?Taps = null,
         pub fn run(f: *Forward, ids: []const i32) !void {
             observed_ring = f.ring;
@@ -69,7 +70,7 @@ const engine = struct {
         seqs: [32]Seq = @splat(.{}),
         bp: fw.Buffers,
         share: struct { vocab: Vocab = .{} } = .{},
-        settings: struct { split: bool = true, ring: bool = true, kda_wide: bool = true } = .{},
+        settings: struct { split: bool = true, ring: bool = true, split_min: u32 = 0, kda_wide: bool = true } = .{},
         d: u8 = 0,
         m: u8 = 0,
         stream: u8 = 0,
