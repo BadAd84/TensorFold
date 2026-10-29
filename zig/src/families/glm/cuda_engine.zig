@@ -33,22 +33,24 @@ const pair_bytes = 16;
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
 
-/// Where a prompt chunk from `start` ends: `prompt_rows` on, the prompt's end, or the first mark past `start` (a chunk
-/// starts at each mark, where its state is kept).
+/// Where a prompt chunk from `start` ends: the next multiple of `prompt_rows`, the prompt's end, or the first mark past
+/// `start`. A start off that grid (a resume or a mark) ends on it, so the chunks after it start aligned and can pair.
 pub fn chunkEnd(start: usize, len: usize, marks: []const u32) usize {
-    var end = @min(len, start + prompt_rows);
+    var end = @min(len, (start / prompt_rows + 1) * prompt_rows);
     for (marks) |m| {
         if (m > start and m < end) end = m;
     }
     return end;
 }
 
-test "a prompt chunk ends at its rows, the prompt's end or the first mark past its start" {
-    try std.testing.expectEqual(@as(usize, prompt_rows), chunkEnd(0, 9000, &.{}));
-    try std.testing.expectEqual(@as(usize, 9000), chunkEnd(9000 - prompt_rows, 9000, &.{}));
-    try std.testing.expectEqual(@as(usize, 7000), chunkEnd(6144, 7000, &.{}));
-    try std.testing.expectEqual(@as(usize, 5001), chunkEnd(4096, 9000, &.{ 9, 5003, 5001, 4096 }));
-    try std.testing.expectEqual(@as(usize, 7049), chunkEnd(5001, 9000, &.{ 5001, 7049 })); // its own start does not cut
+test "a prompt chunk ends on the chunk grid, at the prompt's end or at the first mark past its start" {
+    const C = prompt_rows;
+    try std.testing.expectEqual(C, chunkEnd(0, 9 * C, &.{}));
+    try std.testing.expectEqual(2 * C + 100, chunkEnd(2 * C, 2 * C + 100, &.{}));
+    try std.testing.expectEqual(2 * C, chunkEnd(C + 9, 9 * C, &.{})); // a resume at C + 9 realigns at 2C
+    try std.testing.expectEqual(C, chunkEnd(9, 9 * C, &.{})); // the template's row 9: the rest of the first chunk
+    try std.testing.expectEqual(C + 903, chunkEnd(C, 9 * C, &.{ 9, C + 905, C + 903, C }));
+    try std.testing.expectEqual(C + 900, chunkEnd(C + 3, 9 * C, &.{ C + 3, C + 900 })); // its own start does not cut
 }
 pub const max_together = @import("cuda_state.zig").prompt_heads;
 pub const Prompt = struct { slot: u32, ids: []const u32 };
