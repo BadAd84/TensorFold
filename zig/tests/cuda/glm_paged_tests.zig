@@ -101,6 +101,59 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
         try x.release(paged_slot);
         try x.release(twin_slot);
     }
+    // prompts stepped through Leader.chunk with marks off every page and pool edge, as the prompt cache cuts them
+    const Nop = struct {
+        fn call(_: *anyopaque, _: u32) void {}
+    };
+    var nop: u8 = 0;
+    const cuts = [_]u32{ 1001, 2049, 3337, 4097, 6151 };
+    var stepped: usize = 0;
+    for ([_]usize{ 5000, 9001 }, 0..) |len, k| {
+        const marks: glm.engine.Marks = .{ .at = cuts[0..], .ctx = &nop, .call = Nop.call };
+        const ids = try a.alloc(u32, len);
+        for (ids, 0..) |*u, i| u.* = @intCast(100 + (i * 7919 + k * 97) % 5000);
+        const held = try pages.open(paged_slot, len, 64);
+        var first: [2]u32 = .{ 0, 0 };
+        var drafts: [2][glm.engine.max_drafts]u32 = undefined;
+        for ([_]u32{ paged_slot, twin_slot }, 0..) |slot, j| {
+            try x.bind(slot);
+            if (slot == paged_slot) try x.beginOn(null, held) else try x.begin(null);
+            var start: usize = 0;
+            while (start < len) {
+                const step = try x.chunk(ids, start, false, null, null, marks);
+                start += step.rows;
+                if (step.first) |f| first[j] = f;
+                stepped += @intFromBool(j == 0);
+            }
+            try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
+            try x.draft(true, &.{first[j]}, 2, &drafts[j]);
+        }
+        if (first[0] != first[1] or !std.mem.eql(u16, mine[0..V], twin[0..V]) or !std.mem.eql(u32, drafts[0][0..2], drafts[1][0..2])) {
+            std.debug.print("FAIL paged: a {d}-token prompt cut at marks: first token {d}, logits or drafts differ from its twin's ({d})\n", .{ len, first[0], first[1] });
+            failed = true;
+        }
+        for (0..3) |round| {
+            const rows = 1 + round % 4;
+            var w: [4]u32 = undefined;
+            for (w[0..rows], 0..) |*u, r| u.* = @intCast(100 + (round * 37 + k * 11 + r * 13) % 5000);
+            var outs: [2][4]u32 = undefined;
+            for ([_]u32{ paged_slot, twin_slot }, 0..) |slot, j| {
+                try x.bind(slot);
+                try x.verify(w[0..rows], outs[j][0..rows], 0);
+                try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bd.logits, rows * V * 2), "cuMemcpyDtoH");
+                try x.keep(rows);
+                try x.draft(false, outs[j][0..rows], 2, &drafts[j]);
+            }
+            if (!std.mem.eql(u16, mine[0 .. rows * V], twin[0 .. rows * V]) or !std.mem.eql(u32, outs[0][0..rows], outs[1][0..rows])) {
+                std.debug.print("FAIL paged: a {d}-token prompt cut at marks: window {d} differs from its twin's\n", .{ len, round });
+                failed = true;
+            }
+            compared += rows;
+        }
+        try x.release(paged_slot);
+        try x.release(twin_slot);
+    }
+    std.debug.print("paged: {d} prompt steps cut at marks off the page and pool edges\n", .{stepped});
     x.release(shuffled) catch {};
     const c = pages.pool.census();
     if (!pages.pool.idle() or c.free != c.total) {
