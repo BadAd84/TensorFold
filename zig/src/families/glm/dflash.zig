@@ -331,6 +331,21 @@ pub fn ingestsNone(start: usize, rows: usize, len: usize) bool {
     return start + rows <= len -| @as(usize, @intCast(WIN));
 }
 
+/// Whether a prompt pass may split its glue: not where the drafter reads its taps, which need every row's residual.
+pub fn splitsPrompt(split: bool, drafting: bool, start: usize, rows: usize, len: usize) bool {
+    return split and (!drafting or ingestsNone(start, rows, len));
+}
+
+test "a prompt pass keeps every row's residual on every rank wherever the drafter reads its taps" {
+    const w: usize = @intCast(WIN);
+    try std.testing.expect(splitsPrompt(true, false, 0, 2048, 100_000)); // no drafter: the setting stands
+    try std.testing.expect(splitsPrompt(true, true, 0, 2048, 100_000)); // ends before the drafter's window
+    try std.testing.expect(!splitsPrompt(true, true, 100_000 - w, 2048, 100_000)); // inside it
+    try std.testing.expect(!splitsPrompt(true, true, 100_000 - w - 1, 2048, 100_000)); // its last row is inside
+    try std.testing.expect(!splitsPrompt(true, true, 0, 40, 40)); // a short prompt: all of it
+    try std.testing.expect(!splitsPrompt(false, false, 0, 2048, 100_000)); // gather: never split
+}
+
 /// Prompt context retained in the window; row0 is only a tap-buffer offset, never a sequence position.
 pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, row0: usize) !?Run {
     if (start > len or rows > len - start) return error.BadPromptContext;
