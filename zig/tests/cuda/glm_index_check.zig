@@ -20,6 +20,15 @@ const cases = [_]Case{
     .{ .cap = 65536, .pos = 4 * 65536 - 520, .rows = 512 },
     .{ .cap = 147456, .pos = 4 * 147456 - 520, .rows = 512 }, // a cap off the power of two
     .{ .cap = 262144, .pos = 4 * 262144 - 520, .rows = 512 },
+    // decode windows (TF_GLM_INDEX_CUDA=all): one 64-pool tile a CTA, the window's rows sharing it
+    .{ .cap = 4096, .pos = 300, .rows = 3 }, // fewer than 512 visible pools: each row takes all it sees
+    .{ .cap = 1024, .pos = 4 * 1024 - 10, .rows = 2 },
+    .{ .cap = 4096, .pos = 4 * 4096 - 20, .rows = 8, .heads = 20 },
+    .{ .cap = 16384, .pos = 4 * 16384 - 40, .rows = 9, .paged = true },
+    .{ .cap = 65536, .pos = 4 * 65536 - 40, .rows = 33, .bits = true },
+    .{ .cap = 147456, .pos = 4 * 147456 - 9, .rows = 1 },
+    .{ .cap = 262144, .pos = 4 * 149000, .rows = 4 }, // 596k tokens, the agents' depth
+    .{ .cap = 262144, .pos = 4 * 262144 - 20, .rows = 16 }, // 1M tokens
 };
 
 fn bf16(x: f32) u16 {
@@ -72,7 +81,7 @@ pub fn run(gpu: check.Gpu) !void {
     var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);
     defer ops.unload();
     const ks = try glm.glue.Kernels.load(glue_mod);
-    var idx = try glm.index.Kernels.load(gpu.d, cuda.kernels.glm_index, .both);
+    var idx = try glm.index.Kernels.load(gpu.d, cuda.kernels.glm_index, .all);
     defer idx.unload();
     var idx_scores = idx; // TF_GLM_INDEX_CUDA=scores: the kernels' scores, tf_glm_select_rows' pools
     idx_scores.select = false;
