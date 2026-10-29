@@ -39,10 +39,16 @@ pub fn wanted(on: bool, world: usize) bool {
     return on and world > 1;
 }
 
+/// The second chunk's rows of a pair at `start`: from a's end to Engine.chunkEnd (a mark inside b ends it there).
+pub fn pairRows(start: usize, len: usize, marks: []const u32) usize {
+    const next = start + fw.prefill_rows;
+    return if (next >= len) 0 else engine.chunkEnd(next, len, marks) - next;
+}
+
 /// Whether a step at `start` of a `len`-id prompt takes the next chunk too: min_rows or more there, and no mark at it.
 pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool {
     const next = start + fw.prefill_rows;
-    if (next >= len or len - next < @max(min_rows, world)) return false;
+    if (next >= len or pairRows(start, len, marks) < @max(min_rows, world)) return false;
     return std.mem.indexOfScalar(u32, marks, @intCast(next)) == null;
 }
 
@@ -52,29 +58,33 @@ pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
     return start + ra > base + ring or start + ra + rb <= base + ring;
 }
 
-/// Whether a pair at `start` leaves a drafter nothing to read: both chunks end before the prompt rows it ingests.
-fn drafterIdle(e: *const Engine, start: usize, len: usize) bool {
+/// Whether a pair of `rows` at `start` leaves a drafter nothing to read: both chunks end before the rows it ingests.
+fn drafterIdle(e: *const Engine, start: usize, rows: usize, len: usize) bool {
     if (e.drafter == null) return true;
-    return dflash.ingestsNone(start, fw.prefill_rows + @min(len -| (start + fw.prefill_rows), fw.prefill_rows), len);
+    return dflash.ingestsNone(start, rows, len);
 }
 
-/// Rank 0's choice for the step at `start` (the others take the ids it sends); a drafter's rows, prompt rows or prof: no.
+/// Rank 0's choice for the step at `start` (the others take the rows it sends); a drafter's rows, prompt rows or prof: no.
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
-    if (e.pair == null or !e.settings.pair or !drafterIdle(e, start, len) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+    if (e.pair == null or !e.settings.pair or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
-    if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
+    const at: []const u32 = if (marks) |m| m.at else &.{};
+    if (!takesTwo(start, len, e.share.world, at)) return false;
+    const rb = pairRows(start, len, at);
+    if (!drafterIdle(e, start, fw.prefill_rows + rb, len)) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
     const base = if (from) |r| (e.snaps.get(r.id) orelse return false).bases[0] else e.cur.st.base;
-    return ringsAgree(base, e.cur.st.ring_rows, start, @min(len - start - fw.prefill_rows, fw.prefill_rows));
+    return ringsAgree(base, e.cur.st.ring_rows, start, rb);
 }
 
-/// Engine.prefillChunk of two chunks (`part`: both, then the next id): one pass, then each chunk's MTP rows and commit.
-pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks, split: bool) !?u32 {
+/// Engine.prefillChunk of two chunks, `rows` from `start` (`part`: their ids, then the next id): one pass, then each
+/// chunk's MTP rows and commit.
+pub fn prefill(e: *Engine, part: []const u32, start: usize, rows: usize, len: usize, cancel: ?engine.Cancel, marks: ?engine.Marks, split: bool) !?u32 {
     const ra: usize = fw.prefill_rows;
-    if (len <= start + ra) return error.BadChunk;
-    const rb: usize = @min(len - start - ra, fw.prefill_rows);
+    if (rows <= ra or rows > 2 * ra or rows > len - start) return error.BadChunk;
+    const rb: usize = rows - ra;
     const pair = if (e.pair) |*p| p else return error.BadChunk;
-    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or !drafterIdle(e, start, len) or e.prompt_logprobs != null) return error.BadChunk;
+    if (rb < e.share.world or part.len != @min(len - start, rows + 1) or !drafterIdle(e, start, rows, len) or e.prompt_logprobs != null) return error.BadChunk;
     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     e.gate(cancel) catch |err| {
@@ -139,6 +149,10 @@ test "a prompt step takes the next chunk when it holds min_rows or more and no k
     try std.testing.expect(takesTwo(2 * C, 5 * C, 3, &.{}));
     try std.testing.expect(!takesTwo(0, 3 * C, 3, &.{C})); // a state kept at the next chunk's start: that chunk starts a step
     try std.testing.expect(takesTwo(0, 3 * C, 3, &.{ 2 * C, 3 * C })); // marks past the pair
+    try std.testing.expect(!takesTwo(0, 3 * C, 3, &.{C + min_rows - 1})); // a mark leaves b too short: alone
+    try std.testing.expect(takesTwo(0, 3 * C, 3, &.{C + min_rows})); // a mark inside b ends the pair there
+    try std.testing.expectEqual(@as(usize, min_rows), pairRows(0, 3 * C, &.{C + min_rows}));
+    try std.testing.expectEqual(@as(usize, C), pairRows(0, 3 * C, &.{}));
 }
 
 test "a pair rebases the index rings where a chunk at a time would, so a ring based at chunk 0 pairs from chunk 2" {

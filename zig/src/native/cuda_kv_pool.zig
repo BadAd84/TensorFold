@@ -250,7 +250,8 @@ fn hostBudget(o: api.Open, bytes: u64) u64 {
 /// Startup facts use the actual family planner without changing any budget, store or allocation.
 pub fn capacity(comptime F: type, loaded: anytype, k: Kept, window: u64) ?api.PromptCacheCapacity {
     if (comptime !@hasDecl(F, "snap_min_bytes")) return null;
-    if (window <= F.snap_grid) return null;
+    const floor: u64 = if (@hasDecl(F, "snap_grid")) F.snap_grid else F.snap_min_rows; // a window that keeps no state
+    if (window <= floor) return null;
     const minimum = F.snap_min_bytes(loaded.target);
     if (minimum == 0 or minimum == std.math.maxInt(u64)) return null;
     return .{ .budget_bytes = k.copied, .minimum_state_bytes = minimum };

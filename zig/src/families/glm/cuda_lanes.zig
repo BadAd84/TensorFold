@@ -342,13 +342,13 @@ pub const Lanes = struct {
         };
     }
 
-    /// The stream's kept state, where its prompt pass starts (null: none, off the chunk grid, or no longer held).
+    /// The stream's kept state, where its prompt pass starts (null: none, not this prompt's prefix, or no longer held).
     fn resumeFrom(self: *Lanes, s: *lanes.Stream, len: usize) ?engine.Resume {
         const saved = s.reuse.saved orelse return null;
         const k: *const engine.Kept = @ptrCast(@alignCast(saved));
-        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or k.at % fw.prefill_rows != 0 or !self.x.e.holds(k.id)) {
+        if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !self.x.e.holds(k.id)) {
             s.reuse_failed = true;
-            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at or k.at % fw.prefill_rows != 0) error.SnapshotOutOfStep else error.SnapshotStale;
+            s.reuse_error = if (k.at == 0 or k.at >= len) error.SnapshotNotPrefix else if (k.at != s.reuse.at) error.SnapshotOutOfStep else error.SnapshotStale;
             return null;
         }
         s.cached = k.at;

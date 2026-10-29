@@ -32,6 +32,23 @@ const pair_bytes = 16;
 
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
+
+/// Where a prompt chunk from `start` ends: `prompt_rows` on, the prompt's end, or the first mark past `start` (a chunk
+/// starts at each mark, where its state is kept).
+pub fn chunkEnd(start: usize, len: usize, marks: []const u32) usize {
+    var end = @min(len, start + prompt_rows);
+    for (marks) |m| {
+        if (m > start and m < end) end = m;
+    }
+    return end;
+}
+
+test "a prompt chunk ends at its rows, the prompt's end or the first mark past its start" {
+    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 9000, &.{}));
+    try std.testing.expectEqual(@as(usize, 7000), chunkEnd(6144, 7000, &.{}));
+    try std.testing.expectEqual(@as(usize, 5001), chunkEnd(4096, 9000, &.{ 9, 5003, 5001, 4096 }));
+    try std.testing.expectEqual(@as(usize, 7049), chunkEnd(5001, 9000, &.{ 5001, 7049 })); // its own start does not cut
+}
 pub const max_together = @import("cuda_state.zig").prompt_heads;
 pub const Prompt = struct { slot: u32, ids: []const u32 };
 
@@ -336,32 +353,36 @@ pub const Engine = struct {
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
 
-    /// decode.prefill: `ids` in 2,048-row chunks, then the first token from the last row; `from` restores a kept state.
+    /// decode.prefill: `ids` in 2,048-row steps from its start, then the first token from the last row; `from` restores a
+    /// kept state. The steps are fixed: the other ranks run the same ids without the marks (a mark keeps only at a step).
     pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
         var start = try e.prefillStart(ids.len, from);
-        while (true) : (start += fw.prefill_rows) {
-            if (try e.prefillChunk(ids[start..@min(ids.len, start + fw.prefill_rows + 1)], start, ids.len, null, cancel, marks)) |first| return first;
+        while (true) {
+            const rows = @min(ids.len - start, fw.prefill_rows);
+            if (try e.prefillChunk(ids[start..@min(ids.len, start + rows + 1)], start, rows, ids.len, null, cancel, marks)) |first| return first;
+            start += rows;
         }
     }
 
-    /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
+    /// Where a prompt pass of `len` ids starts: 0, or `from`'s position (any row) with its kept state restored.
     fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
         if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
-        if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
+        if (r.at == 0 or r.at >= len) return error.BadResume;
         try e.restoreState(r.id);
         if (e.drafter) |dr| try dr.restart(e.slot, r.at); // the rows before it were never tapped
         return r.at;
     }
 
-    /// One chunk of a `len`-id prompt pass: `part` from `start` plus the next id; first token at the end, else null.
-    pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
+    /// One step of a `len`-id prompt pass: `rows` from `start` (one chunk, or a pair past a chunk's rows), `part` those
+    /// ids plus the next one; the first token at the end, else null. Rank 0 chooses `rows` (Leader.chunk), the others
+    /// take it from the step, so a chunk may start and end at any row: the prompt kernels give each row the same bits.
+    pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, rows: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
         const split = e.index_split; // this step's alone
         e.index_split = false;
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
-        if (start >= len or start % fw.prefill_rows != 0) return error.BadChunk;
-        const rows = @min(len - start, fw.prefill_rows);
-        if (part.len > rows + 1) return prompt_pair.prefill(e, part, start, len, cancel, marks, split);
+        if (start >= len or rows == 0 or rows > len - start) return error.BadChunk;
+        if (rows > fw.prefill_rows) return prompt_pair.prefill(e, part, start, rows, len, cancel, marks, split);
         if (part.len != @min(len - start, rows + 1)) return error.BadChunk;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bp, &one);

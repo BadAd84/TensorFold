@@ -27,8 +27,9 @@ pub fn copyProposers() ?copy.Factory {
 pub const default_context: i64 = 8192;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
-/// Prompt kernels change arithmetic with a chunk's rows: states keep and resume only on chunk starts.
-pub const snap_grid: u32 = prompt_rows;
+/// No snap_grid: a prompt row's bits do not depend on its chunk's rows or start (cuda_engine.chunkEnd cuts at marks), so
+/// states keep and resume at any row. The smallest prompt a state is sized for at admission:
+pub const snap_min_rows: u32 = prompt_rows;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 
@@ -337,9 +338,9 @@ pub fn snap_bytes(ptr: *anyopaque, at: u32) u64 {
     return e.stateBytes(at);
 }
 
-/// The first legal chunk mark, with the same page rounding and possible head window used by cache admission.
+/// A state at snap_min_rows, with the same page rounding and possible head window used by cache admission.
 pub fn snap_min_bytes(ptr: *anyopaque) u64 {
-    return snap_bytes(ptr, snap_grid);
+    return snap_bytes(ptr, snap_min_rows);
 }
 
 /// Reserve every spare page inside the admitted cache budget before requests can enter either rank.

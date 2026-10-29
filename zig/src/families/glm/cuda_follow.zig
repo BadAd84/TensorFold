@@ -19,7 +19,7 @@ pub const Header = extern struct {
     kind: u32,
     n: u32 = 0, // ids that follow
     depth: u32 = 0, // draft: drafts to chain; chunk: where it starts; shared: its parts
-    flags: u32 = 0, // begin: sampled; draft: from the prompt; prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2); verify, shared: whole rows
+    flags: u32 = 0, // begin: sampled; draft: from the prompt; prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), its rows (bits 16 and up); verify, shared: whole rows
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
     temperature: f64 = 0,
@@ -230,17 +230,21 @@ pub const Leader = struct {
         return x.e.prefill(ids, from, cancel, marks);
     }
 
-    /// One prompt step on every rank (Engine.prefillChunk): a chunk, or two when `pair` and Engine.pairedAt allow.
+    /// One prompt step on every rank (Engine.prefillChunk): a chunk to Engine.chunkEnd, or two when `pair` and
+    /// Engine.pairedAt allow; its rows travel in the step, so every rank cuts where this one does.
     pub fn chunk(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
         if (start >= ids.len) return error.BadChunk;
         try x.flush();
-        const n: usize = if (pair and x.e.pairedAt(start, ids.len, from, marks)) 2 else 1;
-        const part = ids[start..@min(ids.len, start + n * engine.prompt_rows + 1)];
+        const at: []const u32 = if (marks) |m| m.at else &.{};
+        const a_end = engine.chunkEnd(start, ids.len, at);
+        const two = pair and a_end == start + engine.prompt_rows and x.e.pairedAt(start, ids.len, from, marks);
+        const n = (if (two) engine.chunkEnd(a_end, ids.len, at) else a_end) - start; // this step's rows
+        const part = ids[start..@min(ids.len, start + n + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
-        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intCast(n)) << 16, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
         x.e.index_split = split;
-        const first = try x.e.prefillChunk(part, start, ids.len, from, cancel, marks);
-        return .{ .first = first, .rows = @min(ids.len - start, n * engine.prompt_rows) };
+        const first = try x.e.prefillChunk(part, start, n, ids.len, from, cancel, marks);
+        return .{ .first = first, .rows = n };
     }
 
     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
@@ -330,6 +334,11 @@ fn indexSplit(h: Header) bool {
     return kind == .chunk and h.flags & 2 != 0;
 }
 
+/// A prompt step's rows (Leader.chunk): rank 0's cut, which may end at a mark, so no rank re-derives it.
+fn chunkRows(h: Header) usize {
+    return h.flags >> 16;
+}
+
 /// A verify step under a grammar (Engine.structured): this rank's columns join the gather of each draw's whole rows.
 fn structuredStep(h: Header) bool {
     const kind: Kind = @fromBackingInt(@intCast(h.kind));
@@ -371,7 +380,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
                 e.index_split = indexSplit(h);
-                _ = e.prefillChunk(ids, h.depth, h.top_k, from, null, null) catch |err| switch (err) {
+                _ = e.prefillChunk(ids, h.depth, chunkRows(h), h.top_k, from, null, null) catch |err| switch (err) {
                     error.Cancelled => {},
                     else => return err,
                 };
@@ -500,6 +509,12 @@ test "flag 1 asks for prompt rows on prefill and chunk steps only (begin's is sa
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.chunk), .depth = 2048, .top_k = 4000 }));
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.begin), .flags = 1, .seed = 7 }));
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.draft), .flags = 1, .depth = 3 }));
+}
+test "a chunk step carries its rows above the prompt-rows and split flags, up to a pair's" {
+    const h: Header = .{ .kind = @backingInt(Kind.chunk), .flags = 1 | 2 | 2953 << 16, .depth = 4096, .top_k = 9000 };
+    try std.testing.expectEqual(@as(usize, 2953), chunkRows(h));
+    try std.testing.expect(promptRows(h) and indexSplit(h));
+    try std.testing.expectEqual(@as(usize, 2 * engine.prompt_rows), chunkRows(.{ .kind = @backingInt(Kind.chunk), .flags = @as(u32, 2 * engine.prompt_rows) << 16 }));
 }
 
 test "flag 1 on verify and shared steps draws from whole rows; a prompt step's flag 1 does not" {
