@@ -125,7 +125,7 @@ pub const Rows = struct {
         r.settle();
         r.stamp();
         r.sync_writes = o.sync_writes or (if (platform.c.getenv("TENSORFOLD_ROWS_SYNC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false);
-        r.staging_bytes = o.staging_bytes;
+        r.staging_bytes = stagingBytes(o.staging_bytes, if (platform.c.getenv("TENSORFOLD_ROWS_STAGING_GIB")) |v| std.mem.span(v) else null);
         r.next_job = @truncate(@as(u128, @intCast(write.nowNs())));
         r.verify = if (platform.c.getenv("TF_IMPRINT_VERIFY")) |v| v[0] == '1' else false;
         return r;
@@ -595,4 +595,23 @@ test {
     _ = @import("rows_pool_select_test.zig");
     _ = @import("rows_prefetch.zig");
     _ = @import("rows_prefetch_stack_test.zig");
+}
+
+/// TENSORFOLD_ROWS_STAGING_GIB: the host bytes the write worker stages at once (a save larger than that is skipped, so a
+/// long conversation's state needs it raised); unset: `default`, the caller's option.
+fn stagingBytes(default: u64, text: ?[]const u8) u64 {
+    const t = text orelse return default;
+    const g = std.fmt.parseFloat(f64, t) catch 0;
+    if (!(g > 0 and g <= 1024)) {
+        std.log.warn("TENSORFOLD_ROWS_STAGING_GIB={s}: give GiB above 0 and at most 1024; staging stays {d} MiB", .{ t, default >> 20 });
+        return default;
+    }
+    return @intFromFloat(g * (1 << 30));
+}
+
+test "TENSORFOLD_ROWS_STAGING_GIB raises the staging permit; unset or unreadable keeps the caller's" {
+    try std.testing.expectEqual(@as(u64, 1 << 30), stagingBytes(1 << 30, null));
+    try std.testing.expectEqual(@as(u64, 8 << 30), stagingBytes(1 << 30, "8"));
+    try std.testing.expectEqual(@as(u64, 3 << 29), stagingBytes(1 << 30, "1.5"));
+    for ([_][]const u8{ "0", "-2", "x", "2000" }) |bad| try std.testing.expectEqual(@as(u64, 1 << 30), stagingBytes(1 << 30, bad));
 }
