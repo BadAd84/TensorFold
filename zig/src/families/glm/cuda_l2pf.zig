@@ -81,7 +81,6 @@ const Group = struct {
     }
 };
 
-
 pub const Site = struct { first: u32, count: u32, grid: u32 };
 
 pub const Prefetch = struct {
@@ -379,5 +378,4 @@ pub const Prefetch = struct {
         try main.wait(p.join_ev);
         p.forked = false;
     }
-
 };

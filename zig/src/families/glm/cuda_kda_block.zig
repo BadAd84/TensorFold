@@ -69,7 +69,6 @@ pub var pad_to: usize = 0;
 pub var dump_driver: ?*const cuda.Driver = null;
 pub var dump_path: ?[*:0]const u8 = null;
 
-
 pub fn rowWidth(own_heads: usize, max_heads: usize) usize {
     if (pad_to != 0) return pad_to;
     const heads = @max(own_heads, max_heads);
