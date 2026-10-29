@@ -25,7 +25,8 @@ pub fn agree(e: anytype, budget: u64) !void {
 }
 
 pub fn bytes(e: anytype, at: usize) u64 {
-    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64)) else null;
+    // the head's rows as keepAs plans them: none while it absorbs nothing (DFlash2 drafting), so mtp_len stays 0
+    const head: ?usize = if (!e.mtp) null else if (!e.head) 0 else @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64));
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
     return pages.rounded(n) catch std.math.maxInt(u64);
