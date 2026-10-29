@@ -33,11 +33,19 @@ test "GLM prompt rows: tiled packed heads use the forward policy" {
     try std.testing.expect(set.prompt);
 }
 test "GLM prompt rows: requests for rows cannot enter the unscored batch path" {
-    const S = struct { images: []const u8 = &.{}, reuse: struct { saved: ?*u8 = null } = .{}, prompt_len: usize = 19, prompt_logprobs: ?u8 = null };
+    const S = struct { images: []const u8 = &.{}, reuse: struct { saved: ?*u8 = null, marks: []const u32 = &.{} } = .{}, prompt_len: usize = 19, prompt_logprobs: ?u8 = null };
     var s: S = .{};
     try std.testing.expect(glm.lanes.canBatch(&s));
     s.prompt_logprobs = 2;
     try std.testing.expect(!glm.lanes.canBatch(&s));
+}
+
+test "GLM prompt rows: a prompt with a cache mark inside it is not batched (the batch fires no mark)" {
+    const S = struct { images: []const u8 = &.{}, reuse: struct { saved: ?*u8 = null, marks: []const u32 = &.{} } = .{}, prompt_len: usize = 2088, prompt_logprobs: ?u8 = null };
+    var s: S = .{ .reuse = .{ .marks = &.{2048} } }; // the disk tier's probe: snap_min_rows + 40 tokens, kept at 2,048
+    try std.testing.expect(!glm.lanes.canBatch(&s));
+    s.reuse.marks = &.{2088}; // at its end: the pass keeps that state itself
+    try std.testing.expect(glm.lanes.canBatch(&s));
 }
 
 test "GLM prompt rows: reservation failure happens before a prompt step" {
@@ -99,6 +107,9 @@ const Heads = struct {
     fn copy(_: u64, _: u64, _: usize, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
         return 0;
     }
+    fn copy2d(_: *const cuda.abi.Memcpy2D, _: cuda.abi.Stream) callconv(.c) cuda.abi.Result {
+        return 0;
+    }
     fn group() callconv(.c) cuda.nccl.Result {
         return 0;
     }
@@ -109,6 +120,7 @@ const Heads = struct {
     fn score(d: *cuda.Driver, output: Output, rank_: usize) !void {
         d.api.cuLaunchKernel = launch;
         d.api.cuMemcpyDtoDAsync_v2 = copy;
+        d.api.cuMemcpy2DAsync_v2 = copy2d; // the sampler places each rank's columns with one strided copy (0a77dcd7d)
         var lib: cuda.nccl.Library = undefined;
         lib.api.ncclGroupStart = group;
         lib.api.ncclGroupEnd = group;

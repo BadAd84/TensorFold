@@ -571,7 +571,9 @@ comptime {
     std.debug.assert(max_rows <= fw.window_rows);
 }
 
-/// Eligibility for the maintained fresh-prompt batching path.
+/// Eligibility for the maintained fresh-prompt batching path: one pass that fires no mark, so none may fall inside.
 pub fn canBatch(s: anytype) bool {
-    return s.prompt_logprobs == null and s.images.len == 0 and s.reuse.saved == null and s.prompt_len <= engine.prompt_rows;
+    if (s.prompt_logprobs != null or s.images.len != 0 or s.reuse.saved != null or s.prompt_len > engine.prompt_rows) return false;
+    for (s.reuse.marks) |m| if (m > 0 and m < s.prompt_len) return false; // a kept state the batch would skip
+    return true;
 }
