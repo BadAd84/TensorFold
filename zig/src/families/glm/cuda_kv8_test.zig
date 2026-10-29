@@ -80,14 +80,29 @@ const Launch = struct {
     var ids: [16]usize = undefined;
     var blocks: [16]u32 = undefined;
     var scales: [16]u64 = undefined;
+    var tables: [16]u64 = undefined; // the page table each latent write or read was given (0: in order)
+    var steps: [16]i64 = undefined; // and its page step in bytes
+    fn arg(comptime T: type, args: ?[*]?*anyopaque, i: usize) T {
+        return @as(*const T, @ptrCast(@alignCast(args.?[i].?))).*;
+    }
     fn run(f: cuda.abi.Function, _: c_uint, _: c_uint, _: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
         const id = @intFromPtr(f);
         ids[n] = id;
         blocks[n] = bx;
-        scales[n] = if (id == 2) @as(*const u64, @ptrCast(@alignCast(args.?[3].?))).* else if (id == 4 or id == 6)
-            @as(*const u64, @ptrCast(@alignCast(args.?[2].?))).*
-        else
-            0;
+        scales[n] = switch (id) {
+            2 => arg(u64, args, 3),
+            4, 6 => arg(u64, args, 2),
+            else => 0,
+        };
+        // lat_write (1) and lat_write_fp8 (2): ..., pt, ps last; chunks (3, 5) after sparse at 13, FP8 (4, 6) at 14
+        const at: ?usize = switch (id) {
+            1, 2 => 5,
+            3, 5 => 13,
+            4, 6 => 14,
+            else => null,
+        };
+        tables[n] = if (at) |i| arg(u64, args, i) else 0;
+        steps[n] = if (at) |i| arg(i64, args, i + 1) else 0;
         n += 1;
         return 0;
     }
@@ -114,6 +129,7 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
     try t.expectEqualSlices(usize, &.{ 1, 2 }, Launch.ids[0..2]);
     try t.expectEqualSlices(u32, &.{ 128, 512 }, Launch.blocks[0..2]);
     try t.expectEqual(@as(u64, 400), Launch.scales[1]);
+    try t.expectEqualSlices(u64, &.{ 0, 0 }, Launch.tables[0..2]); // a window: no table for either format
     const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
     for ([_]usize{ 16, 32 }) |hb| for ([_]u64{ 0, 400 }) |scale| {
         Launch.n = 0;
@@ -128,22 +144,43 @@ test "GLM FP8 KV: real launchers preserve BF16 ABI and pass FP8 scale pointers f
     try t.expectEqual(@as(u64, 400), Launch.scales[0]);
 }
 
-test "GLM FP8 KV: an FP8 cache takes no page table, so its writes and reads refuse one before they launch" {
+test "GLM FP8 KV on pages: writes and dense and sparse reads launch the FP8 kernels with the stream's table" {
     const glue = @import("cuda_glue.zig");
     const latent = @import("cuda_latent.zig");
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Launch.run;
     var ks: glue.Kernels = undefined;
     inline for (@typeInfo(glue.Kernels).@"struct".field_names) |name| @field(ks, name) = .{ .d = &d, .handle = @ptrFromInt(10) };
+    ks.lat_write = .{ .d = &d, .handle = @ptrFromInt(1) };
+    ks.lat_write_fp8 = .{ .d = &d, .handle = @ptrFromInt(2) };
+    ks.chunks_16 = .{ .d = &d, .handle = @ptrFromInt(3) };
+    ks.chunks_16_fp8 = .{ .d = &d, .handle = @ptrFromInt(4) };
+    ks.chunks_32 = .{ .d = &d, .handle = @ptrFromInt(5) };
+    ks.chunks_32_fp8 = .{ .d = &d, .handle = @ptrFromInt(6) };
+    ks.merge = .{ .d = &d, .handle = @ptrFromInt(7) };
     const set: glue.Set = .{ .glue = &ks };
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const paged: latent.Table = .{ .pt = 900, .ps = 6_684_672, .page_rows = 6_528 };
+    const page: u64 = 12 * (512 * 512 + 512 * 4 + 128 * 128 * 2); // GLM-5.3-Flash's 11 DSA layers and the MTP layer
+    const paged: latent.Table = .{ .pt = 900, .ps = page, .page_rows = page / 512 };
     const p: latent.Partials = .{ .po = 1000, .pm = 2000, .pl = 3000 };
     Launch.n = 0;
-    try t.expectError(error.Fp8OnPages, latent.latentWriteFormat(set, stream, 100, 512, 200, 400, paged, 300, 3, 512));
-    try t.expectError(error.Fp8OnPages, latent.attentionFormat(set, stream, 100, 200, 400, paged, 300, p, 500, 600, 3, 32, 512, 1, 0.125, 16));
-    try t.expectError(error.Fp8OnPages, latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, p, 700, 3, 32, 512, 0.125));
-    try t.expectEqual(@as(usize, 0), Launch.n);
+    try latent.latentWriteFormat(set, stream, 100, 512, 200, 400, paged, 300, 3, 512);
+    try t.expectEqual(@as(usize, 2), Launch.ids[0]);
+    try t.expectEqual(@as(u64, 900), Launch.tables[0]);
+    try t.expectEqual(@as(i64, @intCast(page)), Launch.steps[0]);
+    for ([_]usize{ 16, 32 }) |hb| {
+        Launch.n = 0;
+        try latent.attentionFormat(set, stream, 100, 200, 400, paged, 300, p, 500, 600, 3, 32, 512, 1, 0.125, hb);
+        try t.expectEqual(@as(usize, if (hb == 16) 4 else 6), Launch.ids[0]);
+        try t.expectEqual(@as(u64, 400), Launch.scales[0]);
+        try t.expectEqual(@as(u64, 900), Launch.tables[0]);
+        try t.expectEqual(@as(i64, @intCast(page)), Launch.steps[0]);
+    }
+    Launch.n = 0;
+    try latent.sparseAttentionFormat(set, stream, 100, 200, 400, paged, 500, 600, 2051, p, 700, 3, 32, 512, 0.125);
+    try t.expectEqual(@as(usize, 4), Launch.ids[0]);
+    try t.expectEqual(@as(u64, 900), Launch.tables[0]);
+    try t.expectEqual(@as(i64, @intCast(page)), Launch.steps[0]);
 }
 
 const Ops = struct {

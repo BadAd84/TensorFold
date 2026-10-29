@@ -49,38 +49,13 @@ fn run(w: *World, rank: usize, world: usize, text: ?[]const u8, kv8: bool) !void
     return startup.open(std.testing.io, Place{ .rank = rank, .world = world }, text, Settings{ .kv8 = kv8 }, Watch{ .world = w, .rank = rank }, Args{ .world = w, .rank = rank }, construct);
 }
 
-fn refusal(rank: usize) !void {
-    for ([_][]const u8{ "on", "all", "1" }) |mode| {
-        var w: World = .{};
-        const peer = 1 - rank;
-        try run(&w, peer, 2, "auto", true);
-        try std.testing.expect(w.waiting[peer]);
-        try std.testing.expectError(error.Fp8OnPages, run(&w, rank, 2, mode, true));
-        try std.testing.expectEqualStrings("Fp8OnPages", w.refused[peer] orelse "waiting for missing rank");
-        try std.testing.expect(!w.waiting[peer]);
-        try std.testing.expect(w.connected[rank] and w.connected[peer]);
-        try std.testing.expect(!w.constructed[rank]);
-        try std.testing.expectEqual(@as(usize, 2), w.starts);
-        try std.testing.expectEqual(@as(usize, 1), w.notifications);
-    }
-}
-
-test "GLM startup: refusing rank zero promptly tells the waiting follower Fp8OnPages" {
-    try refusal(0);
-}
-
-test "GLM startup: refusing follower promptly tells waiting rank zero Fp8OnPages" {
-    try refusal(1);
-}
-
 test "GLM startup: valid modes reach construction with every other setting intact" {
     for ([_]bool{ false, true }) |kv8| for ([_][]const u8{ "auto", "off", "0", "on", "all" }) |mode| {
-        if (kv8 and (std.mem.eql(u8, mode, "on") or std.mem.eql(u8, mode, "all"))) continue;
         var w: World = .{};
         try run(&w, 0, 2, mode, kv8);
         try std.testing.expect(w.connected[0]);
         try std.testing.expect(w.constructed[0]);
-        try std.testing.expectEqual(try startup.paging(mode, 2, kv8), w.settings[0].?.pages);
+        try std.testing.expectEqual(startup.paging(mode, 2), w.settings[0].?.pages);
         try std.testing.expectEqual(kv8, w.settings[0].?.kv8);
         try std.testing.expectEqual(@as(u32, 37), w.settings[0].?.marker);
         try std.testing.expectEqual(@as(usize, 0), w.notifications);

@@ -48,11 +48,13 @@ pub const Plan = struct {
     }
 
     fn rows(p: *Plan, st: *const State, c: *const Config, x: cache.Caches, j: usize, at: usize) !void {
-        const latent = try std.math.mul(usize, at, @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1));
+        const row: usize = @as(usize, c.kv_lora) * @as(usize, if (x.ls == 0) 2 else 1); // BF16, or E4M3 codes
+        const latent = try std.math.mul(usize, at, row);
         const ring = try std.math.mul(usize, @min(at, st.ring_rows), st.ring_row);
         const pooled = try std.math.mul(usize, @min(at / sparse.pool + 2, x.pk_rows), @as(usize, c.i_dim) * 2);
-        try p.addCache(st, x, x.lc, latent, page_rows * @as(usize, c.kv_lora) * 2);
-        if (x.ls != 0) try p.add(st, x.ls, try std.math.mul(usize, at, @sizeOf(f32)));
+        try p.addCache(st, x, x.lc, latent, page_rows * row);
+        // FP8 scales: in the arena after the codes, or on pages after each page part's codes
+        if (x.ls != 0) try p.addCache(st, x, x.ls, try std.math.mul(usize, at, @sizeOf(f32)), page_rows * @sizeOf(f32));
         try p.add(st, st.rings[2 * j], ring);
         try p.add(st, st.rings[2 * j + 1], ring);
         try p.addCache(st, x, x.pk, pooled, page_rows / sparse.pool * @as(usize, c.i_dim) * 2);

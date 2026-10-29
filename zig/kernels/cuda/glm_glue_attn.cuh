@@ -78,12 +78,21 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
       if constexpr (FP8) {
-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc);
-        const float row_scale = ok ? scales[src] : 1.0f;
+        // a slab row's codes at src and its scale at scales[src]; on pages a part's 512 rows of codes, then their scales
+        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc) + src * LW;
+        const float* row_scales = scales + src;
+        if (pt && ok) {
+          static_assert(CH == 512, "a dense chunk is one page");
+          const int64_t off = sparse ? src % (pstep / LW) : ki - start;  // a sparse key is a row in pstep / LW rows a page
+          const unsigned char* page = reinterpret_cast<const unsigned char*>(lc) +
+                                      (sparse ? (src - off) * LW : (int64_t)pt[c] * pstep);
+          codes = page + off * LW;
+          row_scales = reinterpret_cast<const float*>(page + CH * LW) + off;
+        }
+        const float row_scale = ok ? *row_scales : 1.0f;
 #pragma unroll
         for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)codes[src * LW + u * 8 + j] |
-                                        ((uint16_t)codes[src * LW + u * 8 + j + 1] << 8) : 0;
+          const uint16_t bits = ok ? (uint16_t)codes[u * 8 + j] | ((uint16_t)codes[u * 8 + j + 1] << 8) : 0;
           const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
           dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
           dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
@@ -235,20 +244,21 @@ extern "C" __global__ void __launch_bounds__(256)
   glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
 }
 
-// E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math.
+// E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math; on pages (pt set)
+// each 512-row page part holds the rows' codes, then their scales.
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
-                         int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+                         int64_t rows, int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
   glm_attn::chunks_wide<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
-                                 po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+                                 po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
 }
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
-                         int64_t rows, int64_t heads, int64_t w, float scale, int sparse) {
+                         int64_t rows, int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
   glm_attn::chunks_wide<32, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
-                                 po, pm, pl, rows, heads, w, scale, sparse, nullptr, 0, scales);
+                                 po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
 }
 
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.

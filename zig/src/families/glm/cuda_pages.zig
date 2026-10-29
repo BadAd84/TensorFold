@@ -12,10 +12,11 @@ pub fn tableLen(capacity: usize) usize {
     return (capacity + state.page_rows - 1) / state.page_rows;
 }
 
-/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token.
+/// What a stream of engine `e` holds: its fixed part and table (and `extra`, its other buffers), 13,056 bytes a token
+/// (6,960 with FP8 KV).
 pub fn layout(gpa: std.mem.Allocator, e: *const Engine, extra: u64) !kv.Layout {
     const fixed = try state.State.pagedBytes(gpa, &e.w, e.capacity, tableLen(e.capacity));
-    const page = state.pageBytes(&e.w);
+    const page = state.pageBytes(&e.w, e.settings.kv8);
     return .{ .fixed_bytes = fixed + extra, .token_bytes = page / state.page_rows, .page_tokens = state.page_rows, .snap_bytes = 0 };
 }
 
@@ -30,7 +31,7 @@ pub fn ownSequence(e: *Engine) !void {
     if (e.seqs.items[0] != null) return error.SlotTaken;
     const q = try e.gpa.create(types.Seq);
     errdefer e.gpa.destroy(q);
-    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, on(e, 0, state.pageBytes(&e.w))) };
+    q.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, on(e, 0, state.pageBytes(&e.w, e.settings.kv8))) };
     e.seqs.items[0] = q;
     e.cur = q;
     e.slot = 0;
@@ -83,12 +84,12 @@ pub const Pages = struct {
             if (q.* != null) return error.SlotTaken; // attach comes before any stream
             const s = try e.gpa.create(types.Seq);
             errdefer e.gpa.destroy(s);
-            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, at) };
+            s.* = .{ .st = try fw.State.initPaged(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8, at) };
             q.* = s;
             made += 1;
         }
         try e.stream.synchronize();
-        own.?.st.place(&e.w, at); // last: a failure before it leaves the engine's own as it was
+        own.?.st.place(&e.w, at, e.settings.kv8); // last: a failure before it leaves the engine's own as it was
         return p;
     }
 

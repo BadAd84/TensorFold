@@ -14,7 +14,8 @@ const shuffled = 1; // takes and gives back pages between prompts, so slot 0's c
 const twin_slot = 3; // past the paged sequences: a whole window, as without TF_KV_PAGES
 
 /// `glm-paged-check`: pages taken out of order and NaN-filled; prompt, windows across page edges, keeps and drafts.
-pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
+/// With `kv8` both sides hold FP8 latent rows: codes and scales on pages against a window's codes and scales.
+pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8, kv8: bool) !void {
     const glm = @import("glm_cuda");
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
     defer arena.deinit();
@@ -29,6 +30,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
         return err;
     };
     set.pages = true; // every rank's engine makes its own sequence on pages, as TF_KV_PAGES does
+    set.kv8 = kv8; // --kv-cache fp8: the twin's window (cuda_engine.bind) takes the same format
     const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &lib, comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = true, .settings = set });
     defer e.deinit();
     var link = try glm.follow.Link.init(gpu.gpa, gpu.d, &lib, comm, e.stream, capacity);
@@ -108,5 +110,5 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
         failed = true;
     }
     if (failed) return error.TestFailed;
-    check.pass("pages at TP={d}: on the engine's own sequence, {d} prompts at the pages' edges (511 to 5,000 tokens) and {d} window rows equal their twins' logits, tokens and drafts byte for byte, pages out of order ({d} jumps) and NaN before use; the pool idle after", .{ world, lengths.len, compared, unordered });
+    check.pass("pages at TP={d} ({s} KV): on the engine's own sequence, {d} prompts at the pages' edges (511 to 5,000 tokens) and {d} window rows equal their twins' logits, tokens and drafts byte for byte, pages out of order ({d} jumps) and NaN before use; the pool idle after", .{ world, if (kv8) "FP8" else "BF16", lengths.len, compared, unordered });
 }

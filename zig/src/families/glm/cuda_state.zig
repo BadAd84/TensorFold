@@ -63,22 +63,42 @@ pub fn mlaLayers(w: *const weights.Weights) usize {
     return nd;
 }
 
-/// One cache's part of a page: its latent rows, then their pools' keys.
-fn pageCacheBytes(c: anytype) usize {
-    return page_rows * c.kv_lora * 2 + page_rows / sparse.pool * c.i_dim * 2;
+/// One cache's part of a page: its latent rows (BF16, or E4M3 codes then a FP32 scale a row), then their pools' keys.
+fn pageCacheBytes(c: anytype, kv8: bool) usize {
+    return latentPageBytes(c, kv8) + page_rows / sparse.pool * c.i_dim * 2;
 }
 
-/// A page's bytes: every DSA layer's part, then the MTP layer's (13,056 a row on GLM-5.3-Flash).
-pub fn pageBytes(w: *const weights.Weights) u64 {
-    return (mlaLayers(w) + 1) * pageCacheBytes(&w.config);
+fn latentPageBytes(c: anytype, kv8: bool) usize {
+    return if (kv8) page_rows * (c.kv_lora + 4) else page_rows * c.kv_lora * 2;
 }
 
-/// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table.
-fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize) void {
-    x.lc = p.kv + j * pageCacheBytes(c);
-    x.pk = x.lc + page_rows * c.kv_lora * 2;
+/// A page's bytes: every DSA layer's part, then the MTP layer's (13,056 a row on GLM-5.3-Flash, 6,960 with FP8 KV).
+pub fn pageBytes(w: *const weights.Weights, kv8: bool) u64 {
+    return (mlaLayers(w) + 1) * pageCacheBytes(&w.config, kv8);
+}
+
+/// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table; FP8 scales follow the codes.
+fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize, kv8: bool) void {
+    x.lc = p.kv + j * pageCacheBytes(c, kv8);
+    x.ls = if (kv8) x.lc + page_rows * c.kv_lora else 0;
+    x.pk = x.lc + latentPageBytes(c, kv8);
     x.pt = table;
     x.ps = p.page_bytes;
+}
+
+test "a page part: FP8 codes, then their scales where the kernels read them (512 x 512 in), then the pools' keys" {
+    const c = @import("config.zig").Config{};
+    const p: Paged = .{ .kv = 1 << 30, .pages = 4, .page_bytes = 12 * pageCacheBytes(&c, true) };
+    var x: dsa_block.Caches = .{ .lc = 0, .ik = 0, .ig = 0, .pk = 0, .pk_rows = 0 };
+    onPages(&x, &c, p, 77, 2, true);
+    try std.testing.expectEqual(@as(usize, 512 * 512 + 512 * 4 + 128 * 128 * 2), pageCacheBytes(&c, true));
+    try std.testing.expectEqual(p.kv + 2 * pageCacheBytes(&c, true), x.lc);
+    try std.testing.expectEqual(x.lc + 512 * 512, x.ls); // glm_glue_attn.cuh and glm_glue_latent.cuh: page + 512 * 512
+    try std.testing.expectEqual(x.ls + 512 * 4, x.pk);
+    try std.testing.expectEqual(@as(u64, 0), p.page_bytes % 512); // sparse token rows are 512-byte code rows
+    onPages(&x, &c, p, 77, 2, false);
+    try std.testing.expectEqual(@as(u64, 0), x.ls);
+    try std.testing.expectEqual(x.lc + 512 * 512 * 2, x.pk); // BF16 parts as before
 }
 
 /// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last.
@@ -373,9 +393,9 @@ pub const State = struct {
         return make(gpa, d, w, capacity, kv8, null);
     }
 
-    /// A sequence whose latent rows and pooled keys are pages of `p`; it holds no rows until a stream maps some.
-    pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, p: Paged) !State {
-        return make(gpa, d, w, capacity, false, p);
+    /// A sequence whose latent rows (BF16, or E4M3 and scales) and pooled keys are pages of `p`; no rows until mapped.
+    pub fn initPaged(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize, kv8: bool, p: Paged) !State {
+        return make(gpa, d, w, capacity, kv8, p);
     }
 
     /// Bytes a sequence on pages allocates at any length (its fixed part, as `arena` rounds it), a table of `pages`.
@@ -414,15 +434,15 @@ pub const State = struct {
         if (paged) |q| {
             st.table = p[14 + 4 * nd];
             st.capacity = 0; // no rows until a stream's pages are mapped
-            st.place(w, q);
+            st.place(w, q, kv8);
         }
         return st;
     }
 
     /// A paged sequence's caches on the pages of `p` (the engine's own, made before its pool, placed when it is made).
-    pub fn place(st: *State, w: *const weights.Weights, p: Paged) void {
-        for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, j);
-        onPages(&st.mtp_caches, &w.config, p, st.table, st.caches.len);
+    pub fn place(st: *State, w: *const weights.Weights, p: Paged, kv8: bool) void {
+        for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, j, kv8);
+        onPages(&st.mtp_caches, &w.config, p, st.table, st.caches.len, kv8);
     }
 
     pub fn deinit(st: *State) void {

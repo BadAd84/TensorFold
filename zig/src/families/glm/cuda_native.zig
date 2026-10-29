@@ -423,7 +423,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
-        error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
         error.TooManyRanks => std.fmt.comptimePrint(
             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
             .{ ranks.max_world, ranks.max_world },
@@ -446,30 +445,19 @@ test "a checkpoint refused for its format, at the entry or by the loader, is exp
 }
 
 test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {
-    try std.testing.expect(!try paging(null, 1, false));
-    try std.testing.expect(!try paging("auto", 1, false));
+    try std.testing.expect(!paging(null, 1));
+    try std.testing.expect(!paging("auto", 1));
     for ([_]usize{ 2, 3, 16 }) |w| {
-        try std.testing.expect(try paging(null, w, false));
-        try std.testing.expect(try paging("auto", w, false));
+        try std.testing.expect(paging(null, w));
+        try std.testing.expect(paging("auto", w));
     }
     for ([_]usize{ 1, 2, 3 }) |w| {
-        try std.testing.expect(try paging("on", w, false));
-        try std.testing.expect(try paging("1", w, false));
-        try std.testing.expect(!try paging("off", w, false));
-        try std.testing.expect(!try paging("0", w, false));
-        try std.testing.expect(try paging("all", w, false));
+        try std.testing.expect(paging("on", w));
+        try std.testing.expect(paging("1", w));
+        try std.testing.expect(!paging("off", w));
+        try std.testing.expect(!paging("0", w));
+        try std.testing.expect(paging("all", w));
     }
-}
-
-test "TF_KV_PAGES with --kv-cache fp8: auto and off keep windows at every rank count, on and all are refused by name" {
-    for ([_]usize{ 1, 2, 3, 16 }) |w| {
-        try std.testing.expect(!try paging(null, w, true));
-        try std.testing.expect(!try paging("auto", w, true));
-        try std.testing.expect(!try paging("off", w, true));
-        try std.testing.expect(!try paging("0", w, true));
-        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expectError(error.Fp8OnPages, paging(v, w, true));
-    }
-    try std.testing.expect(explain(null, error.Fp8OnPages) != null);
 }
 
 test "capacity keeps a verify window past the context and a multiple of 64" {
