@@ -125,9 +125,7 @@ pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last
     }
 }
 
-/// DFlash2's taps after layer `j` of a pieced pass. A split piece's glue posts only a rank's own rows of the residual
-/// (`normed` is shared, `x` never is), so a rank taps its own rows (`.local`: the owners' rows copied in first) and
-/// shareTaps hands them to the other ranks once the pass is done.
+/// DFlash2's taps after layer j: split glue posts a rank's own rows of x only, so it taps those (shareTaps sends them).
 pub fn tapPieces(f: *const Forward, t: taps.Taps, j: usize, cut: []const [2]usize) !void {
     if (taps.slot(j) == null) return;
     const r = f.ranks[0];
