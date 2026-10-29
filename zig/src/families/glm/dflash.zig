@@ -104,6 +104,7 @@ pub const Drafter = struct {
     rank: usize,
     world: usize,
     temp: f64 = 1.0, // the selector's softmax temperature for the drafts' chances
+    win: i64 = WIN, // TF_GLM_DFLASH2_WIN: the context positions a draft attends to at most (drafts only, never replies)
     scratch: cuda.DeviceBuffer = undefined,
     slots: std.ArrayList(Slot) = .empty,
     verifies: u64 = 0, // verifies so far: a slot's rows are still in taps_step while its v_step is the latest
@@ -266,7 +267,7 @@ pub const Drafter = struct {
             const s = &dr.slots.items[q.slot];
             dr.h_rings[i] = s.ring.?.ptr;
             dr.h_starts[i] = q.pos;
-            dr.h_froms[i] = s.from;
+            dr.h_froms[i] = windowFrom(s.from, q.pos, dr.win);
             for (0..BLOCK) |t| {
                 dr.h_ids[i * BLOCK + t] = @intCast(if (t == 0) q.anchor else MASK);
                 dr.h_bpos[i * BLOCK + t] = @intCast(q.pos + @as(i64, @intCast(t)));
@@ -298,6 +299,32 @@ pub const Drafter = struct {
         }
     }
 };
+
+/// The first context position a draft at `pos` attends to: the stream's own start, or `win` positions back if later.
+pub fn windowFrom(from: i64, pos: i64, win: i64) i64 {
+    return @max(from, pos - win);
+}
+
+/// TF_GLM_DFLASH2_WIN: unset (WIN), else a count of positions from 0 to WIN; anything else is refused.
+pub fn parseWin(text: ?[]const u8) !i64 {
+    const t = text orelse return WIN;
+    const v = std.fmt.parseInt(i64, std.mem.trim(u8, t, " "), 10) catch return error.BadDrafterWindow;
+    if (v < 0 or v > WIN) return error.BadDrafterWindow;
+    return v;
+}
+
+test "the drafter's window bounds its context from below and never reaches before the stream's start" {
+    try std.testing.expectEqual(@as(i64, 0), windowFrom(0, 100, WIN)); // the whole default window
+    try std.testing.expectEqual(@as(i64, 68), windowFrom(0, 100, 32));
+    try std.testing.expectEqual(@as(i64, 90), windowFrom(90, 100, 32)); // a resumed stream's own start wins
+    try std.testing.expectEqual(@as(i64, 100), windowFrom(0, 100, 0)); // no context: the block's own keys only
+    try std.testing.expectEqual(WIN, try parseWin(null));
+    try std.testing.expectEqual(@as(i64, 256), try parseWin("256"));
+    try std.testing.expectEqual(@as(i64, 0), try parseWin("0"));
+    try std.testing.expectError(error.BadDrafterWindow, parseWin("4096"));
+    try std.testing.expectError(error.BadDrafterWindow, parseWin("-1"));
+    try std.testing.expectError(error.BadDrafterWindow, parseWin("half"));
+}
 
 /// Whether prompt rows [start, start + rows) of a `len`-id prompt end before the window the drafter keeps (none ingested).
 pub fn ingestsNone(start: usize, rows: usize, len: usize) bool {
