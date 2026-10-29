@@ -67,6 +67,8 @@ pub const Kernels = struct {
     select: bool,
     /// Whether decode windows (fewer than rows_from rows) take the kernels too (Mode.all).
     decode: bool,
+    /// The pools a decode window needs before it takes them (TF_GLM_INDEX_DECODE_FROM, read at load; 0: any depth).
+    decode_from: usize = 0,
 
     /// `image`: cuda.kernels.glm_index.
     pub fn load(d: *const cuda.Driver, image: []const u8, mode: Mode) !Kernels {
@@ -79,6 +81,7 @@ pub const Kernels = struct {
             .pools_fn = try m.function("tf_glm_index_pools"),
             .select = mode == .both or mode == .all,
             .decode = mode == .all,
+            .decode_from = try decodeFrom(if (std.c.getenv("TF_GLM_INDEX_DECODE_FROM")) |v| std.mem.span(v) else null),
         };
     }
 
@@ -88,7 +91,7 @@ pub const Kernels = struct {
 
     /// Whether `rows` rows over `np` pools with this key cache layout go through the kernels.
     pub fn takes(k: *const Kernels, rows: usize, np: usize, pk: u64, ps: u64) bool {
-        return (rows >= rows_from or k.decode) and np >= topk and pk % 16 == 0 and ps % 16 == 0;
+        return (rows >= rows_from or (k.decode and np >= k.decode_from)) and np >= topk and pk % 16 == 0 and ps % 16 == 0;
     }
 
     /// tf_glm_scores' launch for `rows` rows at `at` into out [rows][np]; the first `nb` 64-pool blocks are written.
@@ -107,6 +110,28 @@ pub const Kernels = struct {
         try cuda.launch.launch(k.pools_fn, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = pool_threads } }, s, &a);
     }
 };
+
+/// TF_GLM_INDEX_DECODE_FROM, a context position, as the pools a decode window must reach (unset or 0: any depth).
+pub fn decodeFrom(text: ?[]const u8) !usize {
+    const t = text orelse return 0;
+    if (t.len == 0) return 0;
+    return (std.fmt.parseInt(usize, t, 10) catch return error.BadIndexMode) / sparse.pool;
+}
+
+test "GLM index: TF_GLM_INDEX_DECODE_FROM is a position, counted in pools; a typo is refused" {
+    try std.testing.expectEqual(@as(usize, 0), try decodeFrom(null));
+    try std.testing.expectEqual(@as(usize, 16384), try decodeFrom("65536"));
+    try std.testing.expectError(error.BadIndexMode, decodeFrom("64k"));
+}
+
+test "GLM index: with a decode depth gate, shallow decode windows keep today's path and deep ones take the kernels" {
+    var k: Kernels = undefined;
+    k.decode = true;
+    k.decode_from = 16384; // 65,536 positions
+    try std.testing.expect(!k.takes(4, 16383, 0x1000, 32768));
+    try std.testing.expect(k.takes(4, 16384, 0x1000, 32768));
+    try std.testing.expect(k.takes(rows_from, 1024, 0x1000, 32768)); // prompt chunks are not gated
+}
 
 fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
@@ -144,6 +169,7 @@ test "GLM index: the candidate cap follows the pool count and stays in shared me
 test "GLM index: prompt-sized launches on aligned key caches take the kernels, decode windows only with Mode.all" {
     var k: Kernels = undefined;
     k.decode = false;
+    k.decode_from = 0;
     try std.testing.expect(k.takes(rows_from, 1024, 0x1000, 32768));
     try std.testing.expect(!k.takes(rows_from - 1, 1024, 0x1000, 32768));
     try std.testing.expect(!k.takes(4, 1 << 18, 0x1000, 32768));
