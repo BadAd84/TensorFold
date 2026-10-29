@@ -298,12 +298,17 @@ pub const Drafter = struct {
     }
 };
 
+/// Whether prompt rows [start, start + rows) of a `len`-id prompt end before the window the drafter keeps (none ingested).
+pub fn ingestsNone(start: usize, rows: usize, len: usize) bool {
+    return start + rows <= len -| @as(usize, @intCast(WIN));
+}
+
 /// Prompt context retained in the window; row0 is only a tap-buffer offset, never a sequence position.
 pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, row0: usize) !?Run {
     if (start > len or rows > len - start) return error.BadPromptContext;
     if (rows > MAX_CTX or row0 > MAX_CTX - rows) return error.DrafterContextTooWide;
+    if (ingestsNone(start, rows, len)) return null;
     const keep_from = len -| @as(usize, @intCast(WIN));
-    if (start + rows <= keep_from) return null;
     const lo = keep_from -| start;
     return .{ .ring = ring, .taps = taps + (row0 + lo) * TAP_ROW, .n = rows - lo, .pos0 = @intCast(start + lo) };
 }
@@ -312,4 +317,15 @@ pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, 
     const s = try dr.slot(i);
     const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0)) orelse return;
     try dr.ingest(e, &.{run});
+}
+
+test "the drafter ingests a prompt's last WIN rows: a span ending at or before len - WIN reads none (a pair may run)" {
+    const w: usize = @intCast(WIN);
+    try std.testing.expect(ingestsNone(0, 4096, 4096 + w)); // ends where the window starts
+    try std.testing.expect(!ingestsNone(0, 4097, 4096 + w)); // one row into it
+    try std.testing.expect(!ingestsNone(0, 100, 100)); // a prompt shorter than the window is all window
+    try std.testing.expect((try promptRun(1, 2, 2048, 2048, 4096 + w, 0)) == null); // a chunk (MAX_CTX rows) at the edge
+    const run = (try promptRun(1, 2, 2048, 2048, 4095 + w, 0)).?; // one row later: its last row is ingested
+    try std.testing.expectEqual(@as(i64, 4095), run.pos0);
+    try std.testing.expectEqual(@as(usize, 1), run.n);
 }

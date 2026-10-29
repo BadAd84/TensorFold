@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
+const dflash = @import("dflash.zig");
 const weights = @import("cuda_weights.zig");
 const snapshots = @import("cuda_snapshots.zig");
 const engine = @import("cuda_engine.zig");
@@ -51,9 +52,15 @@ pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
     return start + ra > base + ring or start + ra + rb <= base + ring;
 }
 
-/// Rank 0's choice for the step at `start` (the others take the ids it sends); not with a drafter, prompt rows or prof.
+/// Whether a pair at `start` leaves a drafter nothing to read: both chunks end before the prompt rows it ingests.
+fn drafterIdle(e: *const Engine, start: usize, len: usize) bool {
+    if (e.drafter == null) return true;
+    return dflash.ingestsNone(start, fw.prefill_rows + @min(len -| (start + fw.prefill_rows), fw.prefill_rows), len);
+}
+
+/// Rank 0's choice for the step at `start` (the others take the ids it sends); a drafter's rows, prompt rows or prof: no.
 pub fn pairedAt(e: *const Engine, start: usize, len: usize, from: ?engine.Resume, marks: ?engine.Marks) bool {
-    if (e.pair == null or !e.settings.pair or e.drafter != null or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
+    if (e.pair == null or !e.settings.pair or !drafterIdle(e, start, len) or e.prompt_logprobs != null or e.prompt_profs[3] != null) return false;
     if (e.pieces.count == 1 and !e.settings.split) return false; // run takes such a chunk whole
     if (!takesTwo(start, len, e.share.world, if (marks) |m| m.at else &.{})) return false;
     // a resumed step restores its kept state, and the rings' base, after this choice
@@ -67,7 +74,7 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     if (len <= start + ra) return error.BadChunk;
     const rb: usize = @min(len - start - ra, fw.prefill_rows);
     const pair = if (e.pair) |*p| p else return error.BadChunk;
-    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or e.drafter != null or e.prompt_logprobs != null) return error.BadChunk;
+    if (rb < e.share.world or part.len != @min(len - start, ra + rb + 1) or !drafterIdle(e, start, len) or e.prompt_logprobs != null) return error.BadChunk;
     if (!ringsAgree(e.cur.st.base, e.cur.st.ring_rows, start, rb)) return error.BadChunk; // pairedAt's rule, every rank
     if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
     e.gate(cancel) catch |err| {
