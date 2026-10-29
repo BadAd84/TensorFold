@@ -15,6 +15,7 @@ pub const Settings = struct {
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
     split_min: u32 = 0, // TF_GLM_SPLIT_MIN: a prompt piece of fewer rows glues whole (0: every piece of world rows splits)
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
+    kda_pad: bool = false, // TF_GLM_KDA_PAD: 1 (the fused KDA input padded to eight columns at load, for glm_mm) or 0
     pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
@@ -35,6 +36,12 @@ pub const Settings = struct {
         if (get("TF_GLM_MM")) |v| {
             if (std.mem.eql(u8, v, "0")) s.tiled = false else if (!std.mem.eql(u8, v, "1")) {
                 problem.* = "TF_GLM_MM: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KDA_PAD")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kda_pad = true else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KDA_PAD: 0 or 1";
                 return error.BadSetting;
             }
         }
@@ -108,6 +115,10 @@ pub const Settings = struct {
             problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
             return error.BadSetting;
         }
+        if (s.kda_pad and !s.tiled) {
+            problem.* = "TF_GLM_KDA_PAD=1 requires TF_GLM_MM=1 (glm_mm is what reads the padded rows)";
+            return error.BadSetting;
+        }
         return s;
     }
 };
@@ -122,7 +133,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 13, // this struct's version
+    layout: u32 = 14, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -131,6 +142,7 @@ pub const Fingerprint = extern struct {
     tiled: u32,
     split: u32, // TF_GLM_PREFILL_REDUCE: 0 gather, 1 split, 2 ring; TF_GLM_SPLIT_MIN above bit 4
     kda_wide: u32,
+    kda_pad: u32 = 0, // TF_GLM_KDA_PAD: every rank's KDA input rows carry one width
     pieces: u32,
     pair: u32, // TF_GLM_PROMPT_PAIR: rank 0's paired steps need the second chunk's buffers on every rank
     layers: u32, // TF_GLM_LAYERS (0: all)
@@ -158,6 +170,7 @@ pub const Fingerprint = extern struct {
         tiled,
         split,
         kda_wide,
+        kda_pad,
         pieces,
         pair,
         layers,
@@ -195,6 +208,7 @@ pub const Fingerprint = extern struct {
             .tiled = @intFromBool(s.tiled),
             .split = @as(u32, if (!s.split) 0 else if (s.ring) 2 else 1) | s.split_min << 4,
             .kda_wide = @intFromBool(s.kda_wide),
+            .kda_pad = @intFromBool(s.kda_pad),
             .pieces = s.pieces,
             .pair = @intFromBool(s.pair),
             .layers = s.layers,
@@ -226,6 +240,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "tiled",
             "split",
             "kda_wide",
+            "kda_pad",
             "pieces",
             "pair",
             "layers",
@@ -335,6 +350,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .tiled => "TF_GLM_MM",
         .split => "TF_GLM_PREFILL_REDUCE",
         .kda_wide => "TF_GLM_KDA_DECODE_WIDE",
+        .kda_pad => "TF_GLM_KDA_PAD",
         .pieces => "TF_GLM_OVERLAP_PIECES",
         .pair => "TF_GLM_PROMPT_PAIR",
         .layers => "TF_GLM_LAYERS",
