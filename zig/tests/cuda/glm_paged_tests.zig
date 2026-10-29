@@ -6,10 +6,11 @@ const lanes_tests = @import("glm_lanes_tests.zig");
 const Gpu = check.Gpu;
 
 const chunk = @import("glm_cuda").engine.prompt_rows;
-/// Prompts at a page's edges (512 rows), a prompt chunk's and past the dense pass (the sparse one reads pools).
-const lengths = [_]usize{ 511, 512, 513, chunk - 1, chunk, chunk + 1, 5000 };
-/// A window of 8,192 and a verify window, as cuda_native.capacity makes it.
-const capacity = 8256;
+/// Prompts at a page's edges (512 rows), a prompt chunk's and past the dense pass (the sparse one reads pools), and
+/// either side of 32,768 positions (64 page parts), where slab and pages served different replies at TP=3.
+const lengths = [_]usize{ 511, 512, 513, chunk - 1, chunk, chunk + 1, 5000, 32767, 32768, 32769, 33000 };
+/// A window of 33,280 (65 page parts) and a verify window, as cuda_native.capacity makes it.
+const capacity = 33344;
 const paged_slot = 0; // the engine's own sequence, on pages from its init
 const shuffled = 1; // takes and gives back pages between prompts, so slot 0's come out of the free list's order
 const twin_slot = 3; // past the paged sequences: a whole window, as without TF_KV_PAGES
@@ -111,5 +112,5 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
         failed = true;
     }
     if (failed) return error.TestFailed;
-    check.pass("pages at TP={d} ({s} KV): on the engine's own sequence, {d} prompts at the pages' edges (511 to 5,000 tokens) and {d} window rows equal their twins' logits, tokens and drafts byte for byte, pages out of order ({d} jumps) and NaN before use; the pool idle after", .{ world, if (kv8) "FP8" else "BF16", lengths.len, compared, unordered });
+    check.pass("pages at TP={d} ({s} KV): on the engine's own sequence, {d} prompts at the pages' edges (511 to 33,000 tokens) and {d} window rows equal their twins' logits, tokens and drafts byte for byte, pages out of order ({d} jumps) and NaN before use; the pool idle after", .{ world, if (kv8) "FP8" else "BF16", lengths.len, compared, unordered });
 }
