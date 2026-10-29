@@ -126,8 +126,9 @@ pub const Kernels = cuda.exl3_experts.Experts;
 const common = cuda.exl3_experts;
 pub const Scratch = struct { picks: u64, xg: u64, xu: u64, z: u64 };
 pub const top_k = 8;
-/// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
-pub const chunk_rows = 1024;
+/// Rows a call to the common experts takes: each call reads every expert's weights in 64-row tiles, so a prompt chunk
+/// (2,048 rows) runs as one call: ~57 rows an expert fill its tile, where two calls of 1,024 read every expert twice.
+pub const chunk_rows = 2048;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
     return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
 }
