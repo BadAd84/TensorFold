@@ -85,6 +85,8 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   constexpr int PER = FP8 ? KT * (LW / 8) / 256 : 1;
   uint2 pre_c[PER];
   float pre_s[PER];
+  // rows a page part holds of a sparse key's 512-byte rows: its token ids are int32, so the offset is a 32-bit remainder
+  const uint32_t page_rows = pt ? (uint32_t)(pstep / LW) : 1u;
   auto fetch = [&](int tile) {
     const int64_t first = start + tile * KT;
 #pragma unroll
@@ -98,10 +100,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const float* row_scales = scales + src;
       if (pt && ok) {
         static_assert(CH == 512, "a dense chunk is one page");
-        const int64_t off = sparse ? src % (pstep / LW) : ki - start;  // a sparse key is a row in pstep / LW rows a page
-        const unsigned char* page = reinterpret_cast<const unsigned char*>(lc) +
-                                    (sparse ? (src - off) * LW : (int64_t)pt[c] * pstep);
-        codes = page + off * LW;
+        const uint32_t off = sparse ? (uint32_t)src % page_rows : (uint32_t)(ki - start);  // its row in the page part
+        const unsigned char* page = sparse ? codes - (int64_t)off * LW
+                                           : reinterpret_cast<const unsigned char*>(lc) + (int64_t)pt[c] * pstep;
+        codes = page + (int64_t)off * LW;
         row_scales = reinterpret_cast<const float*>(page + CH * LW) + off;
       }
       pre_c[p] = ok ? *reinterpret_cast<const uint2*>(codes + u * 8) : make_uint2(0u, 0u);
