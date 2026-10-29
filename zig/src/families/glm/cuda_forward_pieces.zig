@@ -1,5 +1,6 @@
 //! The existing pieced prompt exchanges, isolated so their diagnostic spans stay beside each stream operation.
 const relay = @import("cuda_relay.zig");
+const taps = @import("cuda_taps.zig");
 const fw = @import("cuda_forward.zig");
 const prof = @import("cuda_prof.zig");
 const Forward = fw.Forward;
@@ -121,5 +122,45 @@ pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last
             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
             if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
         },
+    }
+}
+
+/// DFlash2's taps after layer `j` of a pieced pass. A split piece's glue posts only a rank's own rows of the residual
+/// (`normed` is shared, `x` never is), so a rank taps its own rows (`.local`: the owners' rows copied in first) and
+/// shareTaps hands them to the other ranks once the pass is done.
+pub fn tapPieces(f: *const Forward, t: taps.Taps, j: usize, cut: []const [2]usize) !void {
+    if (taps.slot(j) == null) return;
+    const r = f.ranks[0];
+    const world = r.w.share.world;
+    const row = r.w.config.hc * r.w.config.hidden * 2;
+    for (cut) |piece| {
+        const lo = piece[0];
+        const n = piece[1] - lo;
+        if (f.splits(n) and f.exchange == .nccl) {
+            const mine = share(n, world, r.w.share.rank);
+            try t.at(f.stream, j, r.b.x, lo + mine[0], mine[1] - mine[0]);
+            continue;
+        }
+        if (f.splits(n)) for (f.ranks) |from| if (from.w.share.rank != r.w.share.rank) {
+            const mine = share(n, world, from.w.share.rank);
+            try f.copy(f.stream, r.b.x + (lo + mine[0]) * row, from.b.x + (lo + mine[0]) * row, (mine[1] - mine[0]) * row);
+        };
+        try t.at(f.stream, j, r.b.x, lo, n);
+    }
+}
+
+/// After a pieced pass: every split piece's own tap rows (tapPieces) to every rank, so each rank's taps hold every row.
+pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
+    const x = switch (f.exchange) {
+        .local => return, // tapPieces copied the owners' residual rows in
+        .nccl => |x| x,
+    };
+    const r = f.ranks[0];
+    const dims = taps.layers.len * taps.hidden;
+    for (cut) |piece| {
+        const n = piece[1] - piece[0];
+        if (!f.splits(n)) continue;
+        const plan: relay.Relay = .{ .world = r.w.share.world, .rank = r.w.share.rank, .n = n };
+        if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
     }
 }

@@ -390,6 +390,8 @@ pub const Forward = struct {
     }
 
     const gluePieces = @import("cuda_forward_pieces.zig").gluePieces;
+    const tapPieces = @import("cuda_forward_pieces.zig").tapPieces;
+    const shareTaps = @import("cuda_forward_pieces.zig").shareTaps;
 
     /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
     fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
@@ -406,12 +408,13 @@ pub const Forward = struct {
             for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
             try f.exchangePieces(p, j, .ffn, cut);
             try f.gluePieces(p, j, .ffn, cut);
-            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
+            if (f.taps) |t| try f.tapPieces(t, j, cut);
             switch (layers[j].mixer) {
                 .kda => li += 1,
                 .mla => di += 1,
             }
         }
+        if (f.taps) |t| try f.shareTaps(t, cut);
     }
 
     pub const pairBody = @import("cuda_forward_pair.zig").pairBody;
@@ -470,7 +473,7 @@ pub const Forward = struct {
             try f.prefetch(j, 1); // L2PF site `f`: the next layer's mixer across the FFN's all-gather
             try f.gather(R);
             for (f.ranks) |r| try f.post(r, R);
-            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, R);
+            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
             if (f.prof) |p| p.mark(f.stream, .gather_b);
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,
