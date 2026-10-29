@@ -4,7 +4,7 @@ const glm = @import("glm");
 const t = std.testing;
 const fw = struct {
     pub const Taps = struct { out: u64 };
-    pub const prefill_rows = 2048;
+    pub const prefill_rows = glm.forward.prefill_rows;
     pub const window_rows = 8;
     pub const State = struct {
         pos: usize = 0,
@@ -56,7 +56,7 @@ const fw = struct {
 };
 const engine = struct {
     pub const max_together = 16;
-    pub const prompt_rows = 2048;
+    pub const prompt_rows = glm.engine.prompt_rows;
     pub const Prompt = glm.engine.Prompt;
     pub const Seq = struct { st: fw.State = .{}, held_at: u64 = 0 };
     pub const Engine = struct {
@@ -64,7 +64,7 @@ const engine = struct {
         capacity: usize = 4096,
         c: struct { hidden: usize = 1 } = .{},
         hold: struct { ptr: u64 },
-        mtp: bool = true,
+        head: bool = true,
         cur: *Seq = undefined,
         seqs: [32]Seq = @splat(.{}),
         bp: fw.Buffers,
@@ -224,7 +224,8 @@ test "GLM prompt workflow: context window cut preserves sequence positions indep
     try t.expectEqual(@as(u64, 2000 + 11 * dr.TAP_ROW), shifted.taps);
     try t.expectEqual(@as(?dr.Run, null), try dr.promptRun(1000, 2000, 0, 2048, 5000, 0));
     try t.expectError(error.BadPromptContext, dr.promptRun(0, 0, 9, 2, 10, 0));
-    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, 2044));
+    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, 5, 5, dr.TAP_ROWS - 4)); // past the taps
+    try t.expectError(error.DrafterContextTooWide, dr.promptRun(0, 0, 0, dr.MAX_CTX + 1, dr.MAX_CTX + 1, 0)); // a piece
 }
 
 test "GLM prompt workflow: both ranks share exact packets and reject malformed batches" {
@@ -256,7 +257,7 @@ test "GLM prompt workflow: both ranks share exact packets and reject malformed b
 test "GLM structured: prompt rows survive without an MTP head" {
     var b: Box = .{};
     var e = b.make();
-    e.mtp = false;
+    e.head = false;
     try pass(&e, &.{ .{ .slot = 4, .ids = &.{ 31, 32 } }, .{ .slot = 9, .ids = &.{ 61, 62, 63 } } });
     try t.expectEqual(@as(u16, 32), held(&e, 4));
     try t.expectEqual(@as(u16, 63), held(&e, 9));

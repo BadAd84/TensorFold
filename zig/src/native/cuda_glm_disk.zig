@@ -112,8 +112,8 @@ fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
 
 /// A fixed prompt's store image hashed, and each other rank's shared bytes checked equal to rank 0's (taken as theirs).
 fn probe(a: Allocator, io: std.Io, backend: lanes.backend.Backend, e: *Engine) !struct { hash: u64, rate: f64 } {
-    const mark: u32 = glm.native.prompt_rows;
-    var toks: [glm.native.prompt_rows + 40]u32 = undefined;
+    const mark: u32 = glm.native.snap_min_rows; // the smallest kept state: the probe's steps do not follow the chunk
+    var toks: [glm.native.snap_min_rows + 40]u32 = undefined;
     for (&toks, 0..) |*x, i| x.* = @intCast(1000 + i * 7919 % 50000);
     const Hook = struct {
         e: *Engine,

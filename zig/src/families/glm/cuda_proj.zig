@@ -53,7 +53,7 @@ test "the loader's check refuses an FP8 projection exactly when matmul would at 
     for (shapes) |nk| for ([_]*const cuda.qmmf.Lane{ &flat, &gb10 }) |lane| {
         const q = cuda.fp8.weight(0, 0, nk[0], nk[1]);
         var refused = false; // matmul's own test, at decode rows, partial tiles, the fused rows and a prompt chunk
-        for ([_]usize{ 1, 4, 16, 17, 64, 255, 256, 2048 }) |m| refused = refused or lane.partBytes(m, q) != 0;
+        for ([_]usize{ 1, 4, 16, 17, 64, 255, 256, 2048, @import("cuda_state.zig").prefill_rows }) |m| refused = refused or lane.partBytes(m, q) != 0;
         if (refused) try std.testing.expectError(error.SlicePartialsNotHeld, fits(lane, q)) else try fits(lane, q);
     };
     try std.testing.expectError(error.SlicePartialsNotHeld, fits(&flat, cuda.fp8.weight(0, 0, 8192, 4096)));

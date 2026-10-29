@@ -44,7 +44,8 @@ pub fn chunkEnd(start: usize, len: usize, marks: []const u32) usize {
 }
 
 test "a prompt chunk ends at its rows, the prompt's end or the first mark past its start" {
-    try std.testing.expectEqual(@as(usize, 2048), chunkEnd(0, 9000, &.{}));
+    try std.testing.expectEqual(@as(usize, prompt_rows), chunkEnd(0, 9000, &.{}));
+    try std.testing.expectEqual(@as(usize, 9000), chunkEnd(9000 - prompt_rows, 9000, &.{}));
     try std.testing.expectEqual(@as(usize, 7000), chunkEnd(6144, 7000, &.{}));
     try std.testing.expectEqual(@as(usize, 5001), chunkEnd(4096, 9000, &.{ 9, 5003, 5001, 4096 }));
     try std.testing.expectEqual(@as(usize, 7049), chunkEnd(5001, 9000, &.{ 5001, 7049 })); // its own start does not cut
@@ -80,7 +81,7 @@ pub const Engine = struct {
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
-    prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
+    prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024 and prompt_rows rows
     checkpoint_digest: [32]u8,
     l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream
     settings: ranks.Settings,
@@ -353,8 +354,9 @@ pub const Engine = struct {
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
 
-    /// decode.prefill: `ids` in 2,048-row steps from its start, then the first token from the last row; `from` restores a
-    /// kept state. The steps are fixed: the other ranks run the same ids without the marks (a mark keeps only at a step).
+    /// decode.prefill: `ids` in prompt_rows steps from its start, then the first token from the last row; `from`
+    /// restores a kept state. The steps are fixed: the other ranks run the same ids without the marks (a mark keeps only
+    /// at a step).
     pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
         var start = try e.prefillStart(ids.len, from);
         while (true) {
@@ -390,7 +392,7 @@ pub const Engine = struct {
         const as_i32: []const i32 = @ptrCast(part);
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
         f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
-        const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", "prompt chunk to 2048 rows" };
+        const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", std.fmt.comptimePrint("prompt chunk to {d} rows", .{prompt_rows}) };
         if (f.prof) |p| try p.beginPrompt(e.stream, labels[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
         if (f.prof) |p| e.profiling_prompt = p;
         defer if (f.prof != null) {

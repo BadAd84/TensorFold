@@ -336,6 +336,7 @@ fn indexSplit(h: Header) bool {
 
 /// A prompt step's rows (Leader.chunk): rank 0's cut, which may end at a mark, so no rank re-derives it.
 fn chunkRows(h: Header) usize {
+    comptime std.debug.assert(2 * engine.prompt_rows < 1 << 16); // a pair's rows fit flags' 16 bits from bit 16
     return h.flags >> 16;
 }
 

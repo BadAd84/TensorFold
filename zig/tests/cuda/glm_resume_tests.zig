@@ -39,9 +39,9 @@ pub fn resumeCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, 
     const C = glm.engine.prompt_rows;
     const Case = struct { len: usize, at: u32 };
     const cases = [_]Case{
-        .{ .len = 6000, .at = 2 * C }, // on the grid: the check's own control, true before this change too
-        .{ .len = 6000, .at = 2 * C + 3 }, // a row three into a pool of four
-        .{ .len = 6000, .at = C + 1 },
+        .{ .len = 3 * C - 144, .at = 2 * C }, // on the grid: the check's own control, true before this change too
+        .{ .len = 3 * C - 144, .at = 2 * C + 3 }, // a row three into a pool of four
+        .{ .len = 3 * C - 144, .at = C + 1 },
         .{ .len = 4000, .at = 2051 }, // the dense limit (keyWidth)
         .{ .len = 9000, .at = 5001 },
         .{ .len = 3000, .at = 1 }, // a one-row first chunk

@@ -28,8 +28,9 @@ pub const default_context: i64 = 8192;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
 /// No snap_grid: a prompt row's bits do not depend on its chunk's rows or start (cuda_engine.chunkEnd cuts at marks), so
-/// states keep and resume at any row. The smallest prompt a state is sized for at admission:
-pub const snap_min_rows: u32 = prompt_rows;
+/// states keep and resume at any row. The smallest state cache admission plans for (cuda_kv_pool.capacity's floor and
+/// minimum), apart from the chunk size: tied to the chunk, 2,049- to 4,096-row windows would lose their cache facts.
+pub const snap_min_rows: u32 = 2048;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 

@@ -27,7 +27,8 @@ pub const CH: usize = 16; // key chunks of the chunked attention (df_attn_part)
 pub const CW: usize = 2 * TOPK; // a row's gathered ints: 16 ids, then 16 values' bits
 pub const MAX_S: usize = 16; // streams one block pass drafts for
 pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
-pub const MAX_CTX: usize = 2048; // context rows one ingest takes (a prompt chunk's)
+pub const MAX_CTX: usize = 2048; // context rows one ingest takes: a prompt step's piece (ingestPrompt), its own size
+pub const TAP_ROWS: usize = @import("cuda_state.zig").prefill_rows; // a prompt pass's tap rows (taps_prefill)
 pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
 pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
 
@@ -306,17 +307,22 @@ pub fn ingestsNone(start: usize, rows: usize, len: usize) bool {
 /// Prompt context retained in the window; row0 is only a tap-buffer offset, never a sequence position.
 pub fn promptRun(ring: u64, taps: u64, start: usize, rows: usize, len: usize, row0: usize) !?Run {
     if (start > len or rows > len - start) return error.BadPromptContext;
-    if (rows > MAX_CTX or row0 > MAX_CTX - rows) return error.DrafterContextTooWide;
+    if (rows > MAX_CTX or row0 > TAP_ROWS or rows > TAP_ROWS - row0) return error.DrafterContextTooWide;
     if (ingestsNone(start, rows, len)) return null;
     const keep_from = len -| @as(usize, @intCast(WIN));
     const lo = keep_from -| start;
     return .{ .ring = ring, .taps = taps + (row0 + lo) * TAP_ROW, .n = rows - lo, .pos0 = @intCast(start + lo) };
 }
 
+/// A prompt step's rows into slot `i`'s context, one ingest a MAX_CTX-row piece from the step's start: the pieces a
+/// step of MAX_CTX rows at most would take, so the drafter's rows and bits do not follow the target's chunk size.
 pub fn ingestPrompt(dr: anytype, e: anytype, i: u32, start: usize, rows: usize, len: usize, row0: usize) !void {
     const s = try dr.slot(i);
-    const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start, rows, len, row0)) orelse return;
-    try dr.ingest(e, &.{run});
+    var off: usize = 0;
+    while (off < rows) : (off += MAX_CTX) {
+        const run = (try promptRun(s.ring.?.ptr, dr.taps_prefill, start + off, @min(MAX_CTX, rows - off), len, row0 + off)) orelse continue;
+        try dr.ingest(e, &.{run});
+    }
 }
 
 test "the drafter ingests a prompt's last WIN rows: a span ending at or before len - WIN reads none (a pair may run)" {
@@ -328,4 +334,43 @@ test "the drafter ingests a prompt's last WIN rows: a span ending at or before l
     const run = (try promptRun(1, 2, 2048, 2048, 4095 + w, 0)).?; // one row later: its last row is ingested
     try std.testing.expectEqual(@as(i64, 4095), run.pos0);
     try std.testing.expectEqual(@as(usize, 1), run.n);
+}
+
+test "a prompt step of up to TAP_ROWS rows ingests the runs its MAX_CTX-row steps would, from the same tap rows" {
+    const FakeSlot = struct { ring: ?struct { ptr: u64 } = .{ .ptr = 7 } };
+    const Rec = struct {
+        taps_prefill: u64 = 1 << 20,
+        runs: [8]Run = undefined,
+        n: usize = 0,
+        s: FakeSlot = .{},
+        fn slot(r: *@This(), _: u32) !*FakeSlot {
+            return &r.s;
+        }
+        fn ingest(r: *@This(), _: void, runs: []const Run) !void {
+            for (runs) |x| {
+                r.runs[r.n] = x;
+                r.n += 1;
+            }
+        }
+    };
+    comptime std.debug.assert(TAP_ROWS >= 2 * MAX_CTX); // the chunk this checks: two of the drafter's pieces or more
+    const w: usize = @intCast(WIN);
+    const a = 5001; // a step's start, off any grid (a mark)
+    // steps of more than one piece, ending the prompt (the window then crosses the pieces' edge) or before its end
+    for ([_]usize{ MAX_CTX + 1, MAX_CTX + 700, TAP_ROWS - 1, TAP_ROWS }) |rows| for ([_]usize{ 0, 1, MAX_CTX - 1, MAX_CTX, w + 9 }) |past| {
+        const len = a + rows + past;
+        var whole: Rec = .{};
+        try ingestPrompt(&whole, {}, 0, a, rows, len, 0);
+        var steps: Rec = .{};
+        var at: usize = 0;
+        while (at < rows) : (at += MAX_CTX) try ingestPrompt(&steps, {}, 0, a + at, @min(MAX_CTX, rows - at), len, 0);
+        try std.testing.expectEqual(steps.n, whole.n);
+        for (whole.runs[0..whole.n], steps.runs[0..steps.n]) |x, y| {
+            try std.testing.expectEqual(y.pos0, x.pos0);
+            try std.testing.expectEqual(y.n, x.n);
+            const row = (@as(usize, @intCast(x.pos0)) - a) * TAP_ROW; // a position's tap row: its row in the step
+            try std.testing.expectEqual(whole.taps_prefill + row, x.taps);
+            try std.testing.expectEqual(steps.taps_prefill + row % (MAX_CTX * TAP_ROW), y.taps);
+        }
+    };
 }

@@ -15,8 +15,8 @@ const glue = @import("cuda_glue.zig");
 const mlp = @import("cuda_mlp.zig");
 const kda_block = @import("cuda_kda_block.zig");
 
-/// A prompt chunk's rows (decode.PREFILL_ROWS).
-pub const prefill_rows = 2048;
+/// A prompt chunk's rows (decode.PREFILL_ROWS): every size that follows the chunk derives from this one constant.
+pub const prefill_rows = 4096;
 /// A decode window's rows (Engine's max_rows).
 pub const window_rows = 8;
 /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
@@ -24,6 +24,7 @@ pub const prompt_heads = 16;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
 pub const dense_reach = 2560;
 /// Index-key and gate rows a DSA cache holds (a ring): pool_keys reads only from the current pool's first row on.
+/// A paired step's two chunks fit from its rebase (prompt_pair.ringsAgree).
 pub const index_ring = 2 * prefill_rows;
 
 /// Sub-allocations of one device allocation, 256-byte aligned like the driver's own.
@@ -492,12 +493,14 @@ pub const State = struct {
     pub fn ready(st: *State, stream: cuda.Stream, rows: usize) !void {
         if (st.pos + rows > st.capacity) return error.PastCapacity;
         if (st.pos + rows > st.base + st.ring_rows) try st.rebase(stream, false);
+        if (st.pos + rows > st.base + st.ring_rows) return error.PastRing; // rows past the ring overwrite its neighbour
     }
 
     /// Before the MTP head's pass of `n` rows at mtp_len, likewise for its caches.
     pub fn readyMtp(st: *State, stream: cuda.Stream, n: usize) !void {
         if (st.mtp_len + n > st.capacity) return error.PastCapacity;
         if (st.mtp_len + n > st.mtp_base + st.ring_rows) try st.rebase(stream, true);
+        if (st.mtp_len + n > st.mtp_base + st.ring_rows) return error.PastRing;
     }
 
     /// Rebase at the earliest pool a rollback may revisit; MTP retains a whole verify window before its cursor.

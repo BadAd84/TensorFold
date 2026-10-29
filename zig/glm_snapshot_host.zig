@@ -68,9 +68,10 @@ test "GLM snapshots: grid and committed off-grid read sets survive copies on bot
         var f: Fixture = undefined;
         try f.init(&d, rank, 3, true);
         defer f.deinit();
-        try f.e.prepareSnapshots(3 * f.e.stateBytes(8192) + 17);
+        const past = f.seq.st.ring_rows + 4097; // past the index rings' rows: the fixture's state has rebased them
+        try f.e.prepareSnapshots(3 * f.e.stateBytes(past) + 17);
         const allocs = rec.allocs;
-        for ([_]usize{ 2048, 3073, 4096, 8192 }) |at| for ([_]usize{ at - 1, at, at + 7 }) |head| {
+        for ([_]usize{ 2048, 3073, 4096, 8192, past }) |at| for ([_]usize{ at - 1, at, at + 7 }) |head| {
             try f.mark(at, head, @intCast(head % 251));
             const saved = try t.allocator.dupe(u8, rec.bytes(f.seq.st.arena.buf.ptr, f.seq.st.arena.buf.len));
             defer t.allocator.free(saved);
@@ -423,6 +424,7 @@ test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a
     e.cur = &seq;
     e.c = w.config;
     e.mtp = true;
+    e.head = true; // as Engine.init without a drafter: the head's rows are part of every kept state
     e.capacity = seq.st.capacity;
     const minimum = glm.native.snap_min_bytes(&e);
     const budget: u64 = 322122547;
@@ -440,7 +442,7 @@ fn pagedSeq(d: *const cuda.Driver, f: *const Fixture, kv: u64, page: u64, ids: [
     layers[0].mixer = .{ .mla = undefined };
     layers[1].mixer = .{ .kda = undefined };
     w.layers = &layers;
-    var st = try glm.forward.State.initPaged(t.allocator, d, &w, 16448, .{ .kv = kv, .pages = glm.pages.tableLen(16448), .page_bytes = page });
+    var st = try glm.forward.State.initPaged(t.allocator, d, &w, 16448, false, .{ .kv = kv, .pages = glm.pages.tableLen(16448), .page_bytes = page });
     st.pages = ids;
     st.capacity = ids.len * 512;
     return st;

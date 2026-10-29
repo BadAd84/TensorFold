@@ -243,7 +243,7 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
         .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / 64) * 4 },                .{ "g", M * df.RANK * 4 },           .{ "logits", M * head_n * 2 },
         .{ "part", part },                                                                       .{ "gs", C * 5 * (D / 64) * 4 },            .{ "sums", 2 * M * D * 4 },          .{ "cin", C * df.TAP_ROW },
         .{ "c1", C * D * 2 },                                                                    .{ "ctx", C * D * 2 },                      .{ "ckv", C * 2 * KVW * 2 },         .{ "taps_step", df.STEP_ROWS * df.TAP_ROW },
-        .{ "taps_prefill", C * df.TAP_ROW },                                                     .{ "ids", M * 4 },                          .{ "bpos", M * 4 },                  .{ "rings", df.MAX_S * 8 },
+        .{ "taps_prefill", df.TAP_ROWS * df.TAP_ROW },                                           .{ "ids", M * 4 },                          .{ "bpos", M * 4 },                  .{ "rings", df.MAX_S * 8 },
         .{ "starts", df.MAX_S * 8 },                                                             .{ "froms", df.MAX_S * 8 },                 .{ "cpos", C * 8 },                  .{ "crings", C * 8 },
         .{ "gtk", @import("dflash_candidates.zig").Layout.init(dr.world, M, df.CW).device * 4 }, .{ "pv", M * chunks * df.TOPK * 4 },        .{ "pi", M * chunks * df.TOPK * 4 }, .{ "pm", M * df.QH * df.CH * 4 },
         .{ "pl", M * df.QH * df.CH * 4 },                                                        .{ "pacc", M * df.QH * df.CH * df.HD * 4 },

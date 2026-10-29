@@ -5,8 +5,9 @@ const check = @import("check.zig");
 const lanes_tests = @import("glm_lanes_tests.zig");
 const Gpu = check.Gpu;
 
-/// Prompts at a page's edges (512 rows), a prompt chunk's (2,048) and past the dense pass (the sparse one reads pools).
-const lengths = [_]usize{ 511, 512, 513, 2047, 2048, 2049, 5000 };
+const chunk = @import("glm_cuda").engine.prompt_rows;
+/// Prompts at a page's edges (512 rows), a prompt chunk's and past the dense pass (the sparse one reads pools).
+const lengths = [_]usize{ 511, 512, 513, chunk - 1, chunk, chunk + 1, 5000 };
 /// A window of 8,192 and a verify window, as cuda_native.capacity makes it.
 const capacity = 8256;
 const paged_slot = 0; // the engine's own sequence, on pages from its init

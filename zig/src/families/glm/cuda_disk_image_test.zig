@@ -67,7 +67,8 @@ const H = struct {
     }
 };
 
-const capacity = 6144; // past the index rings' 4,096 rows, so a state at the end holds a full ring
+/// Past the index rings' rows, so a state at the end holds a full ring.
+const capacity = @import("cuda_state.zig").index_ring + 2048;
 
 /// TP=2 rank 0's shapes on KDA, DSA, KDA, DSA layers.
 const Model = struct {

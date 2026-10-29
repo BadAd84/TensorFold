@@ -30,6 +30,7 @@ pub const Fixture = struct {
         f.e.share = w.share;
         f.e.capacity = f.seq.st.capacity;
         f.e.mtp = mtp;
+        f.e.head = mtp; // as Engine.init: the MTP head absorbs prompt rows unless a drafter drafts
         f.e.snaps = .empty;
         f.e.snap_pages = null;
         f.e.snap_setup = null;
@@ -49,7 +50,8 @@ pub const Fixture = struct {
         const s = &f.seq.st;
         const buf = rec.bytes(s.arena.buf.ptr, s.arena.buf.len);
         for (buf, 0..) |*b, i| b.* = @as(u8, @truncate(i *% 37 +% i / 251)) ^ salt;
-        try s.restoreHost(f.e.stream, at, head, &.{@as(u1, @truncate(at))}, .{ if (at > 4096) at / 4 * 4 else 0, if (head > 4096) (head -| 8) / 4 * 4 else 0 });
+        const ring = s.ring_rows; // a position past the ring's rows has rebased it (State.ready), MTP a verify window back
+        try s.restoreHost(f.e.stream, at, head, &.{@as(u1, @truncate(at))}, .{ if (at > ring) at / 4 * 4 else 0, if (head > ring) (head -| 8) / 4 * 4 else 0 });
         f.seq.in_head = 0;
     }
 

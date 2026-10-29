@@ -6,6 +6,7 @@ const dflash = @import("dflash.zig");
 const weights = @import("cuda_weights.zig");
 const snapshots = @import("cuda_snapshots.zig");
 const engine = @import("cuda_engine.zig");
+const pool = @import("cuda_sparse.zig").pool;
 const Engine = engine.Engine;
 
 /// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
@@ -52,10 +53,12 @@ pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool
     return std.mem.indexOfScalar(u32, marks, @intCast(next)) == null;
 }
 
-/// Whether a pair at `start` (b of `rb` rows) rebases the index rings where chunks one at a time do: at a, or not.
+/// Whether a pair at `start` (b of `rb` rows) rebases the index rings where chunks one at a time do: at a, or not; and
+/// fits them from there (State.ready rebases to a's pool, so a's rows into that pool count too).
 pub fn ringsAgree(base: usize, ring: usize, start: usize, rb: usize) bool {
     const ra = fw.prefill_rows;
-    return start + ra > base + ring or start + ra + rb <= base + ring;
+    if (start + ra + rb <= base + ring) return true;
+    return start + ra > base + ring and start % pool + ra + rb <= ring;
 }
 
 /// Whether a pair of `rows` at `start` leaves a drafter nothing to read: both chunks end before the rows it ingests.
@@ -162,6 +165,10 @@ test "a pair rebases the index rings where a chunk at a time would, so a ring ba
     try std.testing.expect(!ringsAgree(0, 2 * C, C, 1));
     try std.testing.expect(ringsAgree(0, 2 * C, 2 * C, C)); // both at a's start
     try std.testing.expect(ringsAgree(C, 2 * C, C, C));
+    try std.testing.expect(!ringsAgree(0, 2 * C, C + 1, C)); // rebased to C, b's last row would fall one past the ring
+    try std.testing.expect(ringsAgree(0, 2 * C, C + 1, C - 1));
+    try std.testing.expect(ringsAgree(0, 2 * C, C + 3, C - 3));
+    try std.testing.expect(!ringsAgree(0, 2 * C, C + 3, C - 2));
 }
 
 test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
