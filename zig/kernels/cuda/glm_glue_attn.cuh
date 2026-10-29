@@ -69,7 +69,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   const bool live = sparse ? start < n : start <= limit;
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
   const __nv_bfloat16* keys_at = !FP8 && pt && !sparse && live ? lc + ((int64_t)pt[c] * (pstep / 2) - start * LW) : lc;
-  auto load_kv = [&](int tile) {
+  auto load_kv = [&](int tile) {  // BF16: the tile's rows by cp.async into its buffer
     __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
     for (int idx = t; idx < KT * (LW / 8); idx += blockDim.x) {
@@ -77,29 +77,51 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const int64_t ki = first + key;
       const bool ok = sparse ? ki < n : ki <= limit;
       const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
-      if constexpr (FP8) {
-        // a slab row's codes at src and its scale at scales[src]; on pages a part's 512 rows of codes, then their scales
-        const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc) + src * LW;
-        const float* row_scales = scales + src;
-        if (pt && ok) {
-          static_assert(CH == 512, "a dense chunk is one page");
-          const int64_t off = sparse ? src % (pstep / LW) : ki - start;  // a sparse key is a row in pstep / LW rows a page
-          const unsigned char* page = reinterpret_cast<const unsigned char*>(lc) +
-                                      (sparse ? (src - off) * LW : (int64_t)pt[c] * pstep);
-          codes = page + off * LW;
-          row_scales = reinterpret_cast<const float*>(page + CH * LW) + off;
-        }
-        const float row_scale = ok ? *row_scales : 1.0f;
+      cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
+    }
+  };
+  // FP8: a tile's codes (one 8-byte load a slot) and scales fetched into registers a tile ahead, then converted into its
+  // buffer while the tile before is computed; 256 threads, so each holds PER of the tile's KT * LW / 8 slots.
+  constexpr int PER = FP8 ? KT * (LW / 8) / 256 : 1;
+  uint2 pre_c[PER];
+  float pre_s[PER];
+  auto fetch = [&](int tile) {
+    const int64_t first = start + tile * KT;
 #pragma unroll
-        for (int j = 0; j < 8; j += 2) {
-          const uint16_t bits = ok ? (uint16_t)codes[u * 8 + j] | ((uint16_t)codes[u * 8 + j + 1] << 8) : 0;
-          const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
-          dst[wide(key, u) + j] = __float2bfloat16_rn(__fmul_rn(v.x, row_scale));
-          dst[wide(key, u) + j + 1] = __float2bfloat16_rn(__fmul_rn(v.y, row_scale));
-        }
-      } else {
-        cp16(dst + wide(key, u), keys_at + src * LW + u * 8, ok);
+    for (int p = 0; p < PER; ++p) {
+      const int idx = t + p * 256, key = idx / (LW / 8), u = idx % (LW / 8);
+      const int64_t ki = first + key;
+      const bool ok = sparse ? ki < n : ki <= limit;
+      const int64_t src = ok ? (sparse ? (int64_t)tok[r * w + ki] : ki) : 0;
+      // a slab row's codes at src and its scale at scales[src]; on pages a part's 512 rows of codes, then their scales
+      const unsigned char* codes = reinterpret_cast<const unsigned char*>(lc) + src * LW;
+      const float* row_scales = scales + src;
+      if (pt && ok) {
+        static_assert(CH == 512, "a dense chunk is one page");
+        const int64_t off = sparse ? src % (pstep / LW) : ki - start;  // a sparse key is a row in pstep / LW rows a page
+        const unsigned char* page = reinterpret_cast<const unsigned char*>(lc) +
+                                    (sparse ? (src - off) * LW : (int64_t)pt[c] * pstep);
+        codes = page + off * LW;
+        row_scales = reinterpret_cast<const float*>(page + CH * LW) + off;
       }
+      pre_c[p] = ok ? *reinterpret_cast<const uint2*>(codes + u * 8) : make_uint2(0u, 0u);
+      pre_s[p] = ok ? *row_scales : 1.0f;
+    }
+  };
+  auto store = [&](int tile) {
+    __nv_bfloat16* dst = kvs + (tile & 1) * KT * LW;
+#pragma unroll
+    for (int p = 0; p < PER; ++p) {
+      const int idx = t + p * 256, key = idx / (LW / 8), u = idx % (LW / 8);
+      uint32_t out[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {  // code pairs (2j, 2j + 1), little-endian in the slot's eight bytes
+        const uint16_t bits = (uint16_t)(((j < 2 ? pre_c[p].x : pre_c[p].y) >> (16 * (j & 1))) & 0xffffu);
+        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(bits, __NV_E4M3)));
+        const __nv_bfloat162 b = __floats2bfloat162_rn(__fmul_rn(v.x, pre_s[p]), __fmul_rn(v.y, pre_s[p]));
+        out[j] = *reinterpret_cast<const uint32_t*>(&b);
+      }
+      *reinterpret_cast<uint4*>(dst + wide(key, u)) = make_uint4(out[0], out[1], out[2], out[3]);
     }
   };
   float m[MT][2], l[MT][2], o[MT][8][4];
@@ -115,10 +137,17 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
       const bool ok = h0 + hd < heads;
       cp16(qs + wide(hd, u), qa + (r * heads + (ok ? h0 + hd : 0)) * LW + u * 8, ok);
     }
-    load_kv(0);
-    commit();
-    load_kv(1);
-    commit();
+    if constexpr (FP8) {
+      fetch(0);
+      store(0);
+      fetch(1);
+      commit();  // the query's copies
+    } else {
+      load_kv(0);
+      commit();
+      load_kv(1);
+      commit();
+    }
   }
   for (int tile = 0; live && tile < tiles; ++tile) {
     if constexpr (FP8) {
@@ -130,6 +159,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
         wait<0>();
     }
     __syncthreads();
+    if constexpr (FP8) {  // the next tile into its buffer (free since the tile before's last barrier), the one after fetched
+      if (tile + 1 < tiles) store(tile + 1);
+      if (tile + 2 < tiles) fetch(tile + 2);
+    }
     const __nv_bfloat16* kv = kvs + (tile & 1) * KT * LW;
     const int64_t first = start + tile * KT;
     float sc[4];
@@ -211,8 +244,10 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
     __syncthreads();
     for (int i = 0; i < MT; ++i)
       for (int hf = 0; hf < 2; ++hf) l[i][hf] = __fmaf_rn(l[i][hf], alpha[i][hf], stat[HB + i * 16 + hf * 8 + g]);
-    if (tile + 2 < tiles) load_kv(tile + 2);
-    commit();
+    if constexpr (!FP8) {
+      if (tile + 2 < tiles) load_kv(tile + 2);
+      commit();
+    }
   }
   for (int i = 0; i < MT; ++i)
     for (int e = 0; e < 4; ++e) {
