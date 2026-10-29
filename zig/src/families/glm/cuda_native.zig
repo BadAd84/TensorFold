@@ -301,14 +301,15 @@ fn finishRank(a: OpenArgs) !Loaded {
         cuda.memory_receipt.emit(@intCast(p.rank), .cleanup_end, false);
         std.process.exit(0);
     }
-    // Rank 0 alone reads these: TF_GLM_PROMPT_STEPS=0 passes prompts whole, TF_GLM_SHARED=0 runs windows alone.
+    // Rank 0 alone reads these: TF_GLM_PROMPT_STEPS=0 passes prompts whole, TF_GLM_PROMPT_MANY=0 admits short prompts
+    // one a round, TF_GLM_SHARED=0 runs windows alone.
     const off = struct {
         fn get(name: [*:0]const u8) bool {
             return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
         }
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .alone = off("TF_GLM_SHARED") };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .together = !off("TF_GLM_PROMPT_MANY"), .alone = off("TF_GLM_SHARED") };
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
     return .{

@@ -43,6 +43,7 @@ const Lane = struct {
 pub const Lanes = struct {
     x: follow.Leader,
     whole: bool = false, // prompt passes run whole (TF_GLM_PROMPT_STEPS=0): no other stream's round between chunks
+    together: bool = true, // stepped: short prompts admitted in one pass (TF_GLM_PROMPT_MANY=0: one a round)
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -72,7 +73,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else &steps_vt };
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.together) &steps_many_vt else &steps_vt };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -96,6 +97,12 @@ pub const Lanes = struct {
         v.cancel_prefill = cancelPrefillFn;
         v.prefill_many = null;
         v.many_rows = 0;
+        break :vt v;
+    };
+    const steps_many_vt: be.Backend.VTable = vt: { // long, image and resumed prompts still fill by steps (open.batchable)
+        var v = steps_vt;
+        v.prefill_many = prefillManyFn;
+        v.many_rows = @intCast(engine.prompt_rows);
         break :vt v;
     };
 
