@@ -87,6 +87,8 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     var fb = e.view(&pair.bp, &two);
     fa.prof = null;
     fb.prof = null;
+    fa.taps = null; // drafterIdle: the drafter ingests none of these rows, so a chunk at a time's taps go unread too
+    fb.taps = null;
     fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks
     fb.index_split = split;
     const st = &e.cur.st;
@@ -102,6 +104,7 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, len: usize, cancel: 
     try cuda.copy_source.enqueue(e.d, pair.bp.ids, std.mem.sliceAsBytes(ids[ra .. ra + rb]), e.stream);
     try fw.Forward.pairBody(&fa, &fb, ra, rb);
     pair.steps += 1;
+    if (e.share.rank == 0) std.log.info("glm: paired prompt step {d} at {d} of {d} ({d} + {d} rows)", .{ pair.steps, start, len, ra, rb });
     e.index_splits += @intFromBool(split);
     try mtpRows(e, &fa, ids[1 .. ra + 1], e.bp.fnormed);
     try fa.commit(ra);
