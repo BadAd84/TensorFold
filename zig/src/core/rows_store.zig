@@ -112,6 +112,7 @@ pub const Rows = struct {
     stopped: bool = false,
     flush_clock: ?u64 = null, // a close protects states touched after this clock from older queued saves
     next_job: u64 = 0,
+    waiting: ?*pc.Entry = null, // the queued save the jobs in flight left no room for (a reap lets it try again)
     failures: write.Failures = .{},
     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
 
@@ -583,10 +584,12 @@ test {
     _ = image;
     _ = chain;
     _ = file;
+    _ = write.io;
     _ = @import("rows_test.zig");
     _ = @import("rows_spill_test.zig");
     _ = @import("rows_async_test.zig");
     _ = @import("rows_close_test.zig");
+    _ = @import("rows_stage_test.zig");
     _ = @import("rows_select_test.zig");
     _ = @import("rows_recall_select_test.zig");
     _ = @import("rows_pool_select_test.zig");
