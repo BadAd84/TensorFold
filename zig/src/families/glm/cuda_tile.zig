@@ -65,7 +65,7 @@ fn layerLinears(gpa: std.mem.Allocator, l: *Layer, list: *std.ArrayList(Lin)) !v
 /// TF_GLM_KDA_PAD: move an uneven fused KDA input stack into its own eight-aligned buffer (its true rows, then
 /// zeros), so `tiledInput()` passes and the stack is packed instead of staying bf16 row-major. The pad columns are
 /// computed from zero weights and ignored; the field offsets inside a row (f_a, g_a, b) do not move.
-fn padKdaInputs(w: *Weights, d: *const cuda.Driver, s: cuda.Stream) !void {
+pub fn padKdaInputs(w: *Weights, d: *const cuda.Driver, s: cuda.Stream) !void {
     for (w.layers) |*l| switch (l.mixer) {
         .kda => |*x| try padOneKdaInput(w, d, s, x),
         else => {},
