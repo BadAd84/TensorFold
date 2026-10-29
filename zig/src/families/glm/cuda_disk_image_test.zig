@@ -233,6 +233,7 @@ const Fake = struct {
     cur: struct { st: State, in_head: usize = 0 },
     capacity: usize = capacity,
     mtp: bool = true,
+    head: bool = true, // the head absorbs (no DFlash2): kept states carry its rows, as these tests read them
     snaps: std.AutoHashMapUnmanaged(u64, @import("cuda_engine_types.zig").Snap) = .empty,
     snap_pages: ?pages.Pool = null,
 };
