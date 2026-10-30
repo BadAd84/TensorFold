@@ -85,8 +85,8 @@ pub fn settle(r: *Rows) void {
     r.collect();
 }
 
-/// A file's stem: the first 16 bytes of its name in hex (32 digits), then `.blk` or `.st`.
-fn parseName(name: []const u8) ?chain.Stem {
+/// A file's stem: the first 16 bytes of its name in hex (32 digits), then `.blk` or `.st` (rows_carry reads it too).
+pub fn parseName(name: []const u8) ?chain.Stem {
     if (name.len < 33 or name[32] != '.') return null;
     var n: chain.Stem = undefined;
     _ = std.fmt.hexToBytes(&n, name[0..32]) catch return null;

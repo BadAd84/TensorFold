@@ -10,6 +10,7 @@ pub const file = @import("lanes").rows_file;
 pub const write = @import("rows_write.zig");
 pub const read = @import("rows_read.zig");
 pub const local = @import("rows_local.zig");
+pub const carry = @import("rows_carry.zig"); // TF_GLM_OVN_DISK_CARRY: an older identity's directory, read on proof
 const dirs = @import("lanes").learned_dirs;
 const readers = @import("lanes").disk_readers;
 const Admission = @import("lanes").learned_disk.Admission;
@@ -68,6 +69,7 @@ pub const Options = struct {
     sync_writes: bool = false,
     staging_bytes: u64 = 1 << 30,
     slots: ?usize = null, // --checkpoint-slots: the RAM store's states at most, beside this one (null: the family's)
+    adopted: ?u64 = null, // TF_GLM_OVN_DISK_CARRY: the older directory read and written instead (rows_carry.choose)
 };
 
 /// The store under `o`, the RAM store's disk: `o.slots` bounds what it keeps in RAM.
@@ -146,9 +148,7 @@ pub const Rows = struct {
         const img = family.vtable.rows orelse return error.RowsUnsupported;
         const r = try gpa.create(Rows);
         errdefer gpa.destroy(r);
-        var h = std.hash.Wyhash.init(0x726f7773);
-        h.update(std.mem.asBytes(&o.identity));
-        const id = h.final();
+        const id = o.adopted orelse carry.dirOf(o.identity); // an adopted directory's names stay keyed by its own id
         const root = try gpa.dupe(u8, o.root);
         errdefer gpa.free(root);
         const dir = try std.fmt.allocPrintSentinel(gpa, "{s}/{x:0>16}", .{ o.root, id }, 0);
@@ -533,6 +533,7 @@ test {
     _ = @import("rows_prefetch_stack_test.zig");
     _ = @import("rows_pump_test.zig");
     _ = @import("rows_local_test.zig");
+    _ = @import("rows_carry_test.zig");
 }
 
 /// TENSORFOLD_ROWS_STAGING_GIB: the host bytes the write worker stages at once (a save larger than that is skipped, so a

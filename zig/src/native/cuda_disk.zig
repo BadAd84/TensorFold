@@ -103,13 +103,28 @@ pub fn identityOf(a: Allocator, io: std.Io, g: *const cuda.Context, dir: []const
         if (comptime @TypeOf(v) == []const u8) h.update(v);
     }
     if (kernels) |k| h.update(try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ k, "aot.json" }), a, .limited(1 << 26)));
-    var name_buf: [256]u8 = undefined;
-    h.update(g.name(&name_buf) catch "GPU");
-    const device = [_]u64{ try g.capability(), @intCast(try g.d.version()) };
-    h.update(std.mem.sliceAsBytes(&device));
+    try device(&h, g);
     h.update(std.mem.sliceAsBytes(facts));
     h.update(std.mem.asBytes(&probed));
     return h.final();
+}
+
+/// TF_GLM_OVN_DISK_CARRY's key: the identity without the kernels (embedded or captured), every probe's hash last.
+pub fn carryOf(a: Allocator, io: std.Io, g: *const cuda.Context, dir: []const u8, facts: []const u64, probed: []const u64) !u64 {
+    var h = std.hash.Wyhash.init(0x63617272);
+    try disk_identity.checkpoint(&h, a, io, dir);
+    try device(&h, g);
+    h.update(std.mem.sliceAsBytes(facts));
+    h.update(std.mem.sliceAsBytes(probed));
+    return h.final();
+}
+
+/// The device's name, then its capability and driver version (another driver can compile a kernel to other bits).
+fn device(h: *std.hash.Wyhash, g: *const cuda.Context) !void {
+    var name_buf: [256]u8 = undefined;
+    h.update(g.name(&name_buf) catch "GPU");
+    const known = [_]u64{ try g.capability(), @intCast(try g.d.version()) };
+    h.update(std.mem.sliceAsBytes(&known));
 }
 
 /// A fixed prompt's state at a mark inside its last chunk, hashed (a kernel, driver or arithmetic change moves it).
