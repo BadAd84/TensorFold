@@ -220,7 +220,7 @@ pub const Lanes = struct {
         defer self.x.e.prompt_logprobs = null;
         var at: usize = if (from) |r| r.at else 0;
         while (true) {
-            const step = try self.x.chunk(s.prompt(), at, false, from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+            const step = try self.x.chunkOf(s.prompt(), at, false, from, reply.gate(s, cancelled), marksOf(s), false, reply.rowsOf(s)); // a reply's background pass: capped chunks, yields at each gate
             if (step.first) |first| {
                 self.lanes.getPtr(s).?.first = self.take(first);
                 return;
@@ -279,7 +279,7 @@ pub const Lanes = struct {
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
         const busy = self.othersDecode(s); // a pair would hold up their rounds; TF_GLM_OVN_FILL_SLICE_MS slices instead
-        const step = try self.x.chunkOf(s.prompt(), at, !busy, from, .{ .ptr = s, .check = cancelled }, marksOf(s), busy and @import("cuda_prompt_slices.zig").of(self.x.e) != null);
+        const step = try self.x.chunkOf(s.prompt(), at, !busy, from, .{ .ptr = s, .check = cancelled }, marksOf(s), busy and @import("cuda_prompt_slices.zig").of(self.x.e) != null, 0);
         if (step.first) |first| {
             l.first = self.take(first);
             l.fill = null;
@@ -292,6 +292,7 @@ pub const Lanes = struct {
         return false;
     }
     const fill_mod = @import("cuda_lanes_fill.zig");
+    const reply = @import("cuda_reply_prefill.zig");
 
     fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = of(ptr);

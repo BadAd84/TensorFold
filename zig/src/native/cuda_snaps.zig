@@ -2,12 +2,12 @@
 const std = @import("std");
 const api = @import("engine_api");
 
-/// Any row, the head one token on (Nemotron's); a family's snap_grid (or snapGridNow's), snap_lookahead, warm_quiet and
+/// Any row, the head one token on (Nemotron's); a family's snap_grid (or snapGridNow's), snap_lookahead, warmQuiet and
 /// snap_fork if set.
 pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
     var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
     if (@hasDecl(F, "snap_lookahead")) rules.lookahead = F.snap_lookahead;
-    if (@hasDecl(F, "warm_quiet")) rules.warm = .waits;
+    if (warmQuiet(F) != null) rules.warm = .waits;
     if (@hasDecl(F, "snap_fork")) rules.fork = F.snap_fork; // opt-in, a family at a time after its device check
     if (@hasDecl(F, "snap_grid")) {
         rules.planned = true;
@@ -27,6 +27,13 @@ pub fn passRules(comptime F: type, prompt_rows: u32) api.prompt_cache.Rules {
     if (@hasDecl(F, "snap_repeat_min")) rules.repeat_min = if (std.c.getenv("TF_FLASHNEXT_REPEAT_CACHE")) |v| (if (std.mem.eql(u8, std.mem.span(v), "0")) 0 else F.snap_repeat_min) else F.snap_repeat_min;
     rules.chunk_starts = false;
     return rules;
+}
+
+/// A family's warm turns' wait for quiet: its warm_quiet, or warmQuietNow's (a knob read at load); null: no warm turns.
+pub fn warmQuiet(comptime F: type) ?u64 {
+    if (@hasDecl(F, "warm_quiet")) return F.warm_quiet;
+    if (@hasDecl(F, "warmQuietNow")) return F.warmQuietNow();
+    return null;
 }
 
 /// The cache's bytes less what the family sets aside for its states (`snap_ready`, as Nemotron's spare buffers).
@@ -108,6 +115,27 @@ test "a family's snapGridNow plans its states on that grid only when it names on
     try std.testing.expect(on.planned and on.grid == 32);
     const off = cacheRules(Off);
     try std.testing.expect(!off.planned and off.grid == 0);
+}
+
+test "a family's warmQuietNow turns warm turns on only when it names a wait" {
+    const On = struct {
+        pub fn warmQuietNow() ?u64 {
+            return 7;
+        }
+    };
+    const Off = struct {
+        pub fn warmQuietNow() ?u64 {
+            return null;
+        }
+    };
+    const Fixed = struct {
+        pub const warm_quiet: u64 = 5;
+    };
+    try std.testing.expectEqual(@as(?u64, 7), warmQuiet(On));
+    try std.testing.expectEqual(@as(?u64, null), warmQuiet(Off));
+    try std.testing.expectEqual(@as(?u64, 5), warmQuiet(Fixed));
+    try std.testing.expectEqual(@as(?u64, null), warmQuiet(struct {}));
+    try std.testing.expect(cacheRules(On).warm == .waits and cacheRules(Off).warm == .off and cacheRules(Fixed).warm == .waits);
 }
 
 test {

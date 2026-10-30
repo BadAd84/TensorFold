@@ -35,6 +35,12 @@ pub const snap_min_rows: u32 = 2048;
 pub fn snapGridNow() ?u32 {
     return @import("cuda_kda_chunk.zig").snapGrid();
 }
+/// TF_GLM_OVN_REPLY_PREFILL: a reply's background pass prefills the next turn (cuda_reply_prefill); its quiet wait, ns.
+pub fn warmQuietNow() ?u64 {
+    return @import("cuda_reply_prefill.zig").quietNs();
+}
+/// That pass also waits out every other admitted job: a stepped or batched prompt fills on the same thread.
+pub const warm_alone = true;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 
@@ -188,6 +194,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const p = try place();
     const roce_bytes = try roceBytes(if (std.c.getenv("TF_ROCE_MAX_KB")) |v| std.mem.span(v) else null);
     if (p.world > 1 and std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
+    _ = try @import("cuda_reply_prefill.zig").settings(); // TF_GLM_OVN_REPLY_PREFILL's values, refused before the load
     var problem: []const u8 = "";
     const set = settingsOf(&ranks.environment, o, &problem) catch |err| {
         std.log.err("{s}", .{problem});
@@ -453,6 +460,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         ),
         error.NotModelOpt, error.UnsupportedQuant => "GLM-5.3-Flash on CUDA reads ModelOpt NVFP4 and MIXED_PRECISION checkpoints (the log names what config.json has)",
         error.UnreadableFormat => "a projection is stored in a format GLM-5.3-Flash on CUDA does not read (the log names its module, recipe and tensors)",
+        error.BadReplyPrefill => "TF_GLM_OVN_REPLY_PREFILL_QUIET_MS: 1 to 60000; TF_GLM_OVN_REPLY_PREFILL_ROWS: 0 or a multiple of 32 up to a prompt chunk",
         else => null,
     };
 }
@@ -465,7 +473,7 @@ test "a place inside its world of at most 16 ranks serves; a larger world is ref
 }
 
 test "a checkpoint refused for its format, at the entry or by the loader, is explained" {
-    for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat }) |e| try std.testing.expect(explain(null, e) != null);
+    for ([_]anyerror{ error.NotModelOpt, error.UnsupportedQuant, error.UnreadableFormat, error.BadReplyPrefill }) |e| try std.testing.expect(explain(null, e) != null);
 }
 
 test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {

@@ -64,7 +64,7 @@ pub fn sliceCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
             try x.begin(null);
             var at: usize = 0;
             firsts[k] = while (true) {
-                var r = try x.chunkOf(prompt, at, false, null, null, null, k > 0);
+                var r = try x.chunkOf(prompt, at, false, null, null, null, k > 0, 0);
                 while (r.sliced) {
                     slices += 1;
                     try x.bind(decoder); // another stream's round between two slices, as the lane host runs one
