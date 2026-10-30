@@ -50,31 +50,41 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi
 
 /// The block up to its down projection: [gate | up] and SwiGLU into s.act.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
+    return bodyRows(k, stream, l, s, x, x_stride, 0, rows, prompt);
+}
+
+/// body on rows lo..hi, each output row at its own row; s.tmp holds only this call's rows.
+pub fn bodyRows(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool) !void {
     const w = l.width;
+    const rows = hi - lo;
+    const xr = x + lo * x_stride * 2;
+    const gu = s.gu + lo * 2 * w * 2;
+    const act = s.act + lo * w * 2;
+    const xs = s.xs_act + lo * (w / 64) * 4;
     const q = switch (l.w) {
         .nvfp4 => |q| q,
         .bf16 => |b| { // [gate | up] in one matmul, as the shared expert's
-            // TF_GLM_OVN_SWIGLU_REDUCE: the K slices' reduce and SwiGLU in one kernel straight into s.act
-            if (try mm.swigluReduceB16(k.set.mm, k.set.packs, k.set.prompt, stream, x, x_stride, b.gu, 2 * w, l.dims, s.act, s.mm_part, rows, l.limit)) return;
-            try b16.matmul(k.set, stream, x, x_stride, b.gu, s.gu, s.mm_part, rows, 2 * w, l.dims, false);
-            return glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
+            // TF_GLM_OVN_SWIGLU_REDUCE: the K slices' reduce and SwiGLU in one kernel straight into act
+            if (try mm.swigluReduceB16(k.set.mm, k.set.packs, k.set.prompt, stream, xr, x_stride, b.gu, 2 * w, l.dims, act, s.mm_part, rows, l.limit)) return;
+            try b16.matmul(k.set, stream, xr, x_stride, b.gu, gu, s.mm_part, rows, 2 * w, l.dims, false);
+            return glue.swiglu(k.set, stream, gu, act, xs, l.limit, rows, w);
         },
         .mxfp8 => |m| { // [gate | up] stacked on the lane, its rows straight into s.gu
-            try projection.matmul(k.set, stream, .{ .mxfp8 = m.gu }, x, x_stride, s.gu, s.mm_part, rows, 2 * w, l.dims, false);
-            return glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
+            try projection.matmul(k.set, stream, .{ .mxfp8 = m.gu }, xr, x_stride, gu, s.mm_part, rows, 2 * w, l.dims, false);
+            return glue.swiglu(k.set, stream, gu, act, xs, l.limit, rows, w);
         },
     };
     for ([_]cuda.qmmf.Weight{ q.gate, q.up }, 0..) |proj, j| {
         // Fp4Linear(out=a column slice): the rows computed contiguous, then copied into their half of each row
-        try mm(k, stream, proj, x, x_stride, rows, s.tmp, false, prompt);
+        try mm(k, stream, proj, xr, x_stride, rows, s.tmp, false, prompt);
         var a: cuda.Args = .{};
         a.add(s.tmp);
         a.add(@as(c_longlong, @intCast(w * 2)));
-        a.add(s.gu + j * w * 2);
+        a.add(gu + j * w * 2);
         a.add(@as(c_longlong, @intCast(2 * w * 2)));
         a.add(@as(c_int, @intCast(rows)));
         a.add(@as(c_int, @intCast(w * 2)));
         try cuda.launch.launch(k.copy_rows, .{ .grid = .{ .x = @intCast((rows * w * 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
     }
-    try glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
+    try glue.swiglu(k.set, stream, gu, act, xs, l.limit, rows, w);
 }

@@ -87,11 +87,22 @@ pub fn body(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer
 
 /// `o_site`: TF_GLM_OVN_L2PF_PACED's fork; `chunked`: a prompt chunk's chain on TF_GLM_OVN_KDA_CHUNKED's kernel.
 pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, o_site: ?l2pace.At, chunked: ?kda_chunk.Prompt) !void {
-    var stamp = prof.span(profile, stream, .projections);
+    const stamp = prof.span(profile, stream, .projections);
     try project(set, stream, l, s, x, x_stride, rows);
     stamp.end();
     if (o_site) |at| try at.fork(stream); // TF_GLM_OVN_L2PF_PACED: o read into L2 while the chain runs
-    stamp = prof.span(profile, stream, .kda);
+    try chainProfile(set, ks, stream, l, s, rows, conv_state, state_in, wide, prompt, profile, chunked);
+}
+
+/// bodyProfile once projectRows ran on every row (TF_GLM_OVN_FRONTS): project's one dump, then the chain.
+pub fn restProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, chunked: ?kda_chunk.Prompt) !void {
+    try dumpOnce(stream, s.p, l.matWidth(), rows);
+    try chainProfile(set, ks, stream, l, s, rows, conv_state, state_in, wide, prompt, profile, chunked);
+}
+
+/// The block past its projections (s.p, s.ka, s.kg hold every row): the chain, then a prompt chunk's conv commit.
+fn chainProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, chunked: ?kda_chunk.Prompt) !void {
+    const stamp = prof.span(profile, stream, .kda);
     defer stamp.end();
     try chainRows(ks, stream, l, s, rows, conv_state, state_in, wide, chunked);
     if (prompt) try glue.convShift(set, stream, conv_state, s.p, rows, rows * l.matWidth(), l.matWidth(), 1, 3 * l.heads * kda.dk);
@@ -99,26 +110,34 @@ pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l
 
 /// The projections of `rows` rows into s.p, s.ka (decay) and s.kg (gate), row by row so segments share one call.
 pub fn project(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
+    try projectRows(set, stream, l, s, x, x_stride, 0, rows);
+    try dumpOnce(stream, s.p, l.matWidth(), rows);
+}
+
+/// project's matmuls on rows lo..hi, each output row at its own row; s.tmp holds only this call's rows.
+pub fn projectRows(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
     var selected = set;
     if (!l.tiledInput()) selected.mm = null;
     const n = l.heads * kda.dk;
     const w = l.matWidth();
     const fa = 3 * n;
+    const rows = hi - lo;
+    const xr = x + lo * x_stride * 2;
+    const p = s.p + lo * w * 2;
     switch (l.proj) {
-        .bf16 => |p| try b16.matmul(selected, stream, x, x_stride, p, s.p, s.mm_part, rows, w, l.dims, false),
+        .bf16 => |stack| try b16.matmul(selected, stream, xr, x_stride, stack, p, s.mm_part, rows, w, l.dims, false),
         .split => |sp| { // each part on its own kernel into its columns of s.p: one row straight there, more through tmp
             // cc-defer: two row copies a window; an output row stride on the lane and glm_mm if a profile flags them
             const one = rows == 1;
-            try projection.matmul(set, stream, .{ .mxfp8 = sp.qkv }, x, x_stride, if (one) s.p else s.tmp, s.mm_part, rows, fa, l.dims, false);
-            if (!one) try columns(set, stream, s.tmp, fa, s.p, w, rows);
+            try projection.matmul(set, stream, .{ .mxfp8 = sp.qkv }, xr, x_stride, if (one) p else s.tmp, s.mm_part, rows, fa, l.dims, false);
+            if (!one) try columns(set, stream, s.tmp, fa, p, w, rows);
             // the bf16 rest (2 * dk + heads wide) tiles with the stack, or stays row-major with it when uneven
-            try b16.matmul(selected, stream, x, x_stride, sp.rest, if (one) s.p + fa * 2 else s.tmp, s.mm_part, rows, w - fa, l.dims, false);
-            if (!one) try columns(set, stream, s.tmp, w - fa, s.p + fa * 2, w, rows);
+            try b16.matmul(selected, stream, xr, x_stride, sp.rest, if (one) p + fa * 2 else s.tmp, s.mm_part, rows, w - fa, l.dims, false);
+            if (!one) try columns(set, stream, s.tmp, w - fa, p + fa * 2, w, rows);
         },
     }
-    try b16.matmul(selected, stream, s.p + fa * 2, w, l.fb, s.ka, s.mm_part, rows, n, kda.dk, false);
-    try b16.matmul(selected, stream, s.p + (fa + kda.dk) * 2, w, l.gb, s.kg, s.mm_part, rows, n, kda.dk, false);
-    try dumpOnce(stream, s.p, w, rows);
+    try b16.matmul(selected, stream, p + fa * 2, w, l.fb, s.ka + lo * n * 2, s.mm_part, rows, n, kda.dk, false);
+    try b16.matmul(selected, stream, p + (fa + kda.dk) * 2, w, l.gb, s.kg + lo * n * 2, s.mm_part, rows, n, kda.dk, false);
 }
 
 /// The float64 gate's input: the projected fused stack (`rows` x `w` bf16, row stride `w`), written once.
