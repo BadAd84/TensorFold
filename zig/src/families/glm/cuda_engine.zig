@@ -211,6 +211,8 @@ pub const Engine = struct {
             std.log.info("glm: L2 prefetch beside decode windows: sites a {d} MiB, f {d} MiB, o {d} MiB each layer", .{ p.bytes[0] >> 20, p.bytes[1] >> 20, p.bytes[2] >> 20 });
         }
         errdefer if (e.l2pf) |*p| p.deinit();
+        e.m.l2pace = try @import("cuda_l2pace.zig").Paced.open(gpa, d, &e.w, l2pf_settings.on()); // TF_GLM_OVN_L2PF_PACED
+        errdefer if (e.m.l2pace) |*p| p.deinit(); // `m`'s own errdefer frees the copy taken before this was opened
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it

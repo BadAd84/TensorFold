@@ -24,6 +24,7 @@ const prof_mod = @import("cuda_prof.zig");
 const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const l2pf_mod = @import("cuda_l2pf.zig");
+const l2pace = @import("cuda_l2pace.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
 const moe_side = @import("cuda_moe_side.zig");
@@ -58,6 +59,7 @@ pub const Modules = struct {
     glue_row: u64, // TF_GLM_OVN_GLUE_ROW=N: a prompt piece's glue of N rows or more in one kernel (0: off)
     pdl_early: u64, // TF_GLM_OVN_PDL_EARLY: 1 the decode windows' glue launches dependent-ready, 2 prompt chunks too
     mla: glue.Mla, // TF_GLM_OVN_MLA_FUSEMERGE, TF_GLM_OVN_ABSORB_VEC: the MLA launch choices, read at load
+    l2pace: ?l2pace.Paced, // TF_GLM_OVN_L2PF_PACED: #1580's paced prefetch, opened by the engine after the weights tile
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -99,6 +101,7 @@ pub const Modules = struct {
         m.tiled = false;
         m.pools32 = cuda.ovn.on("POOLS32");
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.l2pace = null;
         m.side = try moe_side.Side.init(d); // last: nothing after it fails
         return m;
     }
@@ -114,6 +117,7 @@ pub const Modules = struct {
 
     pub fn deinit(m: *Modules) void {
         if (m.side) |*x| x.deinit();
+        if (m.l2pace) |*p| p.deinit();
         if (m.index) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
@@ -225,6 +229,11 @@ pub const Forward = struct {
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
     side: ?*const moe_side.Side = null, // TF_GLM_OVN_SHARED_SIDE: this window's shared experts beside its routed ones
 
+    /// TF_GLM_OVN_L2PF_PACED on this forward: a decode window of one rank with at most the knob's streams in it.
+    pub fn paced(f: *const Forward) ?*const l2pace.Paced {
+        return l2pace.Paced.gate(&f.m.l2pace, f.ranks.len, f.ranks[0].b.prefill, f.ranks[0].segs.len);
+    }
+
     pub fn set(f: *const Forward) glue.Set {
         const pdl = f.m.pdl_early >= @as(u64, if (f.ranks[0].b.prefill) 2 else 1);
         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .pdl_early = pdl, .mla = f.m.mla };
@@ -290,7 +299,7 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
+                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof, if (f.paced()) |p| .{ .l2 = p, .layer = li + di } else null);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
@@ -443,6 +452,7 @@ pub const Forward = struct {
         var alt = false; // the residual in b.x_alt (each fused glue writes the other buffer)
         var li: usize = 0;
         var di: usize = 0;
+        const pf = f.paced(); // TF_GLM_OVN_L2PF_PACED
         for (f.ranks[0].w.layers, 0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
             try f.prefetch(j, 2); // L2PF site `o`: the mixer's output projection while it runs
@@ -453,6 +463,7 @@ pub const Forward = struct {
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
             try f.prefetch(j, 0); // L2PF site `a`: this layer's FFN across the mixer's all-gather
+            if (pf) |p| try p.fork(f.stream, j, .f); // paced site f: this layer's router or dense gate/up across gather_a
             try f.gather(R);
             if (f.prof) |p| p.mark(f.stream, .gather_a);
             prof_mod.context(f.prof, j, null, .ffn);
@@ -469,6 +480,7 @@ pub const Forward = struct {
             alt = alt != fuse;
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
             try f.prefetch(j, 1); // L2PF site `f`: the next layer's mixer across the FFN's all-gather
+            if (pf) |p| try p.fork(f.stream, j, .n); // paced site n: the next layer's input projections across gather_b
             try f.gather(R);
             const next = fuse and j + 1 < f.ranks[0].w.layers.len; // fused: the next layer's attention-site hc_pre too
             for (f.ranks) |r| if (next) try hc_glue.fused(f, r, alt, r.w.layers[j + 1].attn_hc, r.w.layers[j + 1].in_norm, R) else try f.post(r, hc_glue.xAt(r, alt), R);
@@ -482,6 +494,7 @@ pub const Forward = struct {
         }
         if (f.l2pf) |p| try p.join(f.stream); // the side stream's forks rejoin before the window ends
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, hc_glue.xAt(r, alt), r.b.hidden, R, c.hidden, c.hc);
+        if (pf) |p| try p.join(f.stream); // every paced site rejoins before the window ends
     }
 
     /// TF_GLM_L2PF site `which` of layer `j` (a decode window's weight prefetch; off for prompt chunks).

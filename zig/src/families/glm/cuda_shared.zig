@@ -49,6 +49,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
             const seg = if (r.b.seg_kda) |x| (if (!b.prefill and x.segs == r.segs.len) x else null) else null;
+            if (f.paced()) |p| try p.fork(f.stream, li + di, .o); // TF_GLM_OVN_L2PF_PACED: o into L2 while the chains run
             for (r.segs) |g| {
                 const st = g.st;
                 const cur = st.cur[li];
