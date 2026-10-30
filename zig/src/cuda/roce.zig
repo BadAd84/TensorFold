@@ -12,8 +12,10 @@ const tp_group = @import("tp_group.zig");
 const Stream = @import("stream.zig").Stream;
 const kernels = @import("kernels.zig");
 const nap = @import("roce_nap.zig");
+const ovn = @import("ovn.zig");
+const rails = @import("roce_rails.zig");
 
-const max_hcas = 2;
+const max_hcas = rails.max_hcas; // the arrays' size; a rank uses `Gather.hca_cap` of them (two unless two rails)
 pub const max_world_roce = 4; // the most ranks this gather serves (a region holds a slot per peer)
 const max_peers = max_world_roce - 1;
 const slots = 2;
@@ -166,14 +168,6 @@ fn myIndexAt(me: usize, r: usize, world: usize) usize {
     return (me + world - 1 - r) % world;
 }
 
-/// Whether two IPv4-mapped RoCE GIDs share a /24: the cable that joins the two adjacent ports. Non-mapped
-/// (IPv6) GIDs never match, which keeps a fabric without per-link subnets on the index-h pairing.
-fn sameSubnet(a: [16]u8, b: [16]u8) bool {
-    const mapped = [12]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff };
-    if (!std.mem.eql(u8, a[0..12], &mapped) or !std.mem.eql(u8, b[0..12], &mapped)) return false;
-    return a[12] == b[12] and a[13] == b[13] and a[14] == b[14];
-}
-
 // -- the region's layout (the same on every rank) ---------------------------------------------------------------------
 const Layout = struct {
     slot_bytes: usize,
@@ -184,15 +178,16 @@ const Layout = struct {
     ctrl: usize,
     total: usize,
     recv_peer_stride: usize, // one peer's receive slots: slots * slot_bytes
-    flag_peer_stride: usize, // one peer's flags: slots * max_hcas * flag_stride
+    flag_peer_stride: usize, // one peer's flags: slots * hcas * flag_stride
+    flag_set_stride: usize, // every peer's flags; one-stripe shards under TF_GLM_OVN_ROCE_RAILS_KB use a second set
 
-    fn of(max_bytes: usize, world: usize) Layout {
+    fn of(max_bytes: usize, world: usize, hcas: usize) Layout {
         const s = std.mem.alignForward(usize, max_bytes, 4096);
         const peers = world - 1;
         const recv = peers * slots * s;
-        const flags = recv + peers * slots * max_hcas * flag_stride;
+        const flags = recv + peers * slots * hcas * flag_stride;
         const send = flags + slots * s;
-        return .{ .slot_bytes = s, .world = world, .recv = 0, .flags = flags, .send = send, .ctrl = send + slots * s, .total = send + slots * s + flag_stride, .recv_peer_stride = slots * s, .flag_peer_stride = slots * max_hcas * flag_stride };
+        return .{ .slot_bytes = s, .world = world, .recv = 0, .flags = flags, .send = send, .ctrl = send + slots * s, .total = send + slots * s + flag_stride, .recv_peer_stride = slots * s, .flag_peer_stride = slots * hcas * flag_stride, .flag_set_stride = peers * slots * hcas * flag_stride };
     }
 };
 // ctrl words
@@ -201,19 +196,22 @@ const c_nbytes = 1; // + slot
 const c_error = 3;
 const c_hca = 4;
 
-/// What a rank tells every peer to connect: its region, and per HCA its key, address and queue pair.
-const Blob = extern struct {
-    ok: u32,
-    n_hca: u32,
-    slot_bytes: u64,
-    max_bytes: u64, // the largest shard this rank would send this way (every rank uses the smallest)
-    addr: u64,
-    rkey: [max_hcas]u32,
-    qpn: [max_peers][max_hcas]u32, // peer p's queue pair on HCA h: the peer at index p connects to qpn[p][h]
-    mtu: [max_hcas]u32,
-    lid: [max_hcas]u16,
-    gid: [max_hcas][16]u8,
-};
+/// What a rank tells every peer to connect: its region, and per HCA (up to `n`) its key, address and queue pair.
+fn BlobOf(comptime n: usize) type {
+    return extern struct {
+        pub const cap = n;
+        ok: u32,
+        n_hca: u32,
+        slot_bytes: u64,
+        max_bytes: u64, // the largest shard this rank would send this way (every rank uses the smallest)
+        addr: u64,
+        rkey: [n]u32,
+        qpn: [max_peers][n]u32, // peer p's queue pair on HCA h: the peer at index p connects to qpn[p][h]
+        mtu: [n]u32,
+        lid: [n]u16,
+        gid: [n][16]u8,
+    };
+}
 
 const Hca = struct {
     ctx: ?*Context = null,
@@ -244,6 +242,9 @@ pub const Gather = struct {
     links: [max_peers][max_hcas]u8 = @splat(@splat(0)),
     peer_links: [max_peers][max_hcas]u8 = @splat(@splat(0)),
     n_links: u32 = 0,
+    hca_cap: usize = rails.default_hcas, // the HCAs this rank may stripe over: four with TF_GLM_OVN_ROCE_RAILS=2
+    stripe_min: usize = 0, // TF_GLM_OVN_ROCE_RAILS_KB in bytes: a smaller shard takes one link (0: every one stripes)
+    cpus: ?rails.Cpus = null, // TF_GLM_OVN_ROCE_CPU: the proxy thread's cores (null: anywhere)
     layout: Layout,
     region: memory.HostBuffer,
     region_dev: abi.DevicePtr,
@@ -262,11 +263,20 @@ pub const Gather = struct {
 
     /// Every rank's exchange or null on all; setup crosses ``group``'s communicator on ``s``. ``max_bytes``: a shard.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize) !?*Gather {
+        const two = try rails.wanted(); // every rank reads one environment, so every rank gathers one blob shape
+        const k: Knobs = .{ .stripe_min = if (two) @as(usize, try rails.stripeMinKb()) << 10 else 0, .cpus = try rails.proxyCpus(), .ilp = ovn.on("ROCE_ILP") };
+        if (two) return initOf(BlobOf(max_hcas), gpa, io, d, group, s, want, max_bytes, k);
+        return initOf(BlobOf(rails.default_hcas), gpa, io, d, group, s, want, max_bytes, k);
+    }
+
+    const Knobs = struct { stripe_min: usize, cpus: ?rails.Cpus, ilp: bool };
+
+    fn initOf(comptime Blob: type, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, s: Stream, want: bool, max_bytes: usize, k: Knobs) !?*Gather {
         if (group.world < 2 or group.world > max_world_roce) return error.PeerRefused;
         const g = try gpa.create(Gather);
         var mine: Blob = std.mem.zeroes(Blob);
         const ok = want and blk: {
-            g.setup(gpa, io, d, group, max_bytes) catch |e| {
+            g.setup(gpa, io, d, group, max_bytes, Blob.cap, k.ilp) catch |e| {
                 std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
                 break :blk false;
             };
@@ -292,7 +302,10 @@ pub const Gather = struct {
             return null;
         }
         g.max_bytes = @intCast(cap); // one cap for fits on every rank
-        g.selectLinks(all) catch |e| {
+        g.stripe_min = k.stripe_min;
+        g.cpus = k.cpus;
+        const least: ?usize = if (Blob.cap == rails.default_hcas) null else rails.leastLinks(all, Blob.cap);
+        g.selectLinks(all, least) catch |e| {
             std.log.warn("RoCE all-gather: {s} ({s}); NCCL carries every gather", .{ @errorName(e), std.mem.sliceTo(&g.err, 0) });
             g.teardown();
             gpa.destroy(g);
@@ -327,8 +340,8 @@ pub const Gather = struct {
         _ = std.fmt.bufPrint(g.err[0 .. g.err.len - 1], fmt, args) catch {};
     }
 
-    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, max_bytes: usize) !void {
-        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = @intCast(group.rank), .world = group.world, .n_peers = group.world - 1, .layout = .of(max_bytes, group.world), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes };
+    fn setup(g: *Gather, gpa: std.mem.Allocator, io: std.Io, d: *const Driver, group: *const tp_group.Group, max_bytes: usize, hca_cap: usize, ilp: bool) !void {
+        g.* = .{ .gpa = gpa, .d = d, .lib = undefined, .api = undefined, .rank = @intCast(group.rank), .world = group.world, .n_peers = group.world - 1, .layout = .of(max_bytes, group.world, hca_cap), .region = undefined, .region_dev = 0, .counters = undefined, .module = undefined, .f = undefined, .max_bytes = max_bytes, .hca_cap = hca_cap };
         g.lib = platform.DynLib.open("libibverbs.so.1") catch return platform.optional_libraries.unavailable(.verbs);
         errdefer g.lib.close();
         const info = @typeInfo(Api).@"struct";
@@ -337,7 +350,7 @@ pub const Gather = struct {
         }
         var names: [max_hcas][64]u8 = undefined;
         var lens: [max_hcas]usize = undefined;
-        g.n_hca = try hcaNames(io, gpa, &names, &lens);
+        g.n_hca = try rails.hcaNames(io, gpa, &names, &lens, hca_cap);
         g.region = try memory.HostBuffer.allocMapped(d, g.layout.total);
         errdefer g.region.free();
         @memset(g.region.bytes, 0);
@@ -348,7 +361,7 @@ pub const Gather = struct {
         try g.counters.upload(0, &zeros);
         g.module = try Module.load(d, kernels.roce_gather);
         errdefer g.module.unload();
-        g.f = try g.module.function("roce_gather");
+        g.f = try g.module.function(if (ilp) "roce_gather_ilp" else "roce_gather"); // TF_GLM_OVN_ROCE_ILP: loads first
         errdefer g.closeHcas();
         for (0..g.n_hca) |h| try g.openHca(io, gpa, h, names[h][0..lens[h]]);
     }
@@ -389,7 +402,7 @@ pub const Gather = struct {
         }
         hca.mtu = std.mem.readInt(u32, port.bytes[8..12], .little);
         hca.lid = std.mem.readInt(u16, port.bytes[34..36], .little);
-        hca.gid_index = try gidIndex(io, gpa, name);
+        hca.gid_index = try rails.gidIndex(io, gpa, name);
         if (a.ibv_query_gid(hca.ctx.?, port_num, hca.gid_index, &hca.gid) != 0) return error.HcaFailed;
         hca.pd = a.ibv_alloc_pd(hca.ctx.?) orelse return error.HcaFailed;
         hca.mr = a.ibv_reg_mr(hca.pd.?, g.region.bytes.ptr, g.region.bytes.len, access_local_write | access_remote_write) orelse {
@@ -405,7 +418,7 @@ pub const Gather = struct {
         }
     }
 
-    fn blob(g: *Gather, b: *Blob) void {
+    fn blob(g: *Gather, b: anytype) void {
         b.ok = 1;
         b.n_hca = g.n_hca;
         b.slot_bytes = g.layout.slot_bytes;
@@ -421,46 +434,16 @@ pub const Gather = struct {
         }
     }
 
-    /// Pair my HCAs with each peer's by the /24 their GIDs share: that is the cable joining the two boxes. A
-    /// crossed mesh (port h on one box is a different cable from port h on its peer) makes the plain index-h
-    /// pairing wrong, which is what refused RTR on the spark4-6 triangle. Falls back to index-h when no
-    /// subnet matches (a switched fabric), and refuses when the peers disagree on the count, since the
-    /// kernel waits on one link count for every peer.
-    fn selectLinks(g: *Gather, all: []const Blob) !void {
+    /// Pairs my HCAs with each peer's by shared /24 (rails.pairs); `least`: every pair cut to the ranks' fewest.
+    fn selectLinks(g: *Gather, all: anytype, least: ?usize) !void {
         var count: usize = 0;
         for (0..g.n_peers) |p| {
-            const peer = &all[peerRank(g.rank, p, g.world)];
-            var n: usize = 0;
-            for (0..g.n_hca) |h| {
-                var q: usize = 0;
-                var best: ?usize = null;
-                while (q < peer.n_hca) : (q += 1) {
-                    if (!sameSubnet(g.hcas[h].gid, peer.gid[q])) continue;
-                    var taken = false;
-                    for (g.peer_links[p][0..n]) |u| {
-                        if (@as(usize, u) == q) taken = true;
-                    }
-                    if (taken) continue;
-                    best = q;
-                    break;
-                }
-                if (best) |pq| {
-                    g.links[p][n] = @intCast(h);
-                    g.peer_links[p][n] = @intCast(pq);
-                    n += 1;
-                    if (n == max_hcas) break;
-                }
-            }
-            if (n == 0) { // no shared subnet: keep the plain index-h pairing
-                n = @min(@as(usize, g.n_hca), max_hcas);
-                for (0..n) |i| {
-                    g.links[p][i] = @intCast(i);
-                    g.peer_links[p][i] = @intCast(i);
-                }
-            }
+            const r = peerRank(g.rank, p, g.world);
+            var n = rails.pairs(&all[g.rank], &all[r], g.hca_cap, &g.links[p], &g.peer_links[p]);
+            if (least) |k| n = rails.keep(&g.links[p], &g.peer_links[p], n, k, r < g.rank);
             if (p == 0) {
                 count = n;
-            } else if (n != count) {
+            } else if (n != count) { // the kernel waits on one link count for every peer
                 g.fail("peer {d} has {d} link(s) where peer 0 has {d}", .{ p, n, count });
                 return error.PeerRefused;
             }
@@ -468,7 +451,7 @@ pub const Gather = struct {
         g.n_links = @intCast(count);
     }
 
-    fn connect(g: *Gather, p: usize, peer: *const Blob) !void {
+    fn connect(g: *Gather, p: usize, peer: anytype) !void {
         const r = peerRank(g.rank, p, g.world);
         const me_there = myIndexAt(g.rank, r, g.world); // my slot in r's peer list: qpn[me_there][q] targets me
         g.peer_addr[p] = peer.addr;
@@ -521,22 +504,23 @@ pub const Gather = struct {
         const base = @intFromPtr(g.region.bytes.ptr);
         const packs = nbytes / 16;
         var seq_copy: u32 = seq;
+        const links = g.stripes(nbytes);
         for (0..g.n_peers) |p| {
             const r = peerRank(g.rank, p, g.world);
             const at_peer = myIndexAt(g.rank, r, g.world);
             var offset: u64 = 0;
-            for (0..g.n_links) |i| {
+            for (0..links) |i| {
                 const h = g.links[p][i];
                 const x = &g.hcas[h];
                 while (x.outstanding >= send_depth / 4) {
                     try g.drain(h);
                     if (!g.running.load(.monotonic)) return error.ProxyFailed;
                 }
-                var n = packs / g.n_links;
-                if (i < packs % g.n_links) n += 1;
+                var n = packs / links;
+                if (i < packs % links) n += 1;
                 const bytes: u32 = n * 16;
                 var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
-                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + at_peer * g.layout.flag_peer_stride + (slot * g.n_links + i) * flag_stride, .rkey = g.peer_rkey[p][h] };
+                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + g.flagSet(links) + at_peer * g.layout.flag_peer_stride + (slot * links + i) * flag_stride, .rkey = g.peer_rkey[p][h] };
                 var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
                 var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr[p] + g.layout.recv + at_peer * g.layout.recv_peer_stride + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[p][h] };
                 var bad: ?*SendWr = null;
@@ -553,8 +537,19 @@ pub const Gather = struct {
         for (0..g.n_hca) |h| try g.drain(h);
     }
 
+    /// Stripes a peer for a shard of `bytes`: the size alone decides, so the proxy and every rank's kernel agree.
+    fn stripes(g: *const Gather, bytes: usize) u32 {
+        return if (bytes < g.stripe_min) 1 else g.n_links;
+    }
+
+    /// A shard's flag set: one-stripe shards under a threshold use a second set, so two stripe counts share no flag.
+    fn flagSet(g: *const Gather, links: u32) usize {
+        return if (g.stripe_min > 0 and links == 1) g.layout.flag_set_stride else 0;
+    }
+
     /// The proxy: spins on the doorbell and posts each sequence in order (a missed one from its slot's size).
     fn proxy(g: *Gather) void {
+        if (g.cpus) |m| rails.pin(m);
         const c = g.ctrl();
         var idle: u64 = 0;
         while (g.running.load(.monotonic)) {
@@ -604,20 +599,21 @@ pub const Gather = struct {
         const grid: u32 = @intCast(@min(std.math.ceilPowerOfTwo(usize, need) catch max_blocks, max_blocks));
         const klass: i32 = @intCast(std.math.log2_int(u32, grid));
         const base = g.region_dev;
+        const n = g.stripes(bytes); // the proxy derives the same count from the same size
         var a: launch.Args = .{};
         a.add(send);
         a.add(recv);
         a.add(@as(i32, @intCast(packs)));
         a.add(@as(i32, g.rank));
         a.add(base + g.layout.recv);
-        a.add(base + g.layout.flags);
+        a.add(base + g.layout.flags + g.flagSet(n));
         a.add(base + g.layout.send);
         a.add(base + g.layout.ctrl);
         a.add(@as(i64, @intCast(g.layout.slot_bytes)));
         a.add(g.counters.ptr);
         a.add(klass);
         a.add(spin_limit);
-        a.add(@as(i32, @intCast(g.n_links)));
+        a.add(@as(i32, @intCast(n)));
         a.add(@as(i32, @intCast(g.world)));
         a.add(@as(i64, @intCast(g.layout.recv_peer_stride)));
         a.add(@as(i64, @intCast(g.layout.flag_peer_stride)));
@@ -649,49 +645,10 @@ pub const Gather = struct {
     }
 };
 
-/// The HCAs to stripe over, at most two: TF_ROCE_HCA, else NCCL_IB_HCA without "=^" prefixes or ":port" suffixes.
-fn hcaNames(io: std.Io, gpa: std.mem.Allocator, names: *[max_hcas][64]u8, lens: *[max_hcas]usize) !u32 {
-    _ = io;
-    _ = gpa;
-    const raw = std.c.getenv("TF_ROCE_HCA") orelse std.c.getenv("NCCL_IB_HCA") orelse return error.NoHca;
-    var n: u32 = 0;
-    var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
-    while (it.next()) |w| {
-        if (n == max_hcas) break;
-        var s = std.mem.trimStart(u8, std.mem.trim(u8, w, " "), "=^");
-        if (std.mem.indexOfScalar(u8, s, ':')) |c| s = s[0..c];
-        if (s.len == 0 or s.len > 63) continue;
-        @memcpy(names[n][0..s.len], s);
-        lens[n] = s.len;
-        n += 1;
-    }
-    if (n == 0) return error.NoHca;
-    return n;
-}
-
-/// The HCA's RoCE v2 IPv4 GID (TF_ROCE_GID_INDEX overrides): its index differs between hosts' tables.
-fn gidIndex(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !c_int {
-    if (std.c.getenv("TF_ROCE_GID_INDEX")) |v| return std.fmt.parseInt(c_int, std.mem.span(v), 10) catch error.NoHca;
-    const cwd = std.Io.Dir.cwd();
-    var i: c_int = 0;
-    while (i < 16) : (i += 1) {
-        var pbuf: [160]u8 = undefined;
-        const tpath = try std.fmt.bufPrint(&pbuf, "/sys/class/infiniband/{s}/ports/1/gid_attrs/types/{d}", .{ name, i });
-        const t = cwd.readFileAlloc(io, tpath, gpa, .limited(64)) catch continue;
-        defer gpa.free(t);
-        if (!std.mem.startsWith(u8, t, "RoCE v2")) continue;
-        const gpath = try std.fmt.bufPrint(&pbuf, "/sys/class/infiniband/{s}/ports/1/gids/{d}", .{ name, i });
-        const gid = cwd.readFileAlloc(io, gpath, gpa, .limited(64)) catch continue;
-        defer gpa.free(gid);
-        if (std.mem.startsWith(u8, gid, "0000:0000:0000:0000:0000:ffff:")) return i;
-    }
-    return error.NoHca;
-}
-
 test "RoCE gather: every rank agrees one cap" {
     // 511 KiB and 512 KiB round to the same slot; a 512 KiB shard must take the same path on every rank
-    try std.testing.expectEqual(Layout.of(511 << 10, 2).slot_bytes, Layout.of(512 << 10, 2).slot_bytes);
-    try std.testing.expectEqual(Layout.of(511 << 10, 3).slot_bytes, Layout.of(512 << 10, 4).slot_bytes);
+    try std.testing.expectEqual(Layout.of(511 << 10, 2, rails.default_hcas).slot_bytes, Layout.of(512 << 10, 2, rails.default_hcas).slot_bytes);
+    try std.testing.expectEqual(Layout.of(511 << 10, 3, rails.default_hcas).slot_bytes, Layout.of(512 << 10, 4, rails.default_hcas).slot_bytes);
     const a = @min(@as(u64, 511 << 10), @as(u64, 512 << 10));
     const b = @min(@as(u64, 512 << 10), @as(u64, 511 << 10));
     try std.testing.expectEqual(a, b);
@@ -712,4 +669,18 @@ test "RoCE gather: peer and slot indices agree at every world" {
         // A rank is its own peer never, so the w-1 peers must cover exactly the other ranks.
         for (seen[0..w], 0..) |s, i| if (i != me) try std.testing.expect(s) else try std.testing.expect(!s);
     };
+}
+
+test "RoCE gather: two rails a peer keep the slots and grow only the flags" {
+    const one = Layout.of(4096 << 10, 3, rails.default_hcas);
+    const two = Layout.of(4096 << 10, 3, max_hcas);
+    try std.testing.expectEqual(one.slot_bytes, two.slot_bytes);
+    try std.testing.expectEqual(one.flags + 2 * 2 * 2 * flag_stride, two.flags);
+    try std.testing.expectEqual(one.flag_peer_stride * 2, two.flag_peer_stride);
+    try std.testing.expectEqual(one.total + 2 * 2 * 2 * flag_stride, two.total);
+    // both flag sets fit the flag room (slots * slot_bytes before send) at the most ranks and HCAs
+    const most = Layout.of(1, max_world_roce, max_hcas);
+    try std.testing.expect(2 * most.flag_set_stride <= most.send - most.flags);
+    // the blob a rank sends with rails off is the one it sent before the knob (two HCAs)
+    try std.testing.expectEqual(@as(usize, 112), @sizeOf(BlobOf(rails.default_hcas)));
 }

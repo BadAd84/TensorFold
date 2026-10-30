@@ -81,6 +81,7 @@ test {
     _ = prompt_logprobs;
     _ = engine;
     _ = follow;
+    _ = @import("cuda_link_one.zig");
     _ = lanes;
     _ = native;
     _ = @import("cuda_qpack.zig");

@@ -45,11 +45,44 @@ __device__ __forceinline__ uint32_t arrive(uint32_t* p) {
 __device__ __forceinline__ void fence_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
 __device__ __forceinline__ void fence_gpu() { asm volatile("fence.sc.gpu;" ::: "memory"); }
 
-}  // namespace
+constexpr int MAX_PEERS = 3;  // four ranks
+constexpr int ILP = 4;        // roce_gather_ilp: packs a peer each thread loads before it stores any
+
+// Peer shards out ILP packs a peer at a time: every load issued before any store, so a thread's round trips overlap.
+__device__ __forceinline__ void copy_peers_ilp(uint4* __restrict__ out, const char* recv, int packs, int rank, int world,
+                                               long long slot_off, long long recv_peer_stride, int at, int stride) {
+    const int peers = world - 1;
+    for (int base = at; base < packs; base += ILP * stride) {
+        uint4 v[MAX_PEERS][ILP];
+#pragma unroll
+        for (int p = 0; p < MAX_PEERS; ++p) {
+            if (p < peers) {
+                const uint4* theirs = reinterpret_cast<const uint4*>(recv + (long long)p * recv_peer_stride + slot_off);
+#pragma unroll
+                for (int u = 0; u < ILP; ++u) {
+                    const int i = base + u * stride;
+                    if (i < packs) v[p][u] = ld_relaxed_sys4(theirs + i);
+                }
+            }
+        }
+#pragma unroll
+        for (int p = 0; p < MAX_PEERS; ++p) {
+            if (p < peers) {
+                uint4* peer_out = out + (long long)((rank + 1 + p) % world) * packs;
+#pragma unroll
+                for (int u = 0; u < ILP; ++u) {
+                    const int i = base + u * stride;
+                    if (i < packs) peer_out[i] = v[p][u];
+                }
+            }
+        }
+    }
+}
 
 // in: this rank's shard (packs of 16 bytes); out: every rank's shard in rank order. klass: log2(gridDim.x).
 // Peer p of `rank` is rank (rank + 1 + p) % world; its stripes arrive at recv + p * recv_peer_stride.
-extern "C" __global__ void __launch_bounds__(512) roce_gather(
+template <bool LOADS_FIRST>
+__device__ __forceinline__ void gather_body(
     const uint4* __restrict__ in, uint4* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
     uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca,
     int world, long long recv_peer_stride, long long flag_peer_stride) {
@@ -91,12 +124,16 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
     if (ld_relaxed_gpu(counters + K_POISON) == 0u) {  // 4. every shard in rank order
         uint4* own_out = out + (long long)rank * packs;
         for (int i = at; i < packs; i += stride) own_out[i] = in[i];
-        for (int p = 0; p < peers; ++p) {
-            const int r = (rank + 1 + p) % world;
-            const uint4* theirs = reinterpret_cast<const uint4*>(
-                recv + (long long)p * recv_peer_stride + (long long)slot * slot_bytes);
-            uint4* peer_out = out + (long long)r * packs;
-            for (int i = at; i < packs; i += stride) peer_out[i] = ld_relaxed_sys4(theirs + i);
+        if (LOADS_FIRST) {
+            copy_peers_ilp(out, recv, packs, rank, world, (long long)slot * slot_bytes, recv_peer_stride, at, stride);
+        } else {
+            for (int p = 0; p < peers; ++p) {
+                const int r = (rank + 1 + p) % world;
+                const uint4* theirs = reinterpret_cast<const uint4*>(
+                    recv + (long long)p * recv_peer_stride + (long long)slot * slot_bytes);
+                uint4* peer_out = out + (long long)r * packs;
+                for (int i = at; i < packs; i += stride) peer_out[i] = ld_relaxed_sys4(theirs + i);
+            }
         }
     }
     fence_gpu();  // 5. the epoch, by the last block to finish
@@ -105,4 +142,23 @@ extern "C" __global__ void __launch_bounds__(512) roce_gather(
         fence_gpu();
         if (ld_relaxed_sys(ctrl + C_ERROR) == 0u) st_release_gpu(counters + K_EPOCH, seq);
     }
+}
+
+}  // namespace
+
+extern "C" __global__ void __launch_bounds__(512) roce_gather(
+    const uint4* __restrict__ in, uint4* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
+    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca,
+    int world, long long recv_peer_stride, long long flag_peer_stride) {
+    gather_body<false>(in, out, packs, rank, recv, flags, send, ctrl, slot_bytes, counters, klass, spin_limit, n_hca,
+                       world, recv_peer_stride, flag_peer_stride);
+}
+
+// TF_GLM_OVN_ROCE_ILP: the same exchange, the peers' copy-out with its loads issued before its stores (same bytes).
+extern "C" __global__ void __launch_bounds__(512) roce_gather_ilp(
+    const uint4* __restrict__ in, uint4* __restrict__ out, int packs, int rank, char* recv, char* flags, char* send,
+    uint32_t* ctrl, long long slot_bytes, uint32_t* counters, int klass, uint32_t spin_limit, int n_hca,
+    int world, long long recv_peer_stride, long long flag_peer_stride) {
+    gather_body<true>(in, out, packs, rank, recv, flags, send, ctrl, slot_bytes, counters, klass, spin_limit, n_hca,
+                      world, recv_peer_stride, flag_peer_stride);
 }

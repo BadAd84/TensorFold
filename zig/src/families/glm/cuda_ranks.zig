@@ -23,6 +23,7 @@ pub const Settings = struct {
     layers: u32 = 0, // TF_GLM_LAYERS: the first this many layers only, a thin model for one-GPU checks (0: all)
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
+    ovn_comms: u32 = 0, // the comms lane's TF_GLM_OVN_* knobs as one word (ovnComms): every rank exchanges alike
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -107,6 +108,10 @@ pub const Settings = struct {
                 },
             };
         };
+        s.ovn_comms = ovnComms() catch {
+            problem.* = "TF_GLM_OVN_ROCE_RAILS: 1 or 2; TF_GLM_OVN_ROCE_RAILS_KB: under 1048576";
+            return error.BadSetting;
+        };
         s.heat = heat.bandsFrom(get("TF_HEAT_HIGH"), get("TF_HEAT_LOW")) catch {
             problem.* = "TF_HEAT_HIGH and TF_HEAT_LOW: both or neither, in degrees, with low at or under high";
             return error.BadSetting;
@@ -126,6 +131,13 @@ pub const Settings = struct {
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
 pub const max_world = 16;
 
+/// TF_GLM_OVN_ROCE_RAILS (bit 0), LINK1 (1), LINK_ROCE (2) and ROCE_RAILS_KB (from bit 8): the shapes ranks exchange.
+pub fn ovnComms() !u32 {
+    const rails = try cuda.roce_rails.wanted();
+    const kb: u32 = if (rails) try cuda.roce_rails.stripeMinKb() else 0;
+    return @as(u32, @intFromBool(rails)) | @as(u32, @intFromBool(cuda.ovn.on("LINK1"))) << 1 | @as(u32, @intFromBool(cuda.ovn.on("LINK_ROCE"))) << 2 | kb << 8;
+}
+
 /// The process environment's value of `name` (null when unset).
 pub fn environment(name: [:0]const u8) ?[]const u8 {
     return std.mem.span(std.c.getenv(name) orelse return null);
@@ -133,7 +145,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 14, // this struct's version
+    layout: u32 = 15, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -153,6 +165,8 @@ pub const Fingerprint = extern struct {
     max_videos: u32 = 0,
     max_frames: u32 = 0,
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
+    ovn_comms: u32 = 0, // Settings.ovn_comms: the RoCE gather's blob and stripes and the step link's transport
+    _pad: u32 = 0, // keeps capacity 8-aligned with no implicit padding (the bytes cross the communicator)
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -181,6 +195,7 @@ pub const Fingerprint = extern struct {
         max_videos,
         max_frames,
         bits,
+        ovn_comms,
         capacity,
         heat_high,
         heat_low,
@@ -214,6 +229,7 @@ pub const Fingerprint = extern struct {
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
+            .ovn_comms = s.ovn_comms,
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -251,6 +267,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_videos",
             "max_frames",
             "bits",
+            "ovn_comms",
             "capacity",
             "heat_high",
             "heat_low",
@@ -361,6 +378,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
+        .ovn_comms => "TF_GLM_OVN_ROCE_RAILS, TF_GLM_OVN_ROCE_RAILS_KB, TF_GLM_OVN_LINK1 or TF_GLM_OVN_LINK_ROCE",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
