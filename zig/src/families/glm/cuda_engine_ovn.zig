@@ -1,5 +1,5 @@
 //! The engine's speed-hunt knobs made at load (TF_GLM_OVN_SHARED_PROF, _DRAW1, _SEG_KDA, _SEG_COMMIT, _SEG_DSA,
-//! _FILL_SLICE_MS, _ONE_CHUNK).
+//! _FILL_SLICE_MS, _ONE_CHUNK, _LINEAGE).
 const std = @import("std");
 const cuda = @import("cuda");
 const Engine = @import("cuda_engine.zig").Engine;
@@ -16,6 +16,7 @@ pub fn open(e: *Engine, gpa: std.mem.Allocator, io: std.Io) !void {
         e.one = try @import("cuda_one_chunk.zig").Capture.create(gpa, e.d, &e.cur.st, e.c.i_dim, e.c.hidden);
         @import("cuda_one_chunk.zig").on = true;
     }
+    if (cuda.ovn.on("LINEAGE")) @import("cuda_lineage.zig").on = true; // kept and live rows' tags (cuda_lineage)
     if (cuda.ovn.on("SHARED_PROF")) e.shared_prof = try @import("cuda_engine_prof.zig").Shared.create(gpa, e.d, io);
     if (cuda.ovn.on("DRAW1")) e.draw1 = try @import("cuda_draw1.zig").Draw1.init(e);
     if (e.bs != null and cuda.ovn.on("SEG_KDA")) { // glm_kda is fw.Modules.load's module 0, glm_glue its 6

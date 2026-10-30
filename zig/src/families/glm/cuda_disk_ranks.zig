@@ -39,6 +39,7 @@ pub fn copier(e: *Engine, id: u64, end: u64, segs: *std.ArrayList(image.Seg), w:
     const at: u32 = @intCast(s.pos);
     if (s.len == 0 and end > image.Words.bytes + image.front(sh, at)) return error.DiskOrder;
     try image.segments(sh, at, s.mtp_len, segs, e.gpa);
+    if (@import("cuda_lineage.zig").on) try @import("cuda_lineage_copy.zig").remap(e, s, segs); // a padded lease
     w.* = (try wordsOf(e, id)).encode();
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     return .{ .d = e.d, .pool = pool, .lease = &s.lease, .segs = segs.items, .words = w };

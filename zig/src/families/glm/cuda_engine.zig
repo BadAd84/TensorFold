@@ -377,6 +377,7 @@ pub const Engine = struct {
     pub fn begin(e: *Engine, sampling: ?sampler.Sampling) !void {
         e.cur.sampling = sampler.check(sampling);
         e.cur.in_head = 0;
+        if (@import("cuda_lineage.zig").on) e.cur.st.lin.reset(e.cur.st.pos); // its rows stay; new writes, new tag
         try e.cur.st.reset(e.stream);
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }

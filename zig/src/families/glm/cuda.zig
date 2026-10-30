@@ -48,9 +48,12 @@ pub const disk_ranks = @import("cuda_disk_ranks.zig");
 pub const one_chunk = @import("cuda_one_chunk.zig");
 pub const disk_local = @import("cuda_disk_local.zig"); // TF_GLM_OVN_DISK_LOCAL: each rank's part on its own disk
 pub const rotlayer = @import("cuda_rotlayer.zig"); // TF_GLM_OVN_EXPERT_ROTATE: each MoE layer's first shares rotated
+pub const lineage = @import("cuda_lineage.zig"); // TF_GLM_OVN_LINEAGE: rows' tags, and the copies they spare
+pub const lineage_copy = @import("cuda_lineage_copy.zig");
 
 test {
     _ = @import("cuda_tile.zig");
+    _ = lineage;
     _ = @import("cuda_kv8_test.zig");
     _ = @import("cuda_kvb.zig");
     _ = @import("cuda_mla_ovn_test.zig");

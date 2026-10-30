@@ -26,6 +26,13 @@ pub const Plan = struct {
         return (try make(&whole, c, at, head, true)).len;
     }
 
+    /// `size`'s plan (TF_GLM_OVN_LINEAGE pads its parts): the sequence's addresses, no page read.
+    pub fn sized(st: *const State, c: *const Config, capacity: usize, at: usize, head: ?usize) !Plan {
+        var whole = st.*;
+        whole.capacity = capacity;
+        return make(&whole, c, at, head, true);
+    }
+
     fn make(st: *const State, c: *const Config, at: usize, head: ?usize, sizing: bool) !Plan {
         if (at > st.capacity or st.caches.len > @import("config.zig").max_layers) return error.SnapshotShape;
         if (st.rings.len != 2 * (st.caches.len + 1)) return error.SnapshotShape;

@@ -315,6 +315,9 @@ pub const Lanes = struct {
     pub fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
+        if (@import("cuda_lineage.zig").on) if (self.x.e.pages) |p| { // its pages: those that hold the kept rows
+            p.want = if (s.prompt_logprobs != null) 0 else self.keptId(s, ids.len);
+        };
         const pages = try self.seat(s, ids.len, s.max_new);
         errdefer {
             self.x.e.release(self.lanes.get(s).?.slot);
@@ -325,6 +328,13 @@ pub const Lanes = struct {
         s.cached = 0;
         s.prompt_rows.clearRetainingCapacity();
         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
+    }
+
+    /// TF_GLM_OVN_LINEAGE: the kept state `resumeFrom` would take, leaving the stream's notes (0: none).
+    fn keptId(self: *const Lanes, s: *const lanes.Stream, len: usize) u64 {
+        const saved = s.reuse.saved orelse return 0;
+        const k: *const engine.Kept = @ptrCast(@alignCast(saved));
+        return if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !self.x.e.holds(k.id)) 0 else k.id;
     }
 
     /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.

@@ -6,6 +6,8 @@ pub const pages = @import("cuda_snapshot_pages.zig");
 pub const layout = @import("cuda_snapshot_layout.zig");
 const ring_bytes = @import("dflash.zig").ring_bytes;
 pub const gather = @import("cuda_snapshot_gather.zig");
+const lin = @import("cuda_lineage.zig"); // TF_GLM_OVN_LINEAGE: every branch below reads it first
+const lin_copy = @import("cuda_lineage_copy.zig");
 
 pub const Setup = struct { ptr: *anyopaque, run: *const fn (*anyopaque, u64) anyerror!void };
 
@@ -33,9 +35,10 @@ pub fn bytes(e: anytype, at: usize) u64 {
     return planBytes(e, at) +| windowBytes(e);
 }
 
-fn planBytes(e: anytype, at: usize) u64 {
+pub fn planBytes(e: anytype, at: usize) u64 {
     // the head's rows as keepAs plans them: none while it absorbs nothing (DFlash2 drafting), so mtp_len stays 0
     const head: ?usize = if (!e.mtp) null else if (!e.head) 0 else @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64));
+    if (lin.on) return lin_copy.size(&e.cur.st, &e.c, e.capacity, at, head); // the padded lease
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
     return pages.rounded(n) catch std.math.maxInt(u64);
@@ -44,7 +47,7 @@ fn planBytes(e: anytype, at: usize) u64 {
 /// TF_GLM_OVN_DRAFT_KEEPWIN: the bound sequence's drafter ring and its first row a state kept here carries.
 const Window = struct { ring: u64, from: i64 };
 
-fn window(e: anytype) ?Window {
+pub fn window(e: anytype) ?Window {
     if (comptime !@hasField(@TypeOf(e.*), "drafter")) {
         return null;
     } else {
@@ -85,7 +88,8 @@ pub fn resumeDrafter(e: anytype, dr: anytype, r: types.Resume) !void {
     const s = e.snaps.getPtr(r.id) orelse return error.NoKeptState;
     const from = s.win_from orelse return dr.restart(e.slot, r.at); // the rows before it were never tapped
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    try moveFlat(pool, e.stream, &s.lease, try pages.rounded(s.len), try dr.ringOf(e.slot), ring_bytes, false);
+    const end = if (lin.on) try lin_copy.end(e, s) else try pages.rounded(s.len);
+    try moveFlat(pool, e.stream, &s.lease, end, try dr.ringOf(e.slot), ring_bytes, false);
     try dr.restartKept(e.slot, from, r.at);
 }
 
@@ -100,7 +104,10 @@ pub fn keep(e: anytype) !u64 {
 
 pub fn keepAs(e: anytype, id: u64) !void {
     const one_chunk = @import("cuda_one_chunk.zig");
-    if (one_chunk.taking(e)) |k| return one_chunk.keep.keepAt(e, id, k); // TF_GLM_OVN_ONE_CHUNK: a mark inside a chunk
+    if (one_chunk.taking(e)) |k| { // TF_GLM_OVN_ONE_CHUNK: a mark inside a chunk
+        return if (lin.on) lin_copy.keepInside(e, id, k) else one_chunk.keep.keepAt(e, id, k);
+    }
+    if (lin.on) return lin_copy.keepAs(e, id);
     if (e.snaps.contains(id)) return error.StateKept;
     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
         return error.NotAtMark;
@@ -123,6 +130,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
 
 /// A disk read's state: `at`'s pages leased under rank 0's id on each rank, refused by `restore` until `seal`.
 pub fn blankAs(e: anytype, id: u64, at: usize) !void {
+    if (lin.on) return lin_copy.blankAs(e, id, at);
     if (e.snaps.contains(id)) return error.StateKept;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     var lease = try pool.take(planBytes(e, at)); // a disk image holds no drafter window
@@ -155,6 +163,7 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
 }
 
 pub fn restore(e: anytype, id: u64) !void {
+    if (lin.on) return lin_copy.restore(e, id);
     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
     if (s.len == 0) return error.UnsealedState;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
@@ -182,6 +191,7 @@ pub fn drop(e: anytype, id: u64) void {
 }
 
 pub fn free(e: anytype, s: *types.Snap) void {
+    if (lin.on) lin_copy.forget(e, s);
     e.snap_pages.?.give(&s.lease);
     e.gpa.free(s.cur);
 }

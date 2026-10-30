@@ -268,6 +268,21 @@ pub const Pool = struct {
         return id;
     }
 
+    /// `take` of free page `id` (TF_GLM_OVN_LINEAGE's preferred page): false, taking nothing, when it is not free.
+    pub fn takeFree(p: *Pool, l: *Lease, id: u32) error{ PastReservation, OutOfMemory }!bool {
+        if (l.promised == 0) return error.PastReservation;
+        if (id >= p.refs.len or p.refs[id] != 0) return false;
+        const at = std.mem.lastIndexOfScalar(u32, p.free[0..p.nfree], id) orelse return false;
+        try l.ids.ensureUnusedCapacity(p.gpa, 1);
+        std.mem.copyForwards(u32, p.free[at .. p.nfree - 1], p.free[at + 1 .. p.nfree]); // the rest keep their order
+        p.nfree -= 1;
+        p.ownership(id, 1, 1);
+        l.promised -= 1;
+        p.promised -= 1;
+        l.ids.appendAssumeCapacity(id);
+        return true;
+    }
+
     /// Pages a store's resume retained for this stream (its matched path), at the head of its table.
     pub fn adopt(p: *Pool, l: *Lease, ids: []const u32) error{OutOfMemory}!void {
         l.ids.appendSlice(p.gpa, ids) catch |e| {

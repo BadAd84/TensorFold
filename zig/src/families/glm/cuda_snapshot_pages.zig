@@ -16,6 +16,7 @@ pub const Pool = struct {
     pages: kv.Pool,
     arena: ?cuda.DeviceBuffer,
     gather: ?Gather = null, // TF_GLM_OVN_SNAP_GATHER: moves by tf_glm_snap_copy batches (cuda_snapshots.prepare)
+    shared: usize = 0, // TF_GLM_OVN_LINEAGE: lease entries past the first on a page (0 without the knob)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, budget: u64) !Pool {
         const count = std.math.cast(usize, budget / page) orelse return error.SnapshotBudget;
@@ -33,13 +34,14 @@ pub const Pool = struct {
         p.pages.deinit();
     }
 
+    /// Pages free as if no lease shared one (TF_GLM_OVN_LINEAGE), so the store keeps and drops as without the knob.
     pub fn spare(p: *const Pool) u64 {
-        return p.pages.available() * page;
+        return (p.pages.available() - p.shared) * page;
     }
 
     pub fn take(p: *Pool, bytes: usize) !Lease {
         const n = (try rounded(bytes)) / page;
-        if (n == 0 or n > p.pages.available()) return error.NoSnapshotRoom;
+        if (n == 0 or n > p.pages.available() - p.shared) return error.NoSnapshotRoom;
         var lease: Lease = .{};
         errdefer p.pages.finish(&lease);
         try p.pages.promise(&lease, n);
@@ -48,7 +50,16 @@ pub const Pool = struct {
     }
 
     pub fn give(p: *Pool, lease: *Lease) void {
+        if (p.shared > 0) for (lease.ids.items) |id| {
+            if (p.pages.holders(id) > 1) p.shared -= 1;
+        };
         p.pages.finish(lease);
+    }
+
+    /// TF_GLM_OVN_LINEAGE: the lease's page `i` is another lease's page `id` (holding the same bytes) from now on.
+    pub fn share(p: *Pool, lease: *Lease, i: usize, id: u32) void {
+        p.pages.share(lease, i, id);
+        p.shared += 1;
     }
 
     pub fn move(p: *const Pool, stream: cuda.Stream, lease: *const Lease, plan: *const Plan, into: bool) !void {
