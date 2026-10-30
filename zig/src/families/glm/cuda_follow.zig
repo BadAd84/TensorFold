@@ -245,11 +245,11 @@ pub const Leader = struct {
         try x.link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
     }
 
-    /// `cancel` (rank 0's), asked before each chunk, decides for every rank; `from` every rank holds; `marks` rank 0's.
-    pub fn prefill(x: Leader, ids: []const u32, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !u32 {
+    /// Rank 0's `cancel` decides for every rank. No marks: its fixed steps cut at none (Lanes.prefillFn runs chunks).
+    pub fn prefill(x: Leader, ids: []const u32, from: ?engine.Resume, cancel: ?engine.Cancel) !u32 {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.prefill), .flags = x.rows(), .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0 }, ids);
-        return x.e.prefill(ids, from, cancel, marks);
+        return x.e.prefill(ids, from, cancel);
     }
 
     /// One prompt step on every rank (Engine.prefillChunk): a chunk to Engine.chunkEnd, or two when `pair` and
@@ -420,7 +420,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 const ids = try e.gpa.dupe(u32, step.ids);
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
-                _ = e.prefill(ids, from, null, null) catch |err| switch (err) {
+                _ = e.prefill(ids, from, null) catch |err| switch (err) {
                     error.Cancelled => {},
                     else => return err,
                 };

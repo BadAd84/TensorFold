@@ -369,13 +369,12 @@ pub const Engine = struct {
     }
 
     /// decode.prefill: `ids` in prompt_rows steps from its start, then the first token from the last row; `from`
-    /// restores a kept state. The steps are fixed: the other ranks run the same ids without the marks (a mark keeps only
-    /// at a step).
-    pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !u32 {
+    /// restores a kept state. The steps are fixed and keep no state: a pass with marks runs Leader.chunk's steps.
+    pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel) !u32 {
         var start = try e.prefillStart(ids.len, from);
         while (true) {
             const rows = @min(ids.len - start, fw.prefill_rows);
-            if (try e.prefillChunk(ids[start..@min(ids.len, start + rows + 1)], start, rows, ids.len, null, cancel, marks)) |first| return first;
+            if (try e.prefillChunk(ids[start..@min(ids.len, start + rows + 1)], start, rows, ids.len, null, cancel, null)) |first| return first;
             start += rows;
         }
     }

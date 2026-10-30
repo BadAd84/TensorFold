@@ -48,6 +48,30 @@ test "GLM prompt rows: a prompt with a cache mark inside it is not batched (the 
     try std.testing.expect(glm.lanes.canBatch(&s));
 }
 
+test "GLM prompt rows: a whole pass's steps (Engine.chunkEnd, Lanes.prefillFn's) start at every mark inside it" {
+    const C = glm.engine.prompt_rows;
+    const probe = glm.native.snap_min_rows;
+    const Case = struct { from: usize, len: usize, marks: []const u32 };
+    const cases = [_]Case{
+        .{ .from = 0, .len = probe + 40, .marks = &.{probe} }, // the disk tier's probe: one fixed step skipped it
+        .{ .from = 9, .len = 3 * C + 5, .marks = &.{ 100, C + 7, 2 * C, 3 * C + 5 } }, // the template's row 9
+        .{ .from = C + 3, .len = 2 * C, .marks = &.{ C + 3, C + 900, 2 * C - 1 } }, // a resume off the grid
+        .{ .from = 0, .len = 2 * C + 1, .marks = &.{ 1, C - 1, C + 1, 2 * C } },
+    };
+    for (cases) |c| {
+        var starts: [16]usize = undefined;
+        var n: usize = 0;
+        var at = c.from;
+        while (at < c.len) : (n += 1) {
+            starts[n] = at;
+            const end = glm.engine.chunkEnd(at, c.len, c.marks);
+            try std.testing.expect(end > at and end - at <= C); // never past one chunk: the pass stays unpaired
+            at = end;
+        }
+        for (c.marks) |m| if (m > c.from and m < c.len) try std.testing.expect(std.mem.indexOfScalar(usize, starts[0..n], m) != null);
+    }
+}
+
 test "GLM prompt rows: reservation failure happens before a prompt step" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var s: lanes.Stream = undefined;

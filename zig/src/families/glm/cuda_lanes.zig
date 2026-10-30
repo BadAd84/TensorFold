@@ -201,16 +201,25 @@ pub const Lanes = struct {
 
     // -- the vtable ---------------------------------------------------------------------------------------------
 
+    /// The prompt pass in one call, Leader.chunk's steps unpaired: each ends at Engine.chunkEnd, so every mark keeps.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
-        const from = try self.opening(s);
+        var from = try self.opening(s);
         try self.images(s, from);
         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        const first = try self.x.prefill(s.prompt(), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
-        self.lanes.getPtr(s).?.first = self.take(first);
+        var at: usize = if (from) |r| r.at else 0;
+        while (true) {
+            const step = try self.x.chunk(s.prompt(), at, false, from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+            if (step.first) |first| {
+                self.lanes.getPtr(s).?.first = self.take(first);
+                return;
+            }
+            at += step.rows;
+            from = null; // restored by the first step
+        }
     }
 
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {

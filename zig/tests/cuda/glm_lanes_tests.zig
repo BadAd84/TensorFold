@@ -252,7 +252,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         for (ids, k.prompt) |*u, v| u.* = @intCast(v);
         try x.bind(@intCast(slot));
         try x.begin(if (i == S - 1) .{ .seed = 77, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null);
-        const t = try x.prefill(ids, null, null, null);
+        const t = try x.prefill(ids, null, null);
         if (slot >= S and t != first[i]) {
             std.debug.print("FAIL shared: stream {d}'s twin drew {d} from the prompt, the stream {d}\n", .{ i, t, first[i] });
             failed = true;
