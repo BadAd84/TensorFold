@@ -65,7 +65,7 @@ extern "C" __global__ void __launch_bounds__(glm_index::RB * 32, 2)
   for (int j = 0; j < loop; ++j) {
     const int64_t pb = first + j, p0 = pb * BP;
     if (pb >= nb) break;
-    cp_wait();
+    cp_wait<0>();
     __syncthreads();  // tile j is in, and every warp is done with tile j - 1
     if (any(j + 1)) stage((j + 1) & 1, pb + 1);
     cp_commit();

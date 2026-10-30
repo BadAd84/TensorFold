@@ -109,13 +109,13 @@ __device__ __forceinline__ void kmain(const half* __restrict__ X0, const half* _
 #pragma unroll
     for (int c = 0; c < NST - 1; ++c) {
         if (c < chunks) load(c);
-        cp_async_commit();
+        cp_commit();
     }
     for (int c = 0; c < chunks; ++c) {
-        cp_async_wait<NST - 2>();
+        cp_wait<NST - 2>();
         __syncthreads();
         if (c + NST - 1 < chunks) load(c + NST - 1);
-        cp_async_commit();
+        cp_commit();
         const half* base = stage + (size_t)(c % NST) * SH;
         const half* xs = base + (size_t)(XR == TPM ? 0 : mat) * TPM * KXS;
         const uint32_t* ws = reinterpret_cast<const uint32_t*>(base + (size_t)XR * KXS);
@@ -133,7 +133,7 @@ __device__ __forceinline__ void kmain(const half* __restrict__ X0, const half* _
                 if (jb < nblocks) {
                     uint32_t r[4];
                     const int row = jb * 16 + (lane & 7) + ((lane >> 4) & 1) * 8;
-                    ldmatrix_x4(r, xs + (size_t)row * KXS + kswz(row, kk * 2 + ((lane >> 3) & 1)) * 8);
+                    ldmatrix4(r, xs + (size_t)row * KXS + kswz(row, kk * 2 + ((lane >> 3) & 1)) * 8);
                     const uint32_t bl[2] = {r[0], r[1]}, bh[2] = {r[2], r[3]};
                     const bool upper = jb * 16 + 8 < cnt;   // members 8-15 of the block (else never stored)
 #pragma unroll
@@ -145,7 +145,7 @@ __device__ __forceinline__ void kmain(const half* __restrict__ X0, const half* _
             }
         }
     }
-    cp_async_wait<0>();
+    cp_wait<0>();
     __syncthreads();   // the stages become the epilogue's sums
 }
 
