@@ -135,7 +135,8 @@ pub const Host = struct {
         h.host.explain = explain;
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) nemotron.native.warm_quiet else 0;
+        h.host.warm_quiet = if (info.warm_turns) snaps.warmQuiet(F) orelse 0 else 0;
+        h.host.warm_alone = info.warm_turns and @hasDecl(F, "warm_alone"); // its pass waits for no admitted prompt either
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -486,7 +487,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .policy = if (@hasField(@TypeOf(loaded), "policy")) loaded.policy else "",
         .prompt_cache = h.store != null,
         .prompt_cache_capacity = cache_capacity,
-        .warm_turns = h.store != null and @hasDecl(F, "warm_quiet"),
+        .warm_turns = h.store != null and snaps.warmQuiet(F) != null,
         .logprobs = served.backend.vtable.first_row != null,
         .prompt_logprobs = served.backend.vtable.prompt_rows,
         .penalties = served.backend.penalties,
@@ -544,6 +545,10 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
 
 test "family readiness reaches production lane admission without binding CUDA" {
     try @import("cuda_health_test.zig").check(Host, Host.readiness, Host.serve);
+}
+
+test "a family's warm wait and warm_alone reach the lane host only with warm turns on" {
+    try @import("cuda_warm_serve_test.zig").check(Host, Host.serve);
 }
 
 test "Flash Next refuses tensor-rank draft caching before files or CUDA" {

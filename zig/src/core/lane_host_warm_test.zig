@@ -322,3 +322,58 @@ test "a finished warm pass keeps its states with its request's length: the histo
         try std.testing.expect(got.same);
     }
 }
+
+/// Warm-pass chunks run while another request's prompt still fills (a stepped backend), the pass sent during its first.
+fn warmBesideFill(alone: bool) !usize {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
+    host.warm_quiet = 1; // a filling prompt never wakes the wait: it times out at once unless warm_alone ends it first
+    host.warm_alone = alone;
+    try host.start();
+    defer host.stop();
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var warm: Box = .{};
+    var real: Box = .{};
+    const warm_request: Request = .{ .prompt = &prompt, .max_tokens = 0, .background = true };
+    const request: Request = .{ .prompt = &prompt, .max_tokens = 4 };
+    const Arrival = struct { // the warm pass arrives during the request's first fill chunk
+        engine: Engine,
+        request: *const Request,
+        box: *Box,
+        sent: bool = false,
+        filled: bool = false, // the request's last fill chunk ran
+        beside: usize = 0,
+        fn hook(ctx: *anyopaque, s: *lanes.Stream, chunk: usize) void {
+            const a: *@This() = @ptrCast(@alignCast(ctx));
+            if (s.max_new == 0) {
+                if (!a.filled) a.beside += 1;
+                return;
+            }
+            if (chunk == 2) a.filled = true;
+            if (a.sent or chunk != 0) return;
+            a.sent = true;
+            a.engine.submit(2, a.request, .{ .ctx = a.box, .event = Box.event }) catch {};
+        }
+    };
+    var arrival: Arrival = .{ .engine = host.engine(), .request = &warm_request, .box = &warm };
+    target.prefill_hook = Arrival.hook;
+    target.prefill_hook_ctx = &arrival;
+    try host.engine().submit(1, &request, .{ .ctx = &real, .event = Box.event });
+    try std.testing.expectEqual(Reason.length, real.wait());
+    try std.testing.expectEqual(@as(usize, 4), real.tokens);
+    const warm_end = warm.wait();
+    if (alone) try std.testing.expectEqual(Reason.cancelled, warm_end); // dropped before it touched the backend
+    return arrival.beside;
+}
+
+test "warm_alone: a warm pass sent while a prompt fills is dropped untouched; without it the pass runs inside that fill" {
+    try std.testing.expectEqual(@as(usize, 0), try warmBesideFill(true));
+    try std.testing.expect(try warmBesideFill(false) > 0); // the gap warm_alone closes (GLM's stepped prompts)
+}

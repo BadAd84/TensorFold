@@ -83,6 +83,7 @@ const glm_split_tests = @import("glm_split_tests.zig");
 const glm_fronts_tests = @import("glm_fronts_tests.zig");
 const glm_paged_tests = @import("glm_paged_tests.zig");
 const glm_resume_tests = @import("glm_resume_tests.zig");
+const glm_reply_prefill_check = @import("glm_reply_prefill_check.zig");
 const glm_slice_tests = @import("glm_slice_tests.zig");
 const glm_onechunk_tests = @import("glm_onechunk_tests.zig");
 const glm_lineage_tests = @import("glm_lineage_tests.zig");
@@ -290,6 +291,7 @@ const usage =
     \\  glm-fronts-check <ckpt> <dc.json> <rank> <world> <idfile>  prompt chunks with TF_GLM_OVN_PEER_FIRST and _FRONTS on rank 0 against plain twins, byte for byte
     \\  glm-paged-check <ckpt> <rank> <world> <idfile> [fp8]  a paged stream (pages out of order, NaN first) against a whole-window twin
     \\  glm-resume-check <ckpt> <rank> <world> <idfile>  states kept and resumed at rows off the 2,048 grid against fresh passes, bit for bit, with red controls
+    \\  glm-reply-prefill-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_REPLY_PREFILL: next turns resumed from a reply's background pass (and one that stepped aside) against the turn without it, bit for bit, with red controls
     \\  glm-slice-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_FILL_SLICE_MS=1: prompt chunks in layer slices with decode windows between, against whole chunks, bit for bit
     \\  glm-onechunk-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_ONE_CHUNK=1: marks kept inside one chunk against chunks cut at each mark, bit for bit
     \\  glm-lineage-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_LINEAGE=1: turns, forks and a reloaded state on pages and a window, every kept state and next window against the knob-off path, bit for bit
@@ -537,6 +539,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-lanes-cover")) return glm_lanes_tests.coverCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-paged-check")) return glm_paged_tests.pagedCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3), rest.len > 4 and std.mem.eql(u8, rest[4], "fp8"));
     if (std.mem.eql(u8, cmd, "glm-resume-check")) return glm_resume_tests.resumeCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "glm-reply-prefill-check")) return glm_reply_prefill_check.replyPrefillCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-slice-check")) return glm_slice_tests.sliceCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-onechunk-check")) return glm_onechunk_tests.oneChunkCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-lineage-check")) return glm_lineage_tests.lineageCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));

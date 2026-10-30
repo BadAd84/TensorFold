@@ -260,18 +260,18 @@ pub const Leader = struct {
     /// One prompt step on every rank (Engine.prefillChunk): a chunk to Engine.chunkEnd, or two when `pair` and
     /// Engine.pairedAt allow; its rows travel in the step, so every rank cuts where this one does.
     pub fn chunk(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
-        return x.chunkOf(ids, start, pair, from, cancel, marks, false);
+        return x.chunkOf(ids, start, pair, from, cancel, marks, false, 0);
     }
 
-    /// `chunk`; with `slice` (TF_GLM_OVN_FILL_SLICE_MS beside decoders) an unpaired chunk's layers may run in slices:
-    /// the first here, the rest by `slicePart` (`sliced` while some are left).
-    pub fn chunkOf(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks, slice: bool) !Chunk {
+    /// `chunk`; `slice` (FILL_SLICE_MS beside decoders): an unpaired chunk's layers may run in slices, the rest by
+    /// `slicePart` (`sliced` while some are left); `cap` > 0 (REPLY_PREFILL's passes) ends it by a multiple of `cap`.
+    pub fn chunkOf(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks, slice: bool, cap: usize) !Chunk {
         if (start >= ids.len) return error.BadChunk;
         try x.flush();
         const at: []const u32 = if (marks) |m| m.at else &.{};
-        const a_end = engine.chunkEnd(start, ids.len, at);
+        const a_end = @import("cuda_reply_prefill.zig").capEnd(start, engine.chunkEnd(start, ids.len, at), cap);
         const two = pair and a_end == start + engine.prompt_rows and x.e.pairedAt(start, ids.len, from, marks);
-        const one = one_chunk.plan(x.e, start, ids.len, at, from, two or slice); // TF_GLM_OVN_ONE_CHUNK (null: as before)
+        const one = one_chunk.plan(x.e, start, ids.len, at, from, two or slice or cap != 0); // TF_GLM_OVN_ONE_CHUNK (null: as before)
         const n = if (one) |p| p.end - start else (if (two) engine.chunkEnd(a_end, ids.len, at) else a_end) - start;
         const part = ids[start..@min(ids.len, start + n + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it

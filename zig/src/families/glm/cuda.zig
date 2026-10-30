@@ -41,6 +41,7 @@ pub const open_owner = @import("cuda_open_owner.zig");
 pub const images = @import("cuda_images.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
+pub const reply_prefill = @import("cuda_reply_prefill.zig");
 pub const native = @import("cuda_native.zig");
 pub const snapshots = @import("cuda_snapshots.zig");
 pub const disk_image = @import("cuda_disk_image.zig");
@@ -115,6 +116,7 @@ test {
     _ = @import("cuda_prompt_pieces.zig");
     _ = @import("cuda_lanes_fill.zig");
     _ = @import("cuda_prompt_slices.zig");
+    _ = reply_prefill;
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
     _ = @import("dflash_ovn.zig");
 }
