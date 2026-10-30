@@ -13,14 +13,28 @@ const Keep = struct {
     ids: [max_keeps]u64 = @splat(0),
     ats: [max_keeps]u32 = @splat(0),
     n: usize = 0,
+    errs: [max_keeps]?anyerror = @splat(null), // why a mark kept nothing (its id 0)
     fn call(ctx: *anyopaque, at: u32) void {
         const k: *@This() = @ptrCast(@alignCast(ctx));
         const glm = @import("glm_cuda");
         const e: *glm.engine.Engine = @ptrCast(@alignCast(k.e));
         if (k.n == max_keeps) return;
-        k.ids[k.n] = e.keepState() catch 0;
+        k.ids[k.n] = e.keepState() catch |err| blk: {
+            k.errs[k.n] = err;
+            break :blk 0;
+        };
         k.ats[k.n] = at;
         k.n += 1;
+    }
+
+    /// Prints every mark that kept nothing (case `i`, pass `name`); true when there was one.
+    fn missing(k: *const @This(), i: usize, name: []const u8) bool {
+        var none = false;
+        for (k.ids[0..k.n], k.ats[0..k.n], k.errs[0..k.n]) |id, at, err| if (id == 0) {
+            std.debug.print("FAIL onechunk: case {d}: pass {s} kept nothing at mark {d}: {s}\n", .{ i, name, at, if (err) |x| @errorName(x) else "no id" });
+            none = true;
+        };
+        return none;
     }
 };
 
@@ -134,16 +148,19 @@ pub fn oneChunkCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int
         glm.one_chunk.on = false;
         var from: ?glm.engine.Resume = null;
         if (case.from != 0) { // the resumed state, kept as before at a chunk stop
-            const base = try Run.pass(x, a, 4, ids, null, &.{case.from}, true, V);
+            const base = Run.pass(x, a, 4, ids, null, &.{case.from}, true, V) catch |err| return report(i, "resume base", err);
             if (base.keep.n != 1 or base.keep.ids[0] == 0) {
                 std.debug.print("FAIL onechunk: case {d}: no state kept at {d} to resume\n", .{ i, case.from });
                 return error.TestFailed;
             }
             from = .{ .id = base.keep.ids[0], .at = case.from };
         }
-        const A = try Run.pass(x, a, 0, ids, from, case.marks, true, V);
+        const A = Run.pass(x, a, 0, ids, from, case.marks, true, V) catch |err| return report(i, "A (cut at every mark)", err);
         glm.one_chunk.on = true;
-        const B = try Run.pass(x, a, 1, ids, from, case.marks, true, V);
+        const B = Run.pass(x, a, 1, ids, from, case.marks, true, V) catch |err| return report(i, "B (one chunk)", err);
+        const gone_a = A.keep.missing(i, "A");
+        const gone = B.keep.missing(i, "B") or gone_a; // a state compared below must exist
+        failed = failed or gone;
         if (!Run.same(&A, &B)) {
             const d = std.mem.indexOfDiff(u16, A.logits, B.logits);
             std.debug.print("FAIL onechunk: case {d}: one chunk first {d}, cut {d}; first logit difference at {?d}\n", .{ i, B.first, A.first, d });
@@ -157,18 +174,18 @@ pub fn oneChunkCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int
             std.debug.print("FAIL onechunk: case {d}: {d} and {d} keeps for {d} marks\n", .{ i, A.keep.n, B.keep.n, case.marks.len });
             failed = true;
         }
-        for (0..@min(A.keep.n, B.keep.n)) |k| {
-            const sa = try kept(e, a, A.keep.ids[k]);
-            const sb = try kept(e, a, B.keep.ids[k]);
+        if (!gone) for (0..@min(A.keep.n, B.keep.n)) |k| {
+            const sa = kept(e, a, A.keep.ids[k]) catch |err| return report(i, "A's kept state", err);
+            const sb = kept(e, a, B.keep.ids[k]) catch |err| return report(i, "B's kept state", err);
             if (A.keep.ats[k] != B.keep.ats[k] or !std.mem.eql(u8, sa, sb)) {
                 const d = std.mem.indexOfDiff(u8, sa, sb);
                 std.debug.print("FAIL onechunk: case {d}: the state kept at {d} differs at byte {?d} of {d}\n", .{ i, A.keep.ats[k], d, sa.len });
                 failed = true;
             }
-        }
-        inner += A.steps - B.steps;
-        if (B.keep.n > 0) { // C: B's first kept state resumed to the end, against A's whole pass
-            const C1 = try Run.pass(x, a, 2, ids, .{ .id = B.keep.ids[0], .at = B.keep.ats[0] }, &.{}, false, V);
+        };
+        inner += A.steps -| B.steps;
+        if (!gone and B.keep.n > 0) { // C: B's first kept state resumed to the end, against A's whole pass
+            const C1 = Run.pass(x, a, 2, ids, .{ .id = B.keep.ids[0], .at = B.keep.ats[0] }, &.{}, false, V) catch |err| return report(i, "C (resumed from B)", err);
             if (!Run.same(&A, &C1)) {
                 std.debug.print("FAIL onechunk: case {d}: resumed at {d} from the knob's kept state, first {d} against {d}\n", .{ i, B.keep.ats[0], C1.first, A.first });
                 failed = true;
@@ -180,4 +197,10 @@ pub fn oneChunkCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int
     }
     if (failed) return error.TestFailed;
     check.pass("one-chunk prompts at TP={d}: {d} prompts in {d} fewer steps keep every mark's state byte for byte and equal their cut passes in the first token and the next window's tokens and logits; each resumed from the knob's first kept state equals its whole pass", .{ world, cases.len, inner });
+}
+
+/// A case's pass or lookup that failed outright: which, before the error returns.
+fn report(i: usize, what: []const u8, err: anyerror) anyerror {
+    std.debug.print("FAIL onechunk: case {d}: {s}: {s}\n", .{ i, what, @errorName(err) });
+    return err;
 }
