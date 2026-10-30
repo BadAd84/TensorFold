@@ -110,6 +110,22 @@ pub const Fake = struct {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .reports_fill = true } };
     }
 
+    /// `backend` whose head gives each held draft a chained chance, sure two rounds in three (a drafter swings).
+    pub fn swung(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .probabilities = swingChances, .reports_fill = true } };
+    }
+
+    fn swingChances(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const x = self(ptr);
+        const sure = (x.rounds + x.lane(s).history.items.len) % 3 != 0;
+        var run: f64 = 1;
+        for (out) |*o| {
+            run *= if (sure) 0.97 else 0.45;
+            o.* = run;
+        }
+        return true;
+    }
+
     /// The same target taking several prompts in one pass (`prefill_many`).
     pub fn batched(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_many = prefillMany, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };

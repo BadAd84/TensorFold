@@ -73,6 +73,7 @@ pub const Engine = struct {
                 .confidence_floor = cfg.draft_confidence,
                 .batch_rows = cfg.batch_rows,
                 .batched_heads = cfg.draft_streams,
+                .full_depth = cfg.shared_depth_full,
             },
         };
     }
@@ -349,7 +350,7 @@ pub const Engine = struct {
                 const own: usize = own_end - 1;
                 if (p.kind == .copy) {
                     win.observeCopied(e, s, p.recalled, own_kept, own);
-                    if (e.alone) {
+                    if (e.alone or e.cfg.shared_copy_width) { // TF_GLM_OVN_SHARED_COPY: shared rounds grow it too
                         const width = s.copy_width orelse e.cfg.first_copy;
                         s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
                     }

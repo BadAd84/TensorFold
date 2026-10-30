@@ -62,6 +62,7 @@ pub const Rule = struct {
     confidence_floor: ?f64 = null,
     batch_rows: u32,
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
+    full_depth: bool = false, // TF_GLM_OVN_DEPTH_FULL: budgets ask most_drafts, no last grant + draft_slack ratchet
     round_ms: Table = .{}, // a round's wall time by drafts, every stream's: what sampled streams price by
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
     greedy_ms: Table = .{}, // round_ms from greedy rounds alone: what greedy streams price by
@@ -213,7 +214,8 @@ pub const Rule = struct {
             for (whos, out) |*w, *o| {
                 const inner = try r.headDepth(w, null, probe);
                 const granted: i64 = if (w.granted) |g| g else r.most_drafts;
-                o.* = try r.headDepth(w, @min(inner, granted + r.k.draft_slack), probe);
+                const ask = if (r.full_depth) inner else @min(inner, granted + r.k.draft_slack);
+                o.* = try r.headDepth(w, ask, probe);
             }
             return;
         }
