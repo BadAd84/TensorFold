@@ -28,24 +28,35 @@ fn cdiv(a: usize, b: usize) u32 {
     return @intCast((a + b - 1) / b);
 }
 
-/// latent.absorb_q (BF16 kv_b): out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums.
-pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
+/// latent.absorb_q: out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums; sk: E4M3 kv_b's.
+pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, sk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
-    try rowBlocks(set.glue.absorb_q, stream, q, wk, out, rows, heads, lw / 32);
+    if (sk != 0) { // TF_GLM_OVN_KVB8: wk E4M3 [heads][d][lw], sk fp32 [heads][d][lw / 128]
+        if (wk % 8 != 0) return error.LatentShape;
+        return rowBlocks(set.glue.absorb_q8, stream, .{ q, wk, sk, out }, rows, heads, lw / 32);
+    }
+    const f = if (set.mla.vec and wk % 16 == 0) set.glue.absorb_q_vec else set.glue.absorb_q; // TF_GLM_OVN_ABSORB_VEC
+    try rowBlocks(f, stream, .{ q, wk, out }, rows, heads, lw / 32);
 }
 
-/// The absorb and expand launches: rows in one block in decode windows, prompt_rb a block in prompt chunks.
-fn rowBlocks(f: cuda.Function, stream: cuda.Stream, in: u64, w: u64, out: u64, rows: usize, heads: usize, cols: usize) !void {
+/// The absorb and expand launches (pointers, then rows, heads, rb): rows in one block in decode, prompt_rb in prompts.
+fn rowBlocks(f: cuda.Function, stream: cuda.Stream, ptrs: anytype, rows: usize, heads: usize, cols: usize) !void {
     const rb = if (rows >= prompt_rows) prompt_rb else rows;
     var a: cuda.Args = .{};
-    inline for (.{ in, w, out, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(rb)) }) |v| a.add(v);
+    inline for (ptrs) |v| a.add(@as(u64, v));
+    inline for (.{ @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(rb)) }) |v| a.add(v);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(heads), .y = @intCast(cols), .z = cdiv(rows, rb) }, .block = .{ .x = 128 } }, stream, &a);
 }
 
-/// latent.expand_v (BF16 kv_b): out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw].
-pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
+/// latent.expand_v: out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw]; sv: E4M3 kv_b's.
+pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, sv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
-    try rowBlocks(set.glue.expand_v, stream, ol, wv, out, rows, heads, dv / 16);
+    if (sv != 0) { // TF_GLM_OVN_KVB8: wv E4M3 [heads][dv][lw], sv fp32 [heads][dv][lw / 128]
+        if (wv % 8 != 0) return error.LatentShape;
+        return rowBlocks(set.glue.expand_v8, stream, .{ ol, wv, sv, out }, rows, heads, dv / 16);
+    }
+    const vec = set.mla.vec and wv % 16 == 0 and ol % 16 == 0; // TF_GLM_OVN_ABSORB_VEC: kv_b and o by 16-byte loads
+    try rowBlocks(if (vec) set.glue.expand_v_vec else set.glue.expand_v, stream, .{ ol, wv, out }, rows, heads, dv / 16);
 }
 
 /// A latent cache holds BF16 rows, or E4M3 rows followed by one FP32 scale per row.
@@ -83,6 +94,7 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Tab
 }
 
 pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    if (fuses(set.mla, rows, hb)) return fused(set, stream, qa, cache, scales, t, pos, 0, 0, out, rows, heads, lw, nch, 0, scale, false);
     try chunks(set, stream, qa, cache, scales, t, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
     try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
 }
@@ -90,9 +102,11 @@ pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;
+    const k = set.glue;
+    const s = set.mla.skip; // TF_GLM_OVN_MLA_FUSEMERGE: the same partials from the tiles up to each chunk's last key
     const f = switch (hb) {
-        heads_tile => if (scales == 0) set.glue.chunks_16 else set.glue.chunks_16_fp8,
-        heads_tile_wide => if (scales == 0) set.glue.chunks_32 else set.glue.chunks_32_fp8,
+        heads_tile => if (scales == 0) (if (s) k.chunks_16_skip else k.chunks_16) else if (s) k.chunks_16_fp8_skip else k.chunks_16_fp8,
+        heads_tile_wide => if (scales == 0) (if (s) k.chunks_32_skip else k.chunks_32) else if (s) k.chunks_32_fp8_skip else k.chunks_32_fp8,
         else => return error.HeadBlock,
     };
     var a: cuda.Args = .{};
@@ -104,6 +118,23 @@ fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, 
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
 }
 
+/// TF_GLM_OVN_MLA_FUSEMERGE: whether a launch of `rows` rows on `hb`-head blocks runs chunks and merge as one kernel.
+fn fuses(m: glue.Mla, rows: usize, hb: usize) bool {
+    return m.fuse_rows != 0 and rows >= m.fuse_rows and hb == heads_tile_wide;
+}
+
+/// chunks then merge as one launch (glm_glue_attn_ovn.cuh): a block a row and 32 heads walks the chunks, no partials.
+fn fused(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, out: u64, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, sparse: bool) !void {
+    if (lw != 512) return error.LatentShape;
+    const f = if (scales == 0) set.glue.chunks_32_fused else set.glue.chunks_32_fp8_fused;
+    var a: cuda.Args = .{};
+    a.add(qa);
+    a.add(cache);
+    if (scales != 0) a.add(scales);
+    inline for (.{ pos, tokens, counts, out, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)), t.pt, @as(i64, @intCast(t.ps)), @as(c_int, @intCast(nch)) }) |v| a.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, heads_tile_wide) }, .block = .{ .x = 256 }, .shared = glue.chunksSmem(heads_tile_wide) }, stream, &a);
+}
+
 /// latent.sparse_attention: rows with counts > 0 over their selected tokens (i32 [rows][w]); others left alone.
 pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     return sparseAttentionFormat(set, stream, qa, cache, 0, t, tokens, counts, w, p, out, rows, heads, lw, scale);
@@ -111,7 +142,9 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 
 pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
-    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, headBlock(rows, heads), true);
+    const hb = headBlock(rows, heads);
+    if (fuses(set.mla, rows, hb)) return fused(set, stream, qa, cache, scales, t, 0, tokens, counts, out, rows, heads, lw, nch, w, scale, true);
+    try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
 }
 
