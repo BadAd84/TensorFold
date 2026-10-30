@@ -31,6 +31,7 @@ fn cdiv(a: usize, b: usize) u32 {
 /// latent.absorb_q: out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums; sk: E4M3 kv_b's.
 pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, sk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
+    if (set.prompt and set.mla.mma) return mmaBlocks(if (sk != 0) set.glue.absorb_mma8 else set.glue.absorb_mma, stream, q, wk, sk, out, rows, heads, lw);
     if (sk != 0) { // TF_GLM_OVN_KVB8: wk E4M3 [heads][d][lw], sk fp32 [heads][d][lw / 128]
         if (wk % 8 != 0) return error.LatentShape;
         return rowBlocks(set.glue.absorb_q8, stream, .{ q, wk, sk, out }, rows, heads, lw / 32);
@@ -48,9 +49,27 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, ptrs: anytype, rows: usize, 
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(heads), .y = @intCast(cols), .z = cdiv(rows, rb) }, .block = .{ .x = 128 } }, stream, &a);
 }
 
+/// latent.MMA_TILE's rows and columns: a block's 64 prompt rows by 128 output columns of one head.
+pub const mma_tile = [2]usize{ 64, 128 };
+
+/// TF_GLM_OVN_LATENT_MMA: every row of a prompt buffer on the tensor cores (latent.py's PROMPT_MMA), as production
+/// gates on b.prefill, so a resumed tail takes the kernel a fresh pass gives the same rows; s: E4M3 kv_b's scales.
+fn mmaBlocks(f: cuda.Function, stream: cuda.Stream, x: u64, w: u64, s: u64, out: u64, rows: usize, heads: usize, n: usize) !void {
+    inline for (.{ x, w, out }) |p| if (p % 16 != 0) return error.LatentShape; // cp.async rows of 16 bytes
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(w);
+    if (s != 0) a.add(s);
+    a.add(out);
+    inline for (.{ @as(i64, @intCast(rows)), @as(i64, @intCast(heads)) }) |v| a.add(v);
+    // production's grid (head, row block, column block) reordered: a row block's columns run together (no bit moves)
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(n / mma_tile[1]), .y = @intCast(heads), .z = cdiv(rows, mma_tile[0]) }, .block = .{ .x = 128 }, .shared = glue.latent_mma_smem }, stream, &a);
+}
+
 /// latent.expand_v: out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw]; sv: E4M3 kv_b's.
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, sv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
+    if (set.prompt and set.mla.mma) return mmaBlocks(if (sv != 0) set.glue.expand_mma8 else set.glue.expand_mma, stream, ol, wv, sv, out, rows, heads, dv);
     if (sv != 0) { // TF_GLM_OVN_KVB8: wv E4M3 [heads][dv][lw], sv fp32 [heads][dv][lw / 128]
         if (wv % 8 != 0) return error.LatentShape;
         return rowBlocks(set.glue.expand_v8, stream, .{ ol, wv, sv, out }, rows, heads, dv / 16);
