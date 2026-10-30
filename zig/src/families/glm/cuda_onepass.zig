@@ -36,6 +36,15 @@ pub fn wanted() bool {
     return cuda.ovn.on("SPARSE_ONEPASS");
 }
 
+/// The kernels when the knob asks for them, else null; one that will not load is logged and left out.
+pub fn open(d: *const cuda.Driver, image: []const u8, major: u32) ?Kernels {
+    if (!wanted()) return null;
+    return Kernels.load(d, image, major) catch |err| {
+        std.log.warn("TF_GLM_OVN_SPARSE_ONEPASS: the onepass kernel is not used ({t}); prompt rows keep the chunk programs", .{err});
+        return null;
+    };
+}
+
 /// Whether a sparse call takes the kernel: prompt buffers (production's b.prefill), an FP8 cache, 17-24 heads.
 pub fn takes(prompt: bool, scales: u64, heads: usize, lw: usize) bool {
     return prompt and scales != 0 and lw == 512 and heads >= min_heads and heads <= max_heads;
