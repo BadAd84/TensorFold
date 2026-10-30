@@ -17,16 +17,19 @@ const Allocator = std.mem.Allocator;
 pub const Carry = struct { want: record.Record, choice: rows.carry.Choice };
 
 /// This start's key and proof, then its directory (rows_carry.choose); null if the probe failed: its own, as knob off.
-pub fn start(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, backend: lanes.backend.Backend, e: *Engine, facts: []const u64, probed: u64, id: u64, rules: api.prompt_cache.Rules, local: bool) !?Carry {
+pub fn start(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, root: []const u8, backend: lanes.backend.Backend, e: *Engine, facts: []const u64, probed: u64, id: u64, store: *const api.prompt_cache.Store, local: bool) !?Carry {
     var parts: std.ArrayList(u64) = .empty;
     try parts.append(a, probed); // the identity's own probe state, every rank's bytes
     const proof = prove(a, backend, e, &parts) catch |err| {
         std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: no carry this start, the carry probe failed ({s})", .{@errorName(err)});
         return null;
     };
+    const rules = store.rules;
     const want: record.Record = .{ .dir = rows.carry.dirOf(id), .key = try cuda_disk.carryOf(a, io, ctx, o.dir, facts, parts.items), .proof = proof, .block = rows.block_tokens, .lookahead = rules.lookahead, .planned = @intFromBool(rules.planned) };
     const asked: ?rows.carry.Ranks = if (local) .{ .ctx = e, .check = check } else null;
-    const c = rows.carry.choose(root, want, asked);
+    // TF_GLM_OVN_DISK_CARRY_REPLAY_TOKENS: the rows of stored states prefilled again before an adoption (0: none)
+    var replay: Replay = .{ .a = a, .gpa = store.gpa, .backend = backend, .e = e, .family = store.family, .root = root, .want = want, .cap = try cuda.ovn.int("DISK_CARRY_REPLAY_TOKENS", rows.replay.default_tokens), .local = local };
+    const c = rows.carry.choose(root, want, asked, if (replay.cap > 0) .{ .ctx = &replay, .run = Replay.run } else null);
     std.log.info("glm: TF_GLM_OVN_DISK_CARRY: {s} (directory {x:0>16}, carry key {x:0>16}, {d} probe hashes)", .{ c.why, c.id, want.key, parts.items.len });
     return .{ .want = want, .choice = c };
 }
@@ -57,9 +60,27 @@ fn prove(a: Allocator, backend: lanes.backend.Backend, e: *Engine, parts: *std.A
     if (marks.len == 0) return error.CarryContextShort;
     const toks = try a.alloc(u32, marks[marks.len - 1] + dc.tail);
     for (toks, 0..) |*x, i| x.* = @intCast(1000 + i * 7919 % 50000); // the identity probe's prompt, further
+    // the ranks back asleep after the pass and its hashes on every way out, as the identity's probe leaves them
+    defer glm.disk_ranks.rest(e) catch |err| std.log.warn("glm: the ranks did not sleep after the carry probe ({s})", .{@errorName(err)});
+    var saved: [2]*anyopaque = undefined;
+    try pass(a, backend, e, toks, marks, saved[0..marks.len]);
+    defer for (saved[0..marks.len]) |k| glm.native.snap_drop(e, k);
+    var out: [64]u64 = undefined;
+    var proof: u64 = 0;
+    for (saved[0..marks.len], 0..) |k, i| {
+        const hs = try dc.hashes(e, @as(*Kept, @ptrCast(@alignCast(k))).id, i == 0, &out);
+        for (hs) |v| if (v == record.unhashed) return error.CarryUnhashed;
+        proof = record.fold(proof, hs[0]);
+        try parts.appendSlice(a, hs);
+    }
+    return proof;
+}
+
+/// One prompt pass of `toks`, its state kept at each of `marks` into `saved` (the caller drops them; none on error).
+fn pass(a: Allocator, backend: lanes.backend.Backend, e: *Engine, toks: []const u32, marks: []const u32, saved: []*anyopaque) !void {
     const Hook = struct {
         e: *Engine,
-        saved: [2]*anyopaque = undefined,
+        saved: []*anyopaque,
         n: usize = 0,
         failed: ?anyerror = null,
         fn at(p: *anyopaque, _: *lanes.Stream, m: u32) void {
@@ -75,26 +96,60 @@ fn prove(a: Allocator, backend: lanes.backend.Backend, e: *Engine, parts: *std.A
             h.n += 1;
         }
     };
-    var hook: Hook = .{ .e = e };
-    defer for (hook.saved[0..hook.n]) |saved| glm.native.snap_drop(e, saved);
+    var hook: Hook = .{ .e = e, .saved = saved };
+    errdefer for (saved[0..hook.n]) |k| glm.native.snap_drop(e, k);
     var s = try lanes.Stream.init(a, .{ .id = "carry probe", .prompt = toks, .max_new = 1, .drafts = e.mtp, .reuse = .{ .marks = marks, .hook = .{ .ptr = &hook, .at = Hook.at } } });
     defer s.deinit(a);
-    // the ranks back asleep after the pass and its hashes on every way out, as the identity's probe leaves them
-    defer glm.disk_ranks.rest(e) catch |err| std.log.warn("glm: the ranks did not sleep after the carry probe ({s})", .{@errorName(err)});
     {
         defer backend.vtable.release(backend.ptr, &s); // once, whether the pass ran or failed
         try backend.vtable.prefill(backend.ptr, &s);
     }
     if (hook.failed) |err| return err;
     if (hook.n != marks.len) return error.ProbeUnmarked;
-    var out: [64]u64 = undefined;
-    var proof: u64 = 0;
-    for (hook.saved[0..hook.n], 0..) |saved, i| {
-        const k: *Kept = @ptrCast(@alignCast(saved));
-        const hs = try dc.hashes(e, k.id, i == 0, &out);
-        for (hs) |v| if (v == record.unhashed) return error.CarryUnhashed;
-        proof = record.fold(proof, hs[0]);
-        try parts.appendSlice(a, hs);
-    }
-    return proof;
 }
+
+/// The replay before an adoption (rows_replay): stored states prefilled again here, compared here and on every rank.
+const Replay = struct {
+    a: Allocator,
+    gpa: Allocator,
+    backend: lanes.backend.Backend,
+    e: *Engine,
+    family: api.prompt_cache.Snapshots,
+    root: []const u8,
+    want: record.Record,
+    cap: u64,
+    local: bool,
+
+    fn run(ctx: *anyopaque, id: u64) bool {
+        const r: *Replay = @ptrCast(@alignCast(ctx));
+        const rest = disk.Rest.of(r.e);
+        defer rest.done();
+        const v = rows.replay.run(r.gpa, r.family, r.root, id, r.want, r.cap, .{ .ctx = r, .fresh = fresh, .others = if (r.local) others else null });
+        switch (v) {
+            .same => |n| std.log.info("glm: TF_GLM_OVN_DISK_CARRY: {d} stored states of {x:0>16} prefilled again, the same bytes on every rank", .{ n, id }),
+            .none => std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: no stored state of {x:0>16} within {d} rows could be replayed: no carry", .{ id, r.cap }),
+            .differs => |d| std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: the {d}-token state {s} of {x:0>16} differs on rank {d} from image byte {d}: no carry", .{ d.at, &rows.chain.hex(d.name), id, d.rank, d.off }),
+            .failed => |err| std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: replaying {x:0>16} failed ({s}): no carry", .{ id, @errorName(err) }),
+        }
+        return v == .same;
+    }
+
+    /// A stored state's own ids prefilled by this build, kept at its position (rows_replay drops it).
+    fn fresh(ctx: *anyopaque, tokens: []const u32, at: u32) anyerror!api.prompt_cache.Saved {
+        const r: *Replay = @ptrCast(@alignCast(ctx));
+        const marks = [_]u32{at};
+        var saved: [1]*anyopaque = undefined;
+        try pass(r.a, r.backend, r.e, tokens, &marks, &saved);
+        return saved[0];
+    }
+
+    /// TF_GLM_OVN_DISK_LOCAL: every other rank's own part of `files` in `dir` against its image of the fresh state.
+    fn others(ctx: *anyopaque, dir: []const u8, saved: api.prompt_cache.Saved, at: u32, files: []const rows.local.File, out: []u64) anyerror![]const u64 {
+        const r: *Replay = @ptrCast(@alignCast(ctx));
+        const fs = try r.gpa.alloc(glm.disk_local.File, files.len);
+        defer r.gpa.free(fs);
+        for (files, fs) |f, *x| x.* = .{ .name = f.name, .kind = f.kind, .window = f.window, .k = f.k };
+        const k: *Kept = @ptrCast(@alignCast(saved));
+        return glm.disk_replay.ask(r.e, dir, k.id, at, rows.block_tokens, fs, out);
+    }
+};

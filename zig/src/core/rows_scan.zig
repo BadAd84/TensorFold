@@ -38,6 +38,15 @@ pub fn scan(r: *Rows) !void {
 
 /// A state file's metadata checked against its name, kept for lookups (its payload is checked when read).
 fn readState(r: *Rows, p: [:0]const u8) !void {
+    var s = try stateOf(r, p);
+    errdefer Rows.freeState(r.gpa, &s);
+    r.clock += 1;
+    s.used = r.clock;
+    try r.states.append(r.gpa, s);
+}
+
+/// State file `p`'s metadata checked against its name under `r`'s keying (r.gpa's memory); nothing on disk changes.
+pub fn stateOf(r: *const Rows, p: [:0]const u8) !State {
     var o = try file.open(p, .state, null);
     defer o.close();
     const m = try file.meta(&o, r.gpa);
@@ -56,9 +65,7 @@ fn readState(r: *Rows, p: [:0]const u8) !void {
     if (s.at == 0 or s.tokens.len != s.at + r.keying.lookahead or o.trailer.block != r.keying.block) return error.RowsRead;
     if (!std.mem.eql(u8, &chain.state(r.keying, s.tokens, s.spans, s.starts, s.at), &s.name)) return error.RowsRead;
     modes.validate(s.spans) catch return error.RowsRead;
-    r.clock += 1;
-    s.used = r.clock;
-    try r.states.append(r.gpa, s);
+    return s;
 }
 
 /// Each state's blocks counted; a state missing one, or that its family cannot lay out, goes; then idle blocks.

@@ -16,17 +16,17 @@ const kind = @backingInt(follow.Kind.disk);
 /// This process's own part: a rank other than 0, from rank 0's open step on.
 var mine: ?*part.Part = null;
 
-/// A file in a step: its kind, group and index, then its name's eight words.
-const file_words = 3 + 8;
+/// A file in a step: its kind, group and index, then its name's eight words (TF_GLM_OVN_DISK_CARRY's replay too).
+pub const file_words = 3 + 8;
 /// A key in a step: its kind, then its stem's four words.
 const key_words = 1 + 4;
 
-fn putFile(f: File, out: []u32) void {
+pub fn putFile(f: File, out: []u32) void {
     out[0..3].* = .{ @backingInt(f.kind), f.window, f.k };
     @memcpy(std.mem.sliceAsBytes(out[3..file_words]), &f.name);
 }
 
-fn getFile(in: []const u32) !File {
+pub fn getFile(in: []const u32) !File {
     if (in[0] != @backingInt(Kind.block) and in[0] != @backingInt(Kind.state)) return error.BadStep;
     var f: File = .{ .name = undefined, .kind = @fromBackingInt(in[0]), .window = in[1], .k = in[2] };
     @memcpy(&f.name, std.mem.sliceAsBytes(in[3..file_words]));

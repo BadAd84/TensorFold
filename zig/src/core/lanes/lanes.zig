@@ -77,3 +77,4 @@ pub const rows_file = @import("rows_file.zig"); // the disk tier's file format: 
 pub const rows_image = @import("rows_image.zig");
 pub const disk_readers = @import("disk_readers.zig");
 pub const carry_record = @import("carry_record.zig"); // TF_GLM_OVN_DISK_CARRY: a store directory's record, every rank's
+pub const carry_compare = @import("carry_compare.zig"); // TF_GLM_OVN_DISK_CARRY's replay: a file against a fresh image

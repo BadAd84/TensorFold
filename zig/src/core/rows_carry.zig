@@ -25,11 +25,14 @@ pub const Ranks = struct {
     check: *const fn (ctx: *anyopaque, dir: []const u8, id: u64, key: u64) anyerror!bool,
 };
 
+/// TF_GLM_OVN_DISK_CARRY's replay, the last proof before an alias is written: directory `id`'s states hold here.
+pub const Replay = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque, id: u64) bool };
+
 /// The directory a store opens: `id` (its own, or the one it adopted), and why, for the log.
 pub const Choice = struct { id: u64, adopted: bool = false, why: []const u8 };
 
-/// The directory a store opens: its own, else its alias's or the newest other proving `want`, once every rank agrees.
-pub fn choose(root: []const u8, want: Record, ranks: ?Ranks) Choice {
+/// The directory a store opens: its own, else its alias's or the newest proving `want`, if ranks and `replay` agree.
+pub fn choose(root: []const u8, want: Record, ranks: ?Ranks, replay: ?Replay) Choice {
     const own = want.dir;
     var own_buf: [1200]u8 = undefined;
     const own_dir = path(&own_buf, root, own, "") catch return .{ .id = own, .why = "the root's path is too long" };
@@ -55,6 +58,10 @@ pub fn choose(root: []const u8, want: Record, ranks: ?Ranks) Choice {
         }
     }
     if (pinned == null or pinned.?.dir != from or pinned.?.key != want.key) {
+        if (replay) |rp| if (!rp.run(rp.ctx, from)) { // only an adoption about to be written replays
+            drop(root, own);
+            return .{ .id = own, .why = "its replayed states do not prove it" };
+        };
         writeAlias(root, .{ .own = own, .dir = from, .key = want.key }) catch
             return .{ .id = own, .why = "its alias could not be written" };
     }

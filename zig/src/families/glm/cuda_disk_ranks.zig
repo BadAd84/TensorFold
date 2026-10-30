@@ -7,7 +7,7 @@ const Engine = @import("cuda_engine.zig").Engine;
 
 /// A disk step's op (Header.flags); its id is `a`, its image offset `seed`, its bytes `depth`, its rank `top_k`.
 /// `local_` ops: TF_GLM_OVN_DISK_LOCAL's (cuda_disk_local); `carry_` ops: TF_GLM_OVN_DISK_CARRY's (cuda_disk_carry).
-pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, bcast, local_open, local_file, local_unlink, local_other, local_have, local_sweep, local_read, local_status, local_verify, carry_proof, carry_check, carry_record };
+pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, bcast, local_open, local_file, local_unlink, local_other, local_have, local_sweep, local_read, local_status, local_verify, carry_proof, carry_check, carry_record, carry_replay };
 const kind = @backingInt(follow.Kind.disk); // each op crosses the follow link as a disk step, its bytes as the ids
 
 /// This rank's image shape (every sequence of the engine has the same; TF_GLM_OVN_DROP_MTP's hold no head caches).
@@ -210,7 +210,7 @@ fn gather(l: *follow.Link, e: *const Engine, mine: u64, out: []u64) !void {
 
 /// A rank other than 0: rank 0's disk step on this rank's copy of its state.
 pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !void {
-    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.carry_record)) return error.BadStep;
+    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.carry_replay)) return error.BadStep;
     const op: Op = @fromBackingInt(h.flags);
     const rank: u32 = @intCast(e.share.rank);
     switch (op) {
@@ -242,6 +242,7 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
         },
         .bcast => try runs(l, e, h.a, ids),
         .carry_proof, .carry_check, .carry_record => try @import("cuda_disk_carry.zig").step(e, l, h, ids, op),
+        .carry_replay => try @import("cuda_disk_replay.zig").step(e, l, h, ids),
         else => try @import("cuda_disk_local.zig").step(e, l, h, ids, op),
     }
 }

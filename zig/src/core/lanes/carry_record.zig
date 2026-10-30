@@ -126,6 +126,7 @@ test "rows_carry record: written whole and read back; a torn, foreign or missing
     const dir = try testDir(&dir_buf, "record");
     defer _ = platform.c.rmdir(dir);
     defer removeIn(dir, file_name);
+    defer removeIn(dir, file_name ++ ".part"); // left only when a write failed (a broken build of this file)
     try std.testing.expect(read(dir) == null);
     const r: Record = .{ .dir = 3, .key = 5, .proof = 7, .block = 256, .lookahead = 1, .planned = 1 };
     try write(dir, r);

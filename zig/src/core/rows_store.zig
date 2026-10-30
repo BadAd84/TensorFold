@@ -11,6 +11,7 @@ pub const write = @import("rows_write.zig");
 pub const read = @import("rows_read.zig");
 pub const local = @import("rows_local.zig");
 pub const carry = @import("rows_carry.zig"); // TF_GLM_OVN_DISK_CARRY: an older identity's directory, read on proof
+pub const replay = @import("rows_replay.zig"); // TF_GLM_OVN_DISK_CARRY: stored states prefilled again and compared
 const dirs = @import("lanes").learned_dirs;
 const readers = @import("lanes").disk_readers;
 const Admission = @import("lanes").learned_disk.Admission;
@@ -143,8 +144,8 @@ pub const Rows = struct {
         return r;
     }
 
-    /// A store holding only its names, nothing read: from here `deinit` alone owns `r` and its strings.
-    fn init(gpa: Allocator, family: pc.Snapshots, o: Options) !*Rows {
+    /// A store holding only its names, nothing read or made (rows_replay views a directory so); `deinit` alone owns it.
+    pub fn init(gpa: Allocator, family: pc.Snapshots, o: Options) !*Rows {
         const img = family.vtable.rows orelse return error.RowsUnsupported;
         const r = try gpa.create(Rows);
         errdefer gpa.destroy(r);
@@ -534,6 +535,7 @@ test {
     _ = @import("rows_pump_test.zig");
     _ = @import("rows_local_test.zig");
     _ = @import("rows_carry_test.zig");
+    _ = @import("rows_replay.zig");
 }
 
 /// TENSORFOLD_ROWS_STAGING_GIB: the host bytes the write worker stages at once (a save larger than that is skipped, so a

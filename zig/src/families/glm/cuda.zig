@@ -48,6 +48,7 @@ pub const disk_ranks = @import("cuda_disk_ranks.zig");
 pub const one_chunk = @import("cuda_one_chunk.zig");
 pub const disk_local = @import("cuda_disk_local.zig"); // TF_GLM_OVN_DISK_LOCAL: each rank's part on its own disk
 pub const disk_carry = @import("cuda_disk_carry.zig"); // TF_GLM_OVN_DISK_CARRY: each rank's probe hashes and record
+pub const disk_replay = @import("cuda_disk_replay.zig"); // TF_GLM_OVN_DISK_CARRY: each rank's replay of its own part
 pub const rotlayer = @import("cuda_rotlayer.zig"); // TF_GLM_OVN_EXPERT_ROTATE: each MoE layer's first shares rotated
 pub const lineage = @import("cuda_lineage.zig"); // TF_GLM_OVN_LINEAGE: rows' tags, and the copies they spare
 pub const lineage_copy = @import("cuda_lineage_copy.zig");
@@ -70,6 +71,7 @@ test {
     _ = @import("cuda_disk_image.zig");
     _ = @import("cuda_disk_part.zig");
     _ = disk_carry;
+    _ = disk_replay;
     _ = experts;
     _ = exl3;
     _ = vision;

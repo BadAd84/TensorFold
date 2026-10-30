@@ -107,7 +107,7 @@ test "rows_carry adopts: a new identity reads the states of an older directory w
     defer rmTree(dir);
     try seed(a, dir, old_identity, 0, want(old_identity, key));
     const old = carry.dirOf(old_identity);
-    const c = carry.choose(dir, want(new_identity, key), null);
+    const c = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(c.adopted);
     try std.testing.expectEqual(old, c.id);
     try std.testing.expectEqual(old, carry.readAlias(dir, carry.dirOf(new_identity)).?.dir);
@@ -119,7 +119,7 @@ test "rows_carry adopts: a new identity reads the states of an older directory w
     try std.testing.expect(!exists(dir, carry.dirOf(new_identity), ""));
     try std.testing.expectEqual(@as(usize, 2), try view(dir, old_identity, null));
     // a restart of the new build takes the same directory by its alias
-    const again = carry.choose(dir, want(new_identity, key), null);
+    const again = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(again.adopted and again.id == old);
 }
 
@@ -138,16 +138,16 @@ test "rows_carry takes the newest directory that proves its key and holds states
         defer r.deinit();
         try carry.record.write(r.dir, want(10, key));
     }
-    const c = carry.choose(dir, want(new_identity, key), null);
+    const c = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(c.adopted);
     try std.testing.expectEqual(carry.dirOf(9), c.id);
     // a newer directory with the key comes later: the alias keeps the one this identity already reads and writes
     try seed(a, dir, 11, 6, want(11, key));
-    try std.testing.expectEqual(carry.dirOf(9), carry.choose(dir, want(new_identity, key), null).id);
+    try std.testing.expectEqual(carry.dirOf(9), carry.choose(dir, want(new_identity, key), null, null).id);
     // the alias's directory proves the key no more (its record rewritten): the newest that does is taken instead
     var path_buf: [160]u8 = undefined;
     try carry.record.write(try std.fmt.bufPrint(&path_buf, "{s}/{x:0>16}", .{ dir, carry.dirOf(9) }), want(9, key + 1));
-    const moved = carry.choose(dir, want(new_identity, key), null);
+    const moved = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(moved.adopted and moved.id == carry.dirOf(11));
     try std.testing.expectEqual(carry.dirOf(11), carry.readAlias(dir, carry.dirOf(new_identity)).?.dir);
 }
@@ -167,7 +167,7 @@ test "rows_carry refuses another key, proof, keying or a record of another direc
     asked[2].planned = 1; // the store names its files otherwise
     asked[3].block += 1;
     for (asked) |w| {
-        const c = carry.choose(dir, w, null);
+        const c = carry.choose(dir, w, null, null);
         try std.testing.expect(!c.adopted);
         try std.testing.expectEqual(carry.dirOf(new_identity), c.id);
         try std.testing.expect(carry.readAlias(dir, carry.dirOf(new_identity)) == null);
@@ -178,7 +178,7 @@ test "rows_carry refuses another key, proof, keying or a record of another direc
     var path_buf: [160]u8 = undefined;
     const old_dir = try std.fmt.bufPrint(&path_buf, "{s}/{x:0>16}", .{ dir, old });
     try carry.record.write(old_dir, copied);
-    try std.testing.expect(!carry.choose(dir, want(new_identity, key), null).adopted);
+    try std.testing.expect(!carry.choose(dir, want(new_identity, key), null, null).adopted);
     try carry.record.write(old_dir, want(old_identity, key));
     // the new build then starts cold in its own directory, and the old build still resumes from its own
     const cold = try nextTurn(a, dir, new_identity, null);
@@ -196,7 +196,7 @@ test "rows_carry refuses a directory whose names are keyed otherwise, so its sca
     try seed(a, dir, old_identity, 0, want(old_identity, key));
     var w = want(new_identity, key);
     w.lookahead = 0; // the new build keeps states with no lookahead: every older name and length means another state
-    const c = carry.choose(dir, w, null);
+    const c = carry.choose(dir, w, null, null);
     try std.testing.expect(!c.adopted);
     {
         var f: fake.Fake = .{ .gpa = gpa }; // the new build's store opens where it was told, scanning with its keying
@@ -239,17 +239,17 @@ test "rows_carry refuses when any rank's own directory does not prove it, or a r
     const old = carry.dirOf(old_identity);
     const alias = carry.dirOf(new_identity);
     var no: Asked = .{ .answer = false };
-    try std.testing.expect(!carry.choose(dir, want(new_identity, key), no.ranks()).adopted);
+    try std.testing.expect(!carry.choose(dir, want(new_identity, key), no.ranks(), null).adopted);
     try std.testing.expectEqual(@as(usize, 1), no.calls);
     try std.testing.expect(no.id == old and no.key == key and no.dir_len == dir.len + 17);
     try std.testing.expect(carry.readAlias(dir, alias) == null);
     var lost: Asked = .{ .answer = error.LinkFailed };
-    try std.testing.expect(!carry.choose(dir, want(new_identity, key), lost.ranks()).adopted);
+    try std.testing.expect(!carry.choose(dir, want(new_identity, key), lost.ranks(), null).adopted);
     try std.testing.expect(carry.readAlias(dir, alias) == null);
     var yes: Asked = .{ .answer = true };
-    try std.testing.expect(carry.choose(dir, want(new_identity, key), yes.ranks()).adopted);
+    try std.testing.expect(carry.choose(dir, want(new_identity, key), yes.ranks(), null).adopted);
     // a later start whose ranks refuse drops the alias: the store reads its own directory, all ranks alike
-    try std.testing.expect(!carry.choose(dir, want(new_identity, key), no.ranks()).adopted);
+    try std.testing.expect(!carry.choose(dir, want(new_identity, key), no.ranks(), null).adopted);
     try std.testing.expect(carry.readAlias(dir, alias) == null);
     try std.testing.expectEqual(@as(usize, 1), try view(dir, old_identity, null));
 }
@@ -276,7 +276,7 @@ test "rows_carry survives a crash mid-adoption: the older directory stays usable
     // the old build restarted instead: its directory and states as they were
     try std.testing.expectEqual(@as(usize, 1), try view(dir, old_identity, null));
     // the new build's next start completes the adoption, the leftover gone
-    const c = carry.choose(dir, want(new_identity, key), null);
+    const c = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(c.adopted and c.id == old);
     try std.testing.expectEqual(old, carry.readAlias(dir, own).?.dir);
     try std.testing.expect(!exists(dir, own, ".carry.part"));
@@ -292,11 +292,11 @@ test "rows_carry: an identity whose own directory holds states keeps them, and a
     defer rmTree(dir);
     try seed(a, dir, old_identity, 0, want(old_identity, key));
     const own = carry.dirOf(new_identity);
-    try std.testing.expect(carry.choose(dir, want(new_identity, key), null).adopted);
+    try std.testing.expect(carry.choose(dir, want(new_identity, key), null, null).adopted);
     // the old directory removed (another identity's room, say): the alias names nothing, so it goes
     var path_buf: [160]u8 = undefined;
     rmTree(try std.fmt.bufPrint(&path_buf, "{s}/{x:0>16}", .{ dir, carry.dirOf(old_identity) }));
-    const gone = carry.choose(dir, want(new_identity, key), null);
+    const gone = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(!gone.adopted and gone.id == own);
     try std.testing.expect(carry.readAlias(dir, own) == null);
     // the new build's own directory holds a state and an older one with the key is back: it keeps its own, alias gone
@@ -311,7 +311,7 @@ test "rows_carry: an identity whose own directory holds states keeps them, and a
     left.magic -%= 1;
     try carry.record.replace(alias, std.mem.asBytes(&left));
     try std.testing.expect(carry.readAlias(dir, own) != null);
-    const kept = carry.choose(dir, want(new_identity, key), null);
+    const kept = carry.choose(dir, want(new_identity, key), null, null);
     try std.testing.expect(!kept.adopted and kept.id == own);
     try std.testing.expect(carry.readAlias(dir, own) == null);
 }
