@@ -383,11 +383,11 @@ pub fn snap_reuses(ptr: *anyopaque, at: u32) bool {
     return snap_spare(ptr) >= snap_bytes(ptr, at);
 }
 
-/// The prompt pass stands at `at` (a mark at a chunk start): copy the state there under a new id.
+/// The prompt pass stands at `at` (a chunk start, or TF_GLM_OVN_ONE_CHUNK's mark inside one): its state under a new id.
 pub fn snap_save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
     _ = owner;
     const e: *engine.Engine = @ptrCast(@alignCast(ptr));
-    if (e.pos() != at) return error.NotAtMark;
+    if (e.pos() != at and !@import("cuda_one_chunk.zig").inside(e, at)) return error.NotAtMark;
     const k = try e.gpa.create(engine.Kept);
     errdefer e.gpa.destroy(k);
     k.* = .{ .id = try e.keepState(), .at = at };

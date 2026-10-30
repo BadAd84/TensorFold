@@ -141,7 +141,7 @@ pub fn projectRows(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: 
 }
 
 /// The float64 gate's input: the projected fused stack (`rows` x `w` bf16, row stride `w`), written once.
-fn dumpOnce(stream: cuda.Stream, src: u64, w: usize, rows: usize) !void {
+pub fn dumpOnce(stream: cuda.Stream, src: u64, w: usize, rows: usize) !void {
     const path = dump_path orelse return;
     const d = dump_driver orelse return;
     dump_path = null; // one dump a process: the gate compares a single round

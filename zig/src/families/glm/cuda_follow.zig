@@ -10,6 +10,7 @@ const prompt_wire = @import("cuda_prompt_wire.zig");
 const dflash = @import("dflash.zig");
 const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
+const one_chunk = @import("cuda_one_chunk.zig");
 const Engine = engine.Engine;
 
 pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, costs, chunk_part };
@@ -22,7 +23,7 @@ pub const Header = extern struct {
     flags: u32 = 0, // begin: sampled; draft: from the prompt; prefill, chunk: prompt_logprobs (1); chunk: indexer rows split (2), its rows (bits 16 and up); verify, shared: whole rows
     a: u64 = 0, // keep: rows; prefill, chunk: the kept state it resumes (0: none); redraw: the prompt's length
     seed: u64 = 0, // begin: the sampling seed; prefill, chunk: the kept state's position
-    temperature: f64 = 0,
+    temperature: f64 = 0, // and top_p, min_p: begin's sampling; chunk: TF_GLM_OVN_ONE_CHUNK's cuts (cuda_one_chunk.put)
     top_p: f64 = 0,
     min_p: f64 = 0,
     top_k: u32 = 0, // begin: top_k; chunk: the prompt's length
@@ -270,11 +271,15 @@ pub const Leader = struct {
         const at: []const u32 = if (marks) |m| m.at else &.{};
         const a_end = engine.chunkEnd(start, ids.len, at);
         const two = pair and a_end == start + engine.prompt_rows and x.e.pairedAt(start, ids.len, from, marks);
-        const n = (if (two) engine.chunkEnd(a_end, ids.len, at) else a_end) - start; // this step's rows
+        const one = one_chunk.plan(x.e, start, ids.len, at, from, two or slice); // TF_GLM_OVN_ONE_CHUNK (null: as before)
+        const n = if (one) |p| p.end - start else (if (two) engine.chunkEnd(a_end, ids.len, at) else a_end) - start;
         const part = ids[start..@min(ids.len, start + n + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
         const hi: usize = if (slice and !two and x.e.prompt_logprobs == null) slices.first(x.e, n, start + n == ids.len) else 0;
-        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intCast(hi)) << 8 | @as(u32, @intCast(n)) << 16, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+        var h: Header = .{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intCast(hi)) << 8 | @as(u32, @intCast(n)) << 16, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) };
+        one_chunk.put(&h, one);
+        try x.send(h, part);
+        try one_chunk.arm(x.e, one);
         x.e.index_split = split;
         if (@import("cuda_prompt_slices.zig").of(x.e)) |s| s.hi = hi;
         const first = try x.e.prefillChunk(part, start, n, ids.len, from, cancel, marks);
@@ -460,6 +465,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
                 e.index_split = indexSplit(h);
                 if (@import("cuda_prompt_slices.zig").of(e)) |s| s.hi = sliceEnd(h); // TF_GLM_OVN_FILL_SLICE_MS: rank 0's first slice end (0: whole)
+                try one_chunk.arm(e, try one_chunk.read(&h, h.depth, chunkRows(h)));
                 _ = e.prefillChunk(ids, h.depth, chunkRows(h), h.top_k, from, null, null) catch |err| switch (err) {
                     error.Cancelled => {},
                     else => return err,

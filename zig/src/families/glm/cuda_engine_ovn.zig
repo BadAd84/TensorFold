@@ -1,5 +1,5 @@
 //! The engine's speed-hunt knobs made at load (TF_GLM_OVN_SHARED_PROF, _DRAW1, _SEG_KDA, _SEG_COMMIT, _SEG_DSA,
-//! _FILL_SLICE_MS).
+//! _FILL_SLICE_MS, _ONE_CHUNK).
 const std = @import("std");
 const cuda = @import("cuda");
 const Engine = @import("cuda_engine.zig").Engine;
@@ -11,6 +11,10 @@ pub fn open(e: *Engine, gpa: std.mem.Allocator, io: std.Io) !void {
     if (slice_ms > 0) {
         e.slices = try @import("cuda_prompt_slices.zig").Slices.create(gpa, e.d, slice_ms, try cuda.ovn.int("FILL_FAST_MS", 0), e.w.layers.len);
         @import("cuda_prompt_slices.zig").on = true;
+    }
+    if (cuda.ovn.on("ONE_CHUNK")) { // the bound sequence's shapes size its captures
+        e.one = try @import("cuda_one_chunk.zig").Capture.create(gpa, e.d, &e.cur.st, e.c.i_dim, e.c.hidden);
+        @import("cuda_one_chunk.zig").on = true;
     }
     if (cuda.ovn.on("SHARED_PROF")) e.shared_prof = try @import("cuda_engine_prof.zig").Shared.create(gpa, e.d, io);
     if (cuda.ovn.on("DRAW1")) e.draw1 = try @import("cuda_draw1.zig").Draw1.init(e);
@@ -28,6 +32,10 @@ pub fn open(e: *Engine, gpa: std.mem.Allocator, io: std.Io) !void {
 
 /// Frees what `open` made (before the buffers and the sampler go).
 pub fn close(e: *Engine) void {
+    if (@import("cuda_one_chunk.zig").on) if (e.one) |c| {
+        c.destroy();
+        e.one = null;
+    };
     if (@import("cuda_prompt_slices.zig").of(e)) |s| {
         s.destroy(e.gpa);
         e.slices = null;

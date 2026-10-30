@@ -91,6 +91,7 @@ pub const Engine = struct {
     seg_dsa: ?@import("cuda_dsa_seg.zig").SegDsa = null, // TF_GLM_OVN_SEG_DSA: e.bs's DSA segment table
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024 and prompt_rows rows
     slices: ?*prompt_slices.Slices = null, // TF_GLM_OVN_FILL_SLICE_MS: a prompt chunk's layer slices (cuda_engine_ovn)
+    one: ?*@import("cuda_one_chunk.zig").Capture = null, // TF_GLM_OVN_ONE_CHUNK: marks kept from inside a chunk (read only on)
     checkpoint_digest: [32]u8,
     l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream
     settings: ranks.Settings,
@@ -433,8 +434,11 @@ pub const Engine = struct {
         stamp.end();
         if (f.prof) |p| p.mark(e.stream, .gate);
         if (hi != 0) return prompt_slices.begin(e, &f, part, start, rows, len, split, hi); // TF_GLM_OVN_FILL_SLICE_MS
+        try @import("cuda_one_chunk.zig").enter(e, &f, start, rows); // TF_GLM_OVN_ONE_CHUNK: the step's cuts and captures
         try f.run(as_i32[0..rows]);
-        return prompt_slices.tail(e, &f, part, start, rows, len, split);
+        const first = try prompt_slices.tail(e, &f, part, start, rows, len, split);
+        try @import("cuda_one_chunk.zig").leave(e, marks); // and the states at its marks, kept after its commit
+        return first;
     }
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.

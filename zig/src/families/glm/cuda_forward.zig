@@ -257,6 +257,7 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
     side: ?*const moe_side.Side = null, // TF_GLM_OVN_SHARED_SIDE: this window's shared experts beside its routed ones
+    one: ?*@import("cuda_one_chunk.zig").Capture = null, // TF_GLM_OVN_ONE_CHUNK: this prompt chunk's KDA cuts
 
     /// TF_GLM_OVN_L2PF_PACED on this forward: a decode window of one rank with at most the knob's streams in it.
     pub fn paced(f: *const Forward) ?*const l2pace.Paced {
@@ -321,6 +322,7 @@ pub const Forward = struct {
         const st = r.st;
         switch (l.mixer) {
             .kda => |k| {
+                if (b.prefill) if (f.one) |cap| return @import("cuda_one_chunk.zig").kdaBlock(f, r, k, li, rows, out, fronted, cap);
                 const cur = st.cur[li];
                 var s = b.kda;
                 s.p = if (b.prefill) b.kproj else st.proj + li * st.proj_layer * 2;

@@ -45,6 +45,7 @@ pub const native = @import("cuda_native.zig");
 pub const snapshots = @import("cuda_snapshots.zig");
 pub const disk_image = @import("cuda_disk_image.zig");
 pub const disk_ranks = @import("cuda_disk_ranks.zig");
+pub const one_chunk = @import("cuda_one_chunk.zig");
 
 test {
     _ = @import("cuda_tile.zig");
