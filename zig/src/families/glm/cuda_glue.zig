@@ -6,7 +6,25 @@ const mm_mod = @import("cuda_mm.zig");
 const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false };
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{} };
+
+/// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, TF_GLM_OVN_ABSORB_VEC); the defaults launch today's kernels.
+pub const Mla = struct {
+    fuse_rows: usize = 0, // attention launches of this many rows or more, 32-head blocks: chunks and merge in one
+    skip: bool = false, // chunk launches stop at the chunk's last live key tile
+    vec: bool = false, // absorb_q and expand_v read bf16 kv_b by 16-byte loads
+
+    /// MLA_FUSEMERGE: unset or 0 off; 1 fuses from latent.prompt_rows rows (prompt chunks); N > 1 from N rows.
+    pub fn read() error{BadOvnKnob}!Mla {
+        const fuse: usize = @intCast(try cuda.ovn.int("MLA_FUSEMERGE", 0));
+        return .{ .fuse_rows = if (fuse == 1) @import("cuda_latent.zig").prompt_rows else fuse, .skip = fuse != 0, .vec = cuda.ovn.on("ABSORB_VEC") };
+    }
+
+    /// Whether any TF_GLM_OVN knob whose kernels sit in glm_glue is set (MLA_FUSEMERGE, ABSORB_VEC, KVB8).
+    pub fn wanted() bool {
+        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8");
+    }
+};
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -80,11 +98,28 @@ pub const Kernels = struct {
     rmsnorm_1536_pdl: cuda.Function,
     rmsnorm_512_pdl: cuda.Function,
     rmsnorm_4096_f32w_pdl: cuda.Function,
+    // TF_GLM_OVN_* forms (glm_glue_attn_ovn.cuh, glm_glue_latent_ovn.cuh), launched only with their knob on
+    chunks_16_skip: cuda.Function,
+    chunks_32_skip: cuda.Function,
+    chunks_16_fp8_skip: cuda.Function,
+    chunks_32_fp8_skip: cuda.Function,
+    chunks_32_fused: cuda.Function,
+    chunks_32_fp8_fused: cuda.Function,
+    absorb_q_vec: cuda.Function,
+    expand_v_vec: cuda.Function,
+    absorb_q8: cuda.Function,
+    expand_v8: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
+        return loadOvn(m, Mla.wanted());
+    }
+
+    /// As load; the TF_GLM_OVN_* forms (chunks_16_skip on) looked up only with `ovn`, else null handles (none loads).
+    pub fn loadOvn(m: cuda.Module, ovn: bool) !Kernels {
+        const from = comptime std.meta.fieldIndex(Kernels, "chunks_16_skip").?;
         var k: Kernels = undefined;
-        inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
-            if (@FieldType(Kernels, name) == cuda.Function) @field(k, name) = try m.function("tf_glm_" ++ name);
+        inline for (@typeInfo(Kernels).@"struct".field_names, 0..) |name, i| {
+            if (@FieldType(Kernels, name) == cuda.Function) @field(k, name) = if (i < from or ovn) try m.function("tf_glm_" ++ name) else .{ .d = m.d, .handle = null };
         }
         const router16 = try cuda.ovn.int("ROUTER16", 0);
         k.router16 = if (router16 == 0) null else try m.function(if (router16 == 4) "tf_glm_router16_s4" else "tf_glm_router16_s3");
@@ -94,6 +129,13 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
+        if (!ovn) return k;
+        try k.chunks_16_skip.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_skip.allowDynamicShared(chunksSmem(32));
+        try k.chunks_16_fp8_skip.allowDynamicShared(chunksSmem(16));
+        try k.chunks_32_fp8_skip.allowDynamicShared(chunksSmem(32));
+        try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));
+        try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
         return k;
     }
 };

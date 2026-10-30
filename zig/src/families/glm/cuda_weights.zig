@@ -17,6 +17,7 @@ const mm_mod = @import("cuda_mm.zig");
 pub const formats = @import("cuda_formats.zig");
 const projection = @import("cuda_proj.zig");
 const glue = @import("cuda_glue.zig");
+const kvb = @import("cuda_kvb.zig");
 const Tensor = core.checkpoint.Tensor;
 const prefix = "model.language_model.";
 /// A hyper-connection site: fn bf16 [s (s + 2)][s d], base and scale widened to fp32.
@@ -254,10 +255,8 @@ const Loader = struct {
         const kv_b = try L.get("layers.{d}.self_attn.kv_b_proj.weight", .{i});
         const per = qk + c.v_dim; // a head's kv_b rows: its keys, then its values
         const total = c.mla_heads * per;
-        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per, head * per + qk, total);
-        const wk = try L.put("layers.{d}.dsa.absorb.wk", .{i});
-        for (h.lo..h.hi) |head| try absorbRows(L, kv_wide, kv_b, kv_name, head * per + qk, (head + 1) * per, total);
-        const wv = try L.put("layers.{d}.dsa.absorb.wv", .{i});
+        const wk, const sk = try kvb.half(L, kv_wide, kv_b, kv_name, .{ h.lo, h.hi }, per, 0, qk, total, c.kv_lora, "layers.{d}.dsa.absorb.wk", "layers.{d}.dsa.absorb.sk", i);
+        const wv, const sv = try kvb.half(L, kv_wide, kv_b, kv_name, .{ h.lo, h.hi }, per, qk, c.v_dim, total, c.kv_lora, "layers.{d}.dsa.absorb.wv", "layers.{d}.dsa.absorb.sv", i);
         const o = try formats.cutProj(L, prefix, i, &.{.{ .rel = "self_attn.o_proj", .cols = .{ h.lo * c.v_dim, h.hi * c.v_dim } }}, wants, "layers.{d}.dsa.o");
         const iw: []const formats.Format = if (mtp) &.{ .bf16, .mxfp8 } else &.{.bf16};
         const kw = try formats.cutProj(L, prefix, i, &.{ .{ .rel = "self_attn.indexer.wk" }, .{ .rel = "self_attn.indexer.weights_proj" } }, iw, "layers.{d}.dsa.index.kw");
@@ -277,6 +276,8 @@ const Loader = struct {
             .q_b = q_b,
             .wk = wk,
             .wv = wv,
+            .sk = sk,
+            .sv = sv,
             .o = o,
             .index = .{ .kw = kw, .gate = gate, .ln_w = ln_w, .ln_b = ln_b, .ape = ape, .qb = qb, .heads = c.i_heads, .d = c.i_dim },
             .heads = h.len(),
@@ -288,12 +289,6 @@ const Loader = struct {
             .eps = c.eps,
             .dense_limit = c.keyWidth(),
         };
-    }
-
-    /// kv_b's rows [lo, hi) onto the host bytes: bf16 as stored, or MXFP8 (`mx`, the MTP layer's) widened exactly.
-    fn absorbRows(L: *Loader, mx: ?formats.mxfp8.Mxfp8, t: Tensor, name: []const u8, lo: usize, hi: usize, total: usize) !void {
-        if (mx) |p| return formats.mxfp8.appendWide(L, p, name, lo, hi);
-        try L.rows(t, lo, hi, total, .bf16);
     }
 
     /// An NVFP4 linear's rows [lo, hi), inputs [klo, khi) as Fp4Linear.from_checkpoint (tf_pack_dense, packScales).

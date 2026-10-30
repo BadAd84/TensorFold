@@ -22,6 +22,8 @@ pub const Layer = struct {
     q_b: projection.Proj,
     wk: u64,
     wv: u64,
+    sk: u64 = 0, // TF_GLM_OVN_KVB8: wk's fp32 scales [heads][qk][lw / 128] (wk then E4M3); 0: wk bf16
+    sv: u64 = 0, // and wv's [heads][dv][lw / 128]
     o: projection.Proj,
     index: Index,
     heads: usize,
@@ -91,7 +93,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x:
     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
     const stamp = prof.span(k.prof, stream, .projections);
     defer stamp.end();
-    try latent.expandV(k.set, stream, s.ol, l.wv, s.vn, rows, l.heads, l.dv, l.lw);
+    try latent.expandV(k.set, stream, s.ol, l.wv, l.sv, s.vn, rows, l.heads, l.dv, l.lw);
 }
 
 /// Whether a sequence at `host_pos` has rows past the dense limit among its next `rows` (the sparse pass).
@@ -117,7 +119,7 @@ pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, 
     const ix = l.index;
     try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
     try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
-    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
+    try latent.absorbQ(set, stream, s.q, l.wk, l.sk, s.qa, rows, l.heads, l.qk, l.lw);
     if (qi) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 

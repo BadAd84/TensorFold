@@ -234,7 +234,10 @@ pub const Buffers = struct {
         const lw: usize = c.kv_lora;
         const part_rows = if (prefill) @min(rows, dsa_block.prompt_att_rows) else seg;
         const nch = latent.chunksFor(@min(capacity, dense_reach) + seg);
-        const partial_rows = @max(nch * part_rows, latent.chunksFor(sparse.width) * seg); // dense calls, or one sparse
+        // dense calls or one sparse call; TF_GLM_OVN_MLA_FUSEMERGE: fused launches (32-head blocks) need no partials
+        const fuse = (try glue.Mla.read()).fuse_rows;
+        const most = if (fuse != 0) @max(fuse, latent.prompt_rows) - 1 else std.math.maxInt(usize);
+        const partial_rows = @max(nch * @min(part_rows, most), latent.chunksFor(sparse.width) * @min(seg, most));
         const np_max = capacity / sparse.pool;
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
