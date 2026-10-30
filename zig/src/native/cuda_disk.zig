@@ -103,6 +103,8 @@ pub fn identityOf(a: Allocator, io: std.Io, g: *const cuda.Context, dir: []const
         if (comptime @TypeOf(v) == []const u8) h.update(v);
     }
     if (kernels) |k| h.update(try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ k, "aot.json" }), a, .limited(1 << 26)));
+    // TF_GLM_OVN_DISK_CARRY_SALT, a test hook: kernels that moved but compute the same bits (identity moves, key stays)
+    if (cuda.ovn.text("DISK_CARRY_SALT")) |s| h.update(s);
     try device(&h, g);
     h.update(std.mem.sliceAsBytes(facts));
     h.update(std.mem.asBytes(&probed));
@@ -254,4 +256,66 @@ test "CUDA disk open: --spill-gib's mode and --checkpoint-slots reach the store"
         try std.testing.expectEqual(mode, r.spill);
         try std.testing.expectEqual(if (keep) |n| @as(usize, @intCast(n)) else std.math.maxInt(usize), store.most);
     }
+}
+
+/// A device for the identity's tests: its name, capability and driver version fixed, no GPU.
+const FakeDevice = struct {
+    fn name(buf: [*]u8, len: c_int, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+        const s = "GB10 for tests";
+        if (len <= s.len) return 1;
+        @memcpy(buf[0..s.len], s);
+        buf[s.len] = 0;
+        return 0;
+    }
+    fn attribute(out: *c_int, _: cuda.abi.DeviceAttribute, _: cuda.abi.Device) callconv(.c) cuda.abi.Result {
+        out.* = 12;
+        return 0;
+    }
+    fn version(out: *c_int) callconv(.c) cuda.abi.Result {
+        out.* = 13000;
+        return 0;
+    }
+};
+
+const salt_facts = [_]u64{ 1, 2 };
+const salt_probed: u64 = 0x51;
+
+/// One start's identity and carry key on device `g` with checkpoint `dir`, TF_GLM_OVN_DISK_CARRY_SALT read as `salt`.
+fn saltedKeys(salt: ?[]const u8, a: Allocator, dir: []const u8, g: *const cuda.Context) ![2]u64 {
+    cuda.ovn.fake("DISK_CARRY_SALT", salt);
+    const id = try identityOf(a, std.testing.io, g, dir, null, &salt_facts, salt_probed);
+    return .{ id, try carryOf(a, std.testing.io, g, dir, &salt_facts, &.{ salt_probed, 0x52 }) };
+}
+
+test "disk identity: TF_GLM_OVN_DISK_CARRY_SALT moves the identity as a kernel change would, and leaves the carry key" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"glm_moe_dsa\"}" });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    var drv: cuda.Driver = undefined;
+    drv.api.cuDeviceGetName = FakeDevice.name;
+    drv.api.cuDeviceGetAttribute = FakeDevice.attribute;
+    drv.api.cuDriverGetVersion = FakeDevice.version;
+    const g: cuda.Context = .{ .d = &drv, .device = 0, .handle = null };
+    defer cuda.ovn.fake("DISK_CARRY_SALT", null);
+    const plain = try saltedKeys(null, a, dir, &g);
+    const one = try saltedKeys("one", a, dir, &g);
+    const two = try saltedKeys("two", a, dir, &g);
+    try std.testing.expect(one[0] != plain[0] and two[0] != plain[0] and one[0] != two[0]);
+    try std.testing.expect(one[1] == plain[1] and two[1] == plain[1]);
+    // unset, the identity hashes what it always did: the checkpoint, the kernels, the device, the facts, the probe
+    var h = std.hash.Wyhash.init(0x6375);
+    try disk_identity.checkpoint(&h, a, io, dir);
+    inline for (comptime std.meta.declarations(cuda.kernels)) |k| {
+        const v = @field(cuda.kernels, k);
+        if (comptime @TypeOf(v) == []const u8) h.update(v);
+    }
+    try device(&h, &g);
+    h.update(std.mem.sliceAsBytes(&salt_facts));
+    h.update(std.mem.asBytes(&salt_probed));
+    try std.testing.expectEqual(h.final(), plain[0]);
 }

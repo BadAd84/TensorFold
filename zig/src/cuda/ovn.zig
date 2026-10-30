@@ -36,6 +36,13 @@ pub fn on(comptime name: []const u8) bool {
     return !std.mem.eql(u8, s, "0");
 }
 
+/// Tests only: knob `name` reads as `value` (null: unset) from now on, as if the environment held it.
+pub fn fake(comptime name: []const u8, value: ?[]const u8) void {
+    if (!@import("builtin").is_test) @compileError("ovn.fake is for tests");
+    Cache(name).read = true;
+    Cache(name).value = value;
+}
+
 test "ovn: an unset knob is off and takes its default" {
     try std.testing.expect(!on("NO_SUCH_KNOB_FOR_TESTS"));
     try std.testing.expectEqual(@as(u64, 7), try int("NO_SUCH_KNOB_FOR_TESTS", 7));
