@@ -48,6 +48,7 @@ const glm_mla_ovn_check = @import("glm_mla_ovn_check.zig");
 const glm_seg_pass_check = @import("glm_seg_pass_check.zig");
 const glm_latent_mma_check = @import("glm_latent_mma_check.zig");
 const glm_index_ovn_check = @import("glm_index_ovn_check.zig");
+const glm_index_regroup_check = @import("glm_index_regroup_check.zig");
 const glm_shard_check = @import("glm_shard_check.zig");
 const glm_onepass_check = @import("glm_onepass_check.zig");
 const glm_pk8_check = @import("glm_pk8_check.zig");
@@ -277,6 +278,7 @@ const usage =
     \\  glm-seg-pass              TF_GLM_OVN_SEG_PASS's chunk partials and merged rows against today's, byte for byte (one GPU)
     \\  glm-latent-mma-check      TF_GLM_OVN_LATENT_MMA's tensor-core absorb/expand against float64, deterministic, rows apart (one GPU)
     \\  glm-index-ovn-check       TF_GLM_OVN_DECODE_INDEX, _INDEX_SCHED and _POOLS32 against today's kernels, byte for byte (one GPU)
+    \\  glm-index-regroup-check   TF_GLM_OVN_INDEX_REGROUP's scores and pools against today's, byte for byte (one GPU)
     \\  glm-shard-check           TF_GLM_OVN_DECODE_SHARD's ranks emulated, merged tokens against selectTokens, byte for byte (one GPU)
     \\  glm-onepass-check         TF_GLM_OVN_SPARSE_ONEPASS's kernel against float64, slab == pages == split, deterministic (one GPU)
     \\  glm-pk8-check             TF_GLM_OVN_PK8's kv8 pooled keys: writer against kv8.quantize_rows, scorers against bf16 on their values (one GPU)
@@ -444,6 +446,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-seg-pass")) return glm_seg_pass_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-latent-mma-check")) return glm_latent_mma_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-index-ovn-check")) return glm_index_ovn_check.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-index-regroup-check")) return glm_index_regroup_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-shard-check")) return glm_shard_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-onepass-check")) return glm_onepass_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-pk8-check")) return glm_pk8_check.run(gpu);
