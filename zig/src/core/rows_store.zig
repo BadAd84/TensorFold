@@ -119,6 +119,7 @@ pub const Rows = struct {
     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
     pump: ?*@import("rows_pump.zig").Pump = null, // TF_GLM_OVN_DISK_PUMP: the job whose payloads stage a few a round
     pump_blocks: u32 = 0, // TF_GLM_OVN_DISK_PUMP: pieces staged a round (0: a state staged in one step)
+    pump_auto: bool = false, // DISK_LOCAL's default pump: only a save wider than the staging permit goes by it
     mirror: ?*const @import("rows_local.zig").Mirror = null, // TF_GLM_OVN_DISK_LOCAL: the other ranks' own parts
     readers: u32 = 1, // TF_GLM_OVN_DISK_READERS: threads a restore reads its files on (1: one file after another)
     readers_stage: readers.Staging = .{}, // their slots, made by the first read that uses them

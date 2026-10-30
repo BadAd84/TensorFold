@@ -25,7 +25,10 @@ pub fn open(e: *Engine, r: *rows.Rows, floor: u64) !void {
     if (r.sync_writes) return error.DiskLocalSyncWrites; // TENSORFOLD_ROWS_SYNC writes on rank 0's thread alone
     mirror = .{ .ctx = e, .file = file, .unlink = unlink, .other = other, .begin = begin, .end = end, .lacks = lacks, .sweep = sweep, .verify = verify, .pin = dl.pinOf(e) };
     r.readers = try lanes.disk_readers.knob(lanes.disk_readers.local_default);
-    if (r.pump_blocks == 0) r.pump_blocks = pump_default;
+    if (r.pump_blocks == 0) { // TF_GLM_OVN_DISK_PUMP unset: the pump for saves wider than the permit alone
+        r.pump_blocks = pump_default;
+        r.pump_auto = true;
+    }
     {
         const rest = disk.Rest.of(e);
         defer rest.done();
@@ -46,11 +49,11 @@ fn idOf(saved: Saved) u64 {
     return k.id;
 }
 
-fn file(ctx: *anyopaque, saved: Saved, at: u32, f: rows.local.File) anyerror!void {
+fn file(ctx: *anyopaque, saved: Saved, at: u32, files: []const rows.local.File) anyerror!void {
     const e = engineOf(ctx);
-    const rest = disk.Rest.of(e);
+    const rest = disk.Rest.of(e); // the other ranks woken once a batch, put back to sleep after its last file
     defer rest.done();
-    try dl.file(e, idOf(saved), at, .{ .name = f.name, .kind = f.kind, .window = f.window, .k = f.k });
+    for (files) |f| try dl.file(e, idOf(saved), at, .{ .name = f.name, .kind = f.kind, .window = f.window, .k = f.k });
 }
 
 fn unlink(ctx: *anyopaque, k: rows.local.Key) void {

@@ -284,7 +284,10 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     try w.promised(r.gpa, &promised);
     var bytes = newBytes(r, &promised, prepared, metadata, &count);
     var charge: u64 = 0;
-    const stream = r.pump_blocks > 0 and may_wait; // TF_GLM_OVN_DISK_PUMP: RAM holds the own file, blocks go by the ring
+    const fixed = @sizeOf(io.Job) + count * @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
+    // TF_GLM_OVN_DISK_PUMP: RAM holds the own file, blocks go by the ring; DISK_LOCAL's default pump (`pump_auto`)
+    // takes only a save the permit could never hold whole, so every other save stages in one step as with the knob off
+    const stream = r.pump_blocks > 0 and may_wait and (!r.pump_auto or bytes + fixed > w.limit);
     while (true) {
         const held = if (stream) image.total(prepared.own) + metadata + @sizeOf(file.Trailer) else bytes;
         charge = held + @sizeOf(io.Job) + count * @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
@@ -335,8 +338,11 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
         r.pump = x;
     }
     if (p == null) if (r.mirror) |m| { // TF_GLM_OVN_DISK_LOCAL: every other rank stages its own part of each file
-        for (prepared.wants) |want| if (lacks(r, &promised, want)) try m.file(m.ctx, e.saved, e.at, .{ .name = want.name, .kind = .block, .window = want.window, .k = want.k });
-        try m.file(m.ctx, e.saved, e.at, .{ .name = prepared.name, .kind = .state });
+        var list: std.ArrayList(local.File) = .empty;
+        defer list.deinit(r.gpa);
+        for (prepared.wants) |want| if (lacks(r, &promised, want)) try list.append(r.gpa, .{ .name = want.name, .kind = .block, .window = want.window, .k = want.k });
+        try list.append(r.gpa, .{ .name = prepared.name, .kind = .state });
+        try m.file(m.ctx, e.saved, e.at, list.items);
     };
     w.submit(j);
     if (p != null) _ = pump.step(r);

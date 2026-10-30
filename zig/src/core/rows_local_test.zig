@@ -33,10 +33,10 @@ const Other = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    fn file(ctx: *anyopaque, _: pc.Saved, _: u32, f: local.File) anyerror!void {
+    fn file(ctx: *anyopaque, _: pc.Saved, _: u32, files: []const local.File) anyerror!void {
         const o = of(ctx);
-        try o.held.put(a, .{ .stem = chain.stem(f.name), .kind = f.kind }, {});
-        o.staged += 1;
+        for (files) |f| try o.held.put(a, .{ .stem = chain.stem(f.name), .kind = f.kind }, {});
+        o.staged += files.len;
     }
 
     fn unlink(ctx: *anyopaque, k: local.Key) void {
@@ -172,6 +172,7 @@ test "rows_local pump: a state wider than the staging permit is skipped staged w
         const x = try Fixture.open(if (blocks == 0) "local-permit-whole" else "local-permit-pump", .off, false, permit);
         defer x.close();
         x.r.pump_blocks = blocks;
+        x.r.pump_auto = true; // DISK_LOCAL's default: the pump still takes a save the permit cannot hold whole
         const tokens = fixture.prompt(9);
         try x.keep(&tokens, 1000);
         if (blocks == 0) {
@@ -187,4 +188,18 @@ test "rows_local pump: a state wider than the staging permit is skipped staged w
         try x.f.snapshots().vtable.restore(&x.f, null, saved);
         try std.testing.expect(x.f.restored_ok);
     }
+}
+
+test "rows_local pump: DISK_LOCAL's default pump leaves a save that fits the permit to one-step staging" {
+    // measured on Sparks: a 107 MiB own file pumped 4 pieces a prompt round took 29 s, staged whole 2.5 s
+    const x = try Fixture.open("local-auto-whole", .off, false, 1 << 20);
+    defer x.close();
+    x.r.pump_blocks = 4;
+    x.r.pump_auto = true;
+    const tokens = fixture.prompt(9);
+    try x.keep(&tokens, 1000);
+    try std.testing.expect(x.r.pump == null); // staged in the keep's own step: no pump left to run between rounds
+    try x.idle(1);
+    try x.settle();
+    try std.testing.expectEqual(@as(u64, 0), x.r.counts.skipped);
 }
