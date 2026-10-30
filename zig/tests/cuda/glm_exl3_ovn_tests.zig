@@ -1,4 +1,5 @@
 //! TF_GLM_OVN_X3_*: GLM's EXL3 decode through every variant and pairing gives the plain path's slot-row bytes.
+//! Every case is reported (a FAIL line locates and classifies each difference); the run fails at the end with a count.
 const std = @import("std");
 const cuda = @import("cuda");
 const glm = @import("glm_cuda");
@@ -6,11 +7,13 @@ const check = @import("check.zig");
 const qr = @import("quant_ref_tests.zig");
 const Gpu = check.Gpu;
 const Rig = qr.RigT;
-const Ovn = cuda.exl3_experts.Ovn;
+const ex = cuda.exl3_experts;
+const Ovn = ex.Ovn;
 
 const E = 12; // routed experts (the shared one is id E, skipped)
 const D = 512; // dims
-const slots = glm.exl3.top_k + 1;
+const top = glm.exl3.top_k;
+const slots = top + 1;
 const limit: f32 = 7.0;
 
 fn signs(r: *Rig, n: usize, scale: f16) ![]f16 {
@@ -40,10 +43,21 @@ fn weights(r: *Rig, n: usize, one: bool) !glm.exl3.Experts {
     const k2: [E]i32 = @splat(8);
     w.k2 = try r.dev(std.mem.sliceAsBytes(&k2));
     const rot = if (one) try signs(r, D, 1.0) else null;
-    w.gt = try matrix(r, D, n, rot, &w.gb, &w.suh_g, &w.svh_g);
-    w.ut = try matrix(r, D, n, rot, &w.ub, &w.suh_u, &w.svh_u);
-    w.dt = try matrix(r, n, D, null, &w.db, &w.suh_d, &w.svh_d);
+    var gb: u64 = 0;
+    var ub: u64 = 0;
+    var db: u64 = 0;
+    w.gt = try matrix(r, D, n, rot, &gb, &w.suh_g, &w.svh_g);
+    w.ut = try matrix(r, D, n, rot, &ub, &w.suh_u, &w.svh_u);
+    w.dt = try matrix(r, n, D, null, &db, &w.suh_d, &w.svh_d);
+    w.gb = gb;
+    w.ub = ub;
+    w.db = db;
     return w;
+}
+
+/// The common module's layer GLM's cuda_exl3.layer builds from `w` (the stage checks call the module directly).
+fn commonLayer(w: glm.exl3.Experts, n: usize) ex.Layer {
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = E, .dims = D, .width = n, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx, .gate_base = w.gb, .up_base = w.ub, .down_base = w.db };
 }
 
 /// Each row's 8 distinct routed picks, then the shared expert's id.
@@ -64,7 +78,7 @@ fn picks(r: *Rig, rows: usize) ![]i32 {
 
 /// The family's decode dispatch with `w.ovn`: ey [rows][slots][D] fp32 bytes, the shared slot left as the canary.
 fn decode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, w: glm.exl3.Experts, n: usize, x: []const u16, pk: []const i32, rows: usize) ![]u8 {
-    const P = rows * glm.exl3.top_k;
+    const P = rows * top;
     const plan: cuda.grouped.Plan = .{
         .members = try r.zeros(P * 4),
         .items = try r.zeros(cuda.grouped.maxItems(P, E, glm.experts.tile) * 12),
@@ -78,6 +92,62 @@ fn decode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, w
     const xd = try r.zeros(P * n * 2);
     try glm.exl3.run(k, ek, r.s, w, sc, plan, try r.dev(std.mem.sliceAsBytes(x)), D, try r.dev(std.mem.sliceAsBytes(pk)), slots, rows, E, D, n, limit, false, ey, xd);
     return r.back(ey, rows * slots * D * 4);
+}
+
+/// One common-module call on the compacted picks (runSlots' shape): its rotated gate inputs, down inputs and slot rows.
+const Stages = struct { xg: []u8, xd: []u8, y: []u8 };
+fn stages(r: *Rig, k: *const glm.exl3.Kernels, l: ex.Layer, x: []const u16, pk: []const i32, rows: usize, o: Ovn) !Stages {
+    const p8 = try r.a.alloc(i32, rows * top);
+    for (0..rows) |row| @memcpy(p8[row * top ..][0..top], pk[row * slots ..][0..top]);
+    const sc = try ex.scratch(try r.zeros(try ex.scratchBytes(l, rows, top)), l, rows, top);
+    try k.runWith(r.s, l, try r.dev(std.mem.sliceAsBytes(x)), D, .bf16, try r.dev(std.mem.sliceAsBytes(p8)), 0, rows, 0, sc, o, 0);
+    const P = rows * top;
+    return .{ .xg = try r.back(sc.xg, P * D * 2), .xd = try r.back(sc.xd, P * l.width * 2), .y = try r.back(sc.y, P * D * 4) };
+}
+
+const Tally = struct { cases: usize = 0, failed: usize = 0 };
+
+fn value(b: []const u8) f64 {
+    if (b.len == 4) return @as(f32, @bitCast(std.mem.readInt(u32, b[0..4], .little)));
+    return @as(f16, @bitCast(std.mem.readInt(u16, b[0..2], .little)));
+}
+
+fn bitsOf(b: []const u8) u32 {
+    return if (b.len == 4) std.mem.readInt(u32, b[0..4], .little) else std.mem.readInt(u16, b[0..2], .little);
+}
+
+/// Byte-equal, else one FAIL line: how many values differ, the first (row of `per_row` values, column), its got and
+/// want, the canary (never written) and NaN counts, and the largest difference against the largest |want|.
+fn same(t: *Tally, name: []const u8, got: []const u8, want: []const u8, elem: usize, per_row: usize) void {
+    t.cases += 1;
+    if (got.len == want.len and std.mem.eql(u8, got, want)) return;
+    t.failed += 1;
+    if (got.len != want.len) {
+        std.debug.print("FAIL {s}: {d} bytes, expected {d}\n", .{ name, got.len, want.len });
+        return;
+    }
+    var first: usize = 0;
+    var differ: usize = 0;
+    var canary: usize = 0;
+    var nan: usize = 0;
+    var most: f64 = 0;
+    var scale: f64 = 0;
+    for (0..got.len / elem) |i| {
+        const g = got[i * elem ..][0..elem];
+        const w = want[i * elem ..][0..elem];
+        if (std.mem.allEqual(u8, g, 0xff)) canary += 1;
+        const gv = value(g);
+        const wv = value(w);
+        if (std.math.isNan(gv)) nan += 1;
+        if (std.math.isFinite(wv)) scale = @max(scale, @abs(wv));
+        if (std.mem.eql(u8, g, w)) continue;
+        if (differ == 0) first = i;
+        differ += 1;
+        if (std.math.isFinite(gv) and std.math.isFinite(wv)) most = @max(most, @abs(gv - wv));
+    }
+    const g = got[first * elem ..][0..elem];
+    const w = want[first * elem ..][0..elem];
+    std.debug.print("FAIL {s}: {d} of {d} values differ, first at row {d} column {d}: got {e} (0x{x}), want {e} (0x{x}); {d} canary, {d} NaN; largest finite difference {e} of largest |want| {e}\n", .{ name, differ, got.len / elem, first / per_row, first % per_row, value(g), bitsOf(g), value(w), bitsOf(w), canary, nan, most, scale });
 }
 
 const variants = [_]Ovn{
@@ -112,23 +182,47 @@ pub fn run_(gpu: Gpu) !void {
     defer k.unload();
     var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
     defer ek.unload();
-    var runs: usize = 0;
+    var t: Tally = .{};
     for ([_]usize{ 256, 640 }) |n| for ([_]bool{ true, false }) |one| { // 640: a TP=3 rank's 5 blocks, 10 down steps
         var w = try weights(&r, n, one);
+        const l = commonLayer(w, n);
         for ([_]usize{ 1, 2, 3, 8, 17 }) |rows| { // decode windows; 17 rows take two member tiles
             const x = try r.bfs(rows * D, 1.0);
             const pk = try picks(&r, rows);
+            const case = try std.fmt.allocPrint(r.a, "width {d}, one rotation {any}, {d} rows", .{ n, one, rows });
             w.ovn = .{};
             const want = try decode(&r, &k, &ek, w, n, x, pk, rows);
-            try check.expect(!std.mem.allEqual(u8, want[0 .. (slots - 1) * D * 4], 0xff), "glm-exl3-ovn: the plain decode wrote row 0's routed slots", .{});
+            same(&t, try std.fmt.allocPrint(r.a, "glm-exl3-ovn {s}: plain twice (control)", .{case}), try decode(&r, &k, &ek, w, n, x, pk, rows), want, 4, D);
+            var nan: usize = 0;
+            for (0..rows) |row| for (0..top) |j| for (0..D) |c| {
+                nan += @intFromBool(std.math.isNan(value(want[((row * slots + j) * D + c) * 4 ..][0..4])));
+            };
+            t.cases += 1;
+            if (nan != 0) {
+                t.failed += 1;
+                std.debug.print("FAIL glm-exl3-ovn {s}: the plain decode left {d} routed values NaN\n", .{ case, nan });
+            }
+            const base = try stages(&r, &k, l, x, pk, rows, .{});
             for (variants) |o| {
                 w.ovn = o;
-                const got = try decode(&r, &k, &ek, w, n, x, pk, rows);
-                const name = try std.fmt.allocPrint(r.a, "glm-exl3-ovn width {d}, one rotation {any}, {d} rows, loads {t}, fuse {any}, xrow {any}", .{ n, one, rows, o.loads, o.fuse_down, o.xrow });
-                try check.sameBytes(name, got, want);
-                runs += 1;
+                const tag = try std.fmt.allocPrint(r.a, "glm-exl3-ovn {s}, loads {t}, fuse {any}, xrow {any}", .{ case, o.loads, o.fuse_down, o.xrow });
+                same(&t, try std.fmt.allocPrint(r.a, "{s}: ey", .{tag}), try decode(&r, &k, &ek, w, n, x, pk, rows), want, 4, D);
+                var so = o; // the stages run unfused: Z, xd and y exist only there
+                so.fuse_down = false;
+                if (!so.any()) continue;
+                const got = try stages(&r, &k, l, x, pk, rows, so);
+                if (so.xrow and one) { // one rotated row a token, each equal to the plain path's every pick of that row
+                    for (0..rows) |row| same(&t, try std.fmt.allocPrint(r.a, "{s}: stage xg row {d}", .{ tag, row }), got.xg[row * D * 2 ..][0 .. D * 2], base.xg[row * top * D * 2 ..][0 .. D * 2], 2, D);
+                } else same(&t, try std.fmt.allocPrint(r.a, "{s}: stage xg", .{tag}), got.xg, base.xg, 2, D);
+                same(&t, try std.fmt.allocPrint(r.a, "{s}: stage xd (gate/up out)", .{tag}), got.xd, base.xd, 2, n);
+                same(&t, try std.fmt.allocPrint(r.a, "{s}: stage y (down out)", .{tag}), got.y, base.y, 4, D);
             }
         }
     };
-    check.pass("glm-exl3-ovn: {d} variant runs equal the plain decode byte for byte", .{runs});
+    std.debug.print("RESULT glm-exl3-ovn: {d} of {d} comparisons differ\n", .{ t.failed, t.cases });
+    if (t.failed != 0) {
+        std.debug.print("FAIL glm-exl3-ovn: {d} of {d} comparisons differ\n", .{ t.failed, t.cases });
+        return error.TestFailed;
+    }
+    check.pass("glm-exl3-ovn: {d} comparisons equal the plain decode byte for byte", .{t.cases});
 }
