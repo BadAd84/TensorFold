@@ -3,4 +3,5 @@
 #include "glm_index_pools.cuh"
 #include "glm_index_split.cuh"
 #include "glm_index_sched.cuh"
+#include "glm_index_regroup.cuh"
 #include "glm_index_pk8.cuh"

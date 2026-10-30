@@ -103,6 +103,8 @@ pub const Kernels = struct {
     split_fn: ?cuda.Function = null,
     /// TF_GLM_OVN_INDEX_SCHED (read at load): prompt-sized launches score with tf_glm_index_scores_sched.
     sched_fn: ?cuda.Function = null,
+    /// TF_GLM_OVN_INDEX_REGROUP (read at load): prompt launches take tf_glm_index_scores_regroup, over INDEX_SCHED.
+    regroup_fn: ?cuda.Function = null,
     /// TF_GLM_OVN_PK8 (sparse.pk8, read at load): every launch scores kv8 pooled keys with tf_glm_index_scores_pk8.
     pk8_fn: ?cuda.Function = null,
 
@@ -122,6 +124,7 @@ pub const Kernels = struct {
             .split_rows = sr,
             .split_fn = if (sr > 0) try m.function("tf_glm_index_split") else null,
             .sched_fn = if (cuda.ovn.on("INDEX_SCHED")) try m.function("tf_glm_index_scores_sched") else null,
+            .regroup_fn = if (cuda.ovn.on("INDEX_REGROUP")) try m.function("tf_glm_index_scores_regroup") else null,
             .pk8_fn = if (sparse.pk8) try m.function("tf_glm_index_scores_pk8") else null,
         };
     }
@@ -145,13 +148,26 @@ pub const Kernels = struct {
         return k.split_fn != null and rows < k.split_rows and rows < rows_from and np >= split_from;
     }
 
+    /// The scorer for `rows` rows: kv8 keys pk8 always; prompt launches regroup, then sched, when loaded; else plain.
+    pub fn scorer(k: *const Kernels, rows: usize) Scorer {
+        if (k.pk8_fn != null) return .pk8;
+        if (rows < rows_from) return .plain;
+        if (k.regroup_fn != null) return .regroup;
+        if (k.sched_fn != null) return .sched;
+        return .plain;
+    }
+
     /// tf_glm_scores' launch for `rows` rows at `at` into out [rows][np]; the first `nb` 64-pool blocks are written.
     pub fn scores(k: *const Kernels, s: cuda.Stream, qi: u64, wts: u64, w_stride: usize, pk: u64, out: u64, at: u64, rows: usize, np: usize, nb: usize, scale: f32, wscale: f32, heads: usize, pt: u64, ps: u64) !void {
         const g = scoresGrid(rows, nb);
         var a: cuda.Args = .{};
         inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), pk, out, at, @as(i64, @intCast(rows)), @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, wscale, @as(i64, @intCast(heads)), @as(c_int, @intCast(tileLoop(rows))), pt, @as(i64, @intCast(ps)) }) |v| a.add(v);
-        const plain = if (k.sched_fn) |x| (if (rows >= rows_from) x else k.scores_fn) else k.scores_fn;
-        const f = k.pk8_fn orelse plain; // kv8 keys: one scorer for every size (INDEX_SCHED's schedule is bf16 only)
+        const f = switch (k.scorer(rows)) {
+            .pk8 => k.pk8_fn.?,
+            .regroup => k.regroup_fn.?,
+            .sched => k.sched_fn.?,
+            .plain => k.scores_fn,
+        };
         try cuda.launch.launch(f, .{ .grid = .{ .x = g[0], .y = g[1] }, .block = .{ .x = threads } }, s, &a);
     }
 
@@ -179,6 +195,26 @@ pub const Kernels = struct {
         }
     }
 };
+
+/// The prompt scorer a launch takes (Kernels.scorer).
+pub const Scorer = enum { plain, sched, regroup, pk8 };
+
+test "GLM index: INDEX_REGROUP's scorer takes prompt launches over INDEX_SCHED's, never decode windows or kv8 keys" {
+    var k: Kernels = undefined;
+    k.pk8_fn = null;
+    k.sched_fn = null;
+    k.regroup_fn = null;
+    try std.testing.expectEqual(Scorer.plain, k.scorer(rows_from));
+    k.sched_fn = @as(cuda.Function, undefined);
+    try std.testing.expectEqual(Scorer.sched, k.scorer(rows_from));
+    k.regroup_fn = @as(cuda.Function, undefined);
+    try std.testing.expectEqual(Scorer.regroup, k.scorer(rows_from));
+    try std.testing.expectEqual(Scorer.plain, k.scorer(rows_from - 1));
+    k.sched_fn = null;
+    try std.testing.expectEqual(Scorer.regroup, k.scorer(2048));
+    k.pk8_fn = @as(cuda.Function, undefined);
+    try std.testing.expectEqual(Scorer.pk8, k.scorer(2048));
+}
 
 /// TF_GLM_INDEX_DECODE_FROM, a context position, as the pools a decode window must reach (unset or 0: any depth).
 pub fn decodeFrom(text: ?[]const u8) !usize {
