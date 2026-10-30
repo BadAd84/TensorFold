@@ -10,6 +10,7 @@ const kda_block = @import("cuda_kda_block.zig");
 const dsa_block = @import("cuda_dsa_block.zig");
 const glue = @import("cuda_glue.zig");
 const projection = @import("cuda_proj.zig");
+const kda_chunk = @import("cuda_kda_chunk.zig");
 
 /// Checks a shared window's segments (a prompt buffer's: whole prompts) against its `rows` rows; each holds its own.
 pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
@@ -58,7 +59,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 const conv = st.conv + li * 3 * st.conv_c * 2;
                 if (b.prefill) { // a whole prompt: its rows in place, the layer committed now (as Forward.mixer)
                     v.p = b.kproj + g.row0 * w * 2;
-                    try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false);
+                    try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false, kda_chunk.prompt(&f.m.chunked, st.pos));
                     try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, 3 * n);
                     st.cur[li] = 1 - cur;
                     continue;
@@ -70,7 +71,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
+                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide, null);
             }
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },

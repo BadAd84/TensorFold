@@ -201,6 +201,7 @@ pub fn run(gpu: Gpu) !void {
     try @import("glm_ref_fp8.zig").run(&r, set);
     try @import("glm_ref_hc.zig").mixing(&r, set);
     try @import("glm_ref_kda.zig").chains(&r);
+    try @import("glm_ref_kda_chunk.zig").chains(&r); // TF_GLM_OVN_KDA_CHUNKED's kernel, on its own seed
     var ops = try cuda.Module.load(gpu.d, cuda.kernels.glm_ops);
     defer ops.unload();
     try @import("glm_ref_index.zig").selection(&r, set, ops);

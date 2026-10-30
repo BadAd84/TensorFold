@@ -2,7 +2,8 @@
 const std = @import("std");
 const api = @import("engine_api");
 
-/// Any row, the head one token on (Nemotron's); a family's snap_grid, snap_lookahead, warm_quiet and snap_fork if set.
+/// Any row, the head one token on (Nemotron's); a family's snap_grid (or snapGridNow's), snap_lookahead, warm_quiet and
+/// snap_fork if set.
 pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
     var rules: api.prompt_cache.Rules = .{ .lookahead = 1, .min_prompt = 0 };
     if (@hasDecl(F, "snap_lookahead")) rules.lookahead = F.snap_lookahead;
@@ -12,6 +13,10 @@ pub fn cacheRules(comptime F: type) api.prompt_cache.Rules {
         rules.planned = true;
         rules.grid = F.snap_grid;
     }
+    if (@hasDecl(F, "snapGridNow")) if (F.snapGridNow()) |g| { // a grid only some settings need, read at load
+        rules.planned = true;
+        rules.grid = g;
+    };
     return rules;
 }
 
@@ -86,6 +91,23 @@ test "a family with snap_grid keeps on its chunk starts, any other at any row as
     defer store.deinit();
     const marks = try store.marks(arena.allocator(), prompt, 0, 3540, &.{}, &.{}, &.{});
     try std.testing.expectEqualSlices(u32, &[_]u32{2048}, marks);
+}
+
+test "a family's snapGridNow plans its states on that grid only when it names one" {
+    const On = struct {
+        pub fn snapGridNow() ?u32 {
+            return 32;
+        }
+    };
+    const Off = struct {
+        pub fn snapGridNow() ?u32 {
+            return null;
+        }
+    };
+    const on = cacheRules(On);
+    try std.testing.expect(on.planned and on.grid == 32);
+    const off = cacheRules(Off);
+    try std.testing.expect(!off.planned and off.grid == 0);
 }
 
 test {

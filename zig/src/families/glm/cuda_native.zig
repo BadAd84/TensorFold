@@ -31,6 +31,10 @@ pub const prompt_rows: u32 = fw.prefill_rows;
 /// states keep and resume at any row. The smallest state cache admission plans for (cuda_kv_pool.capacity's floor and
 /// minimum), apart from the chunk size: tied to the chunk, 2,049- to 4,096-row windows would lose their cache facts.
 pub const snap_min_rows: u32 = 2048;
+/// TF_GLM_OVN_KDA_CHUNKED: prompt rows depend on 32-row sub-chunk alignment, so states keep and resume on that grid.
+pub fn snapGridNow() ?u32 {
+    return @import("cuda_kda_chunk.zig").snapGrid();
+}
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 

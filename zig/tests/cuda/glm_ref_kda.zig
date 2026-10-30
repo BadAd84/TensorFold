@@ -10,14 +10,14 @@ const bf = qr.helpers.bfOf;
 const bf16 = qr.helpers.bf16Of;
 
 const kda = glm.kda;
-const heads = 32;
-const n = heads * kda.dk;
+pub const heads = 32;
+pub const n = heads * kda.dk;
 const dk = kda.dk;
-const p_stride = 3 * n + 64;
-const lower = -5.0;
-const eps = 1e-6;
+pub const p_stride = 3 * n + 64;
+pub const lower = -5.0;
+pub const eps = 1e-6;
 
-fn floats(r: *Rig, count: usize, lo: f32, hi: f32) ![]f32 {
+pub fn floats(r: *Rig, count: usize, lo: f32, hi: f32) ![]f32 {
     const out = try r.a.alloc(f32, count);
     for (out) |*v| v.* = lo + r.rng.float(f32) * (hi - lo);
     return out;
@@ -32,10 +32,10 @@ fn sigmoid(x: f64) f64 {
     return 1 / (1 + @exp(-x));
 }
 
-const Inputs = struct { p: []u16, a: []u16, g: []u16, cs: []u16, cw: []f32, state: []f32, a_log: []f32, dt_bias: []f32, norm: []u16 };
+pub const Inputs = struct { p: []u16, a: []u16, g: []u16, cs: []u16, cw: []f32, state: []f32, a_log: []f32, dt_bias: []f32, norm: []u16 };
 
 /// float64 chain a head: conv+silu, L2 q/k, decay, bf16 beta, delta rule, y = bf16(S q), RMS norm, gate. Out [rows][n].
-fn reference(r: *Rig, in: Inputs, rows: usize) ![]f64 {
+pub fn reference(r: *Rig, in: Inputs, rows: usize) ![]f64 {
     const out = try r.a.alloc(f64, rows * n);
     const s = try r.a.alloc(f64, dk * dk);
     var q: [dk]f64 = undefined;
