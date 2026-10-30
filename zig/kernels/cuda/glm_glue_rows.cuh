@@ -226,3 +226,21 @@ struct tf_glm_words {
 extern "C" __global__ void tf_glm_put_words(unsigned* dst, unsigned n, tf_glm_words v) {
   for (unsigned i = threadIdx.x; i < n; i += blockDim.x) dst[i] = v.w[i];
 }
+
+// TF_GLM_OVN_SNAP_GATHER: a kept state's pieces (cuda_snapshot_gather's Piece), one block a piece, bytes as they are.
+struct tf_glm_snap_piece {
+  unsigned long long src, dst, len;
+};
+extern "C" __global__ void tf_glm_snap_copy(const tf_glm_snap_piece* pieces, unsigned n) {
+  if (blockIdx.x >= n) return;
+  const tf_glm_snap_piece p = pieces[blockIdx.x];
+  if (((p.src | p.dst | p.len) & 15ull) == 0) {
+    const uint4* s = reinterpret_cast<const uint4*>(p.src);
+    uint4* d = reinterpret_cast<uint4*>(p.dst);
+    for (unsigned long long i = threadIdx.x; i < p.len / 16; i += blockDim.x) d[i] = s[i];
+    return;
+  }
+  const unsigned char* s = reinterpret_cast<const unsigned char*>(p.src);
+  unsigned char* d = reinterpret_cast<unsigned char*>(p.dst);
+  for (unsigned long long i = threadIdx.x; i < p.len; i += blockDim.x) d[i] = s[i];
+}

@@ -3,6 +3,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const kv = @import("core").kv_pool;
 const Plan = @import("cuda_snapshot_layout.zig").Plan;
+const Gather = @import("cuda_snapshot_gather.zig").Gather;
 
 pub const page: usize = 2 << 20;
 pub const Lease = kv.Lease;
@@ -14,6 +15,7 @@ pub fn rounded(bytes: usize) !usize {
 pub const Pool = struct {
     pages: kv.Pool,
     arena: ?cuda.DeviceBuffer,
+    gather: ?Gather = null, // TF_GLM_OVN_SNAP_GATHER: moves by tf_glm_snap_copy batches (cuda_snapshots.prepare)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, budget: u64) !Pool {
         const count = std.math.cast(usize, budget / page) orelse return error.SnapshotBudget;
@@ -27,6 +29,7 @@ pub const Pool = struct {
     pub fn deinit(p: *Pool) void {
         std.debug.assert(p.pages.available() == p.pages.total());
         if (p.arena) |*a| a.free();
+        if (p.gather) |*g| g.deinit();
         p.pages.deinit();
     }
 
@@ -51,6 +54,7 @@ pub const Pool = struct {
     pub fn move(p: *const Pool, stream: cuda.Stream, lease: *const Lease, plan: *const Plan, into: bool) !void {
         if (plan.len > lease.ids.items.len * page) return error.SnapshotSize;
         const arena = p.arena orelse return error.NoSnapshotRoom;
+        if (p.gather) |*g| return g.move(arena.ptr, page, stream, lease, plan, into);
         var off: usize = 0;
         for (plan.parts[0..plan.count]) |part| {
             var done: usize = 0;

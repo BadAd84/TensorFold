@@ -161,6 +161,7 @@ pub const Engine = struct {
         const share = try shard.Share.of(&c, rank, world);
         const kb = @import("cuda_kda_block.zig");
         kb.pad_to = if (o.settings.kda_pad) kb.padWidth(c.kda_heads, world) else 0; // read once: rowWidth reads only this
+        @import("cuda_state.zig").drop_mtp = o.mtp and o.drafter and cuda.ovn.on("DROP_MTP"); // read once, as pad_to
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
@@ -189,7 +190,7 @@ pub const Engine = struct {
             }
         };
         const tiler: Tile = .{ .gpa = gpa, .mk = &e.m.mm, .s = stream, .d = d, .enabled = o.settings.tiled, .dense = o.settings.dense_bits, .head = o.settings.head_bits, .packs = &e.packs };
-        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp), tiler, Tile.apply);
+        e.w = try @import("cuda_load_owner.zig").finish(try weights.load(gpa, io, d, stream, e.m.tools(), checkpoint, c, share, layers, o.mtp, @import("cuda_state.zig").drop_mtp), tiler, Tile.apply);
         errdefer e.w.deinit();
         errdefer {
             gpa.free(e.packs.ptrs);

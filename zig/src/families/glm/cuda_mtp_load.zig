@@ -9,6 +9,18 @@ const q4 = @import("cuda_q4.zig");
 
 const prefix = "model.language_model.";
 
+/// weights.load's MTP part: the whole head, or (TF_GLM_OVN_DROP_MTP beside a drafter) its draft head alone.
+pub fn into(w: *weights.Weights, L: anytype, head_ck: *core.Checkpoint, draft_only: bool) !void {
+    if (draft_only) {
+        w.draft = try draft(L, head_ck);
+    } else w.mtp = try load(L, head_ck);
+}
+
+/// The draft head DFlash2 reads: the MTP head's, or the one loaded alone.
+pub fn draftHead(w: *const weights.Weights) ?q4.Q4 {
+    return if (w.mtp) |m| m.draft else w.draft;
+}
+
 /// weights.load's MTPW: layer `layers` as plain DSA + MoE, norms, eh_proj, draft head from the rank's head rows.
 pub fn load(L: anytype, head_ck: *core.Checkpoint) !weights.Mtp {
     const c = &L.w.config;

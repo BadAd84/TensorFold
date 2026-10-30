@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const types = @import("cuda_engine_types.zig");
 pub const pages = @import("cuda_snapshot_pages.zig");
 pub const layout = @import("cuda_snapshot_layout.zig");
+pub const gather = @import("cuda_snapshot_gather.zig");
 
 pub const Setup = struct { ptr: *anyopaque, run: *const fn (*anyopaque, u64) anyerror!void };
 
@@ -13,6 +14,8 @@ pub fn prepare(e: anytype, budget: u64) !void {
     try e.snaps.ensureTotalCapacity(e.gpa, count);
     try e.dropped.ensureTotalCapacity(e.gpa, @as(usize, count) + 1);
     e.snap_pages = try pages.Pool.init(e.gpa, e.d, budget);
+    if (cuda.ovn.on("SNAP_GATHER") and e.snap_pages.?.arena != null)
+        e.snap_pages.?.gather = try gather.Gather.init(e.gpa, e.d, e.m.glue.snap_copy);
 }
 
 /// A failed allocation still joins the startup agreement, so a peer never waits for a missing participant.
