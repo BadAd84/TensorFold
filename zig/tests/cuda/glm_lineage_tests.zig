@@ -166,6 +166,7 @@ pub fn lineageCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int,
         check.pass("rank {d} followed rank 0's turns, forks and reloads in both arms", .{rank});
         return;
     }
+    e.link = &link; // rank 0's disk steps (cuda_disk_ranks) cross on the link, as cuda_native.zig sets it for the serve
     const x: glm.follow.Leader = .{ .e = e, .link = &link };
     defer x.end() catch {};
     const P = glm.pages;
