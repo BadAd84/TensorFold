@@ -6,6 +6,8 @@ const cuda = @import("cuda");
 /// qmm_group.cu's tile-2 instantiation (LaneTile<64, 16, 64, 1, 4, 8>, bf16 out), as zig/kernels/cuda exports it.
 const group_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 const group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
+/// The same tile with fp32 out (TF_GLM_OVN_DRAFT_DOWN4's split down), looked up only when a drafter needs it.
+const f32_symbol = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb1ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
 
 /// qmm_group.cu's Part and Parts, passed by value: four projections at most, one used here.
 const Part = extern struct { w: u64, scales: u64, biases: u64, out: u64, n: c_int, npad: c_int, sk: c_int, tiles: c_int, first: c_int };
@@ -23,6 +25,7 @@ pub const Kernels = struct {
     pack_dense: cuda.Function,
     transpose: cuda.Function,
     gb10: bool, // qmm_group_cuda's programmatic dependent launch: on for GB10 (sm_121)
+    module: ?cuda.Module = null, // qmm_group, owned by the caller (loadF32 looks the fp32 tile up in it)
 
     /// From the qmm_group and affine4_pack modules.
     pub fn load(group: cuda.Module, ops: cuda.Module, ctx: *const cuda.Context) !Kernels {
@@ -31,9 +34,18 @@ pub const Kernels = struct {
             .pack_dense = try ops.function("tf_pack_dense"),
             .transpose = try ops.function("tf_transpose_pad16"),
             .gb10 = try ctx.attribute(.compute_capability_major) == 12 and try ctx.attribute(.compute_capability_minor) == 1,
+            .module = group,
         };
         try k.group.allowDynamicShared(group_smem);
         return k;
+    }
+
+    /// The fp32-out tile (matmulF32's function).
+    pub fn loadF32(ks: *const Kernels) !cuda.Function {
+        const m = ks.module orelse return error.NoQmmGroupModule;
+        const f = try m.function(f32_symbol);
+        try f.allowDynamicShared(group_smem);
+        return f;
     }
 };
 
@@ -76,9 +88,28 @@ pub fn pack(ks: *const Kernels, stream: cuda.Stream, words: u64, scales: u64, bi
     }
 }
 
+/// TF_GLM_OVN_DRAFT_ONEPASS: the rows one launch takes, 8 row tiles (each tile does a 16-row launch's arithmetic).
+pub const many_rows: usize = 128;
+
 /// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
 pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     if (rows == 0 or rows > 16) return error.WindowTooWide;
+    try group(ks, ks.group, stream, x, ldx, xs, q, out, rows);
+}
+
+/// matmul over up to many_rows rows in one launch: row tile t is matmul's launch for rows 16t.., the weights read once.
+pub fn matmulMany(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
+    if (rows == 0 or rows > many_rows) return error.WindowTooWide;
+    try group(ks, ks.group, stream, x, ldx, xs, q, out, rows);
+}
+
+/// matmulMany with fp32 out (`f` from loadF32): the same K order a row, no bf16 rounding of the result.
+pub fn matmulF32(ks: *const Kernels, f: cuda.Function, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
+    if (rows == 0 or rows > many_rows) return error.WindowTooWide;
+    try group(ks, f, stream, x, ldx, xs, q, out, rows);
+}
+
+fn group(ks: *const Kernels, f: cuda.Function, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     const sk = splitK(q.n, q.k);
     const tiles = (q.n + 63) / 64;
     var parts: Parts = std.mem.zeroes(Parts);
@@ -98,7 +129,7 @@ pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u
         .cluster = if (sk > 1) .{ .x = @intCast(sk) } else null,
         .pdl = ks.gb10,
     };
-    try cuda.launch.launch(ks.group, cfg, stream, &a);
+    try cuda.launch.launch(f, cfg, stream, &a);
 }
 
 test "the draft head's shape takes one K slice; npad rounds to 128s" {

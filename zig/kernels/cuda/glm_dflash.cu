@@ -269,6 +269,17 @@ extern "C" __global__ void df_sum2(const float* __restrict__ g, __nv_bfloat16* _
     }
 }
 
+// TF_GLM_OVN_DRAFT_MLPSPLIT: out = bf16(((g0 + g1) + g2) ..) of [world][R][D] partials (dflash2.py's _rank_sum).
+extern "C" __global__ void df_sumw(const float* __restrict__ g, __nv_bfloat16* __restrict__ out, int R, int world) {
+    const long long r = blockIdx.x;
+    for (int c = blockIdx.y * 1024 + threadIdx.x; c < (blockIdx.y + 1) * 1024; c += blockDim.x) {
+        const long long i = r * D + c;
+        float s = g[i];
+        for (int w = 1; w < world; ++w) s = __fadd_rn(s, g[(long long)w * R * D + i]);
+        out[i] = tobf(s);
+    }
+}
+
 // A rank's 16 largest logits a head row as global ids and fp32 values: per-chunk part, then merge; ties keep low id.
 namespace {
 constexpr int CHUNK_COLS = 4096;

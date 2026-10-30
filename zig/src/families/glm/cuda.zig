@@ -86,6 +86,7 @@ test {
     _ = @import("cuda_qpack.zig");
     _ = @import("cuda_tile.zig");
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
+    _ = @import("dflash_ovn.zig");
 }
 
 pub const dflash = @import("dflash.zig");

@@ -376,7 +376,7 @@ pub const Engine = struct {
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len) return error.BadResume;
         try e.restoreState(r.id);
-        if (e.drafter) |dr| try dr.restart(e.slot, r.at); // the rows before it were never tapped
+        if (e.drafter) |dr| try snapshots.resumeDrafter(e, dr, r); // KEEPWIN's kept window, else a fresh start at r.at
         return r.at;
     }
 
@@ -567,7 +567,7 @@ pub const Engine = struct {
     /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.
     pub fn draftBlock(e: *Engine, reqs: []dflash.Req) !void {
         const dr = e.drafter orelse return error.NoDrafter;
-        for (reqs) |*q| q.pos = @intCast((e.seqs.items[q.slot] orelse return error.UnknownSlot).st.pos);
+        for (reqs) |*q| q.* = dflash.located(q.*, e.seqs.items[q.slot] orelse return error.UnknownSlot);
         try dr.draft(e, reqs);
     }
 
