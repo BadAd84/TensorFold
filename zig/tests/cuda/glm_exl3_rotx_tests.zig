@@ -131,21 +131,55 @@ fn run(r: *Rig, k: *const x3.Kernels, ek: *const glm.experts.Kernels, w: x3.Expe
     return r.back(ey, rows * slots * D * eb);
 }
 
+/// Comparisons made and failed; a failure prints one FAIL line and the run goes on (the count fails it at the end).
+const Tally = struct {
+    cases: usize = 0,
+    failed: usize = 0,
+    fn note(t: *Tally, ok: bool, comptime fmt: []const u8, args: anytype) void {
+        t.cases += 1;
+        if (ok) return;
+        t.failed += 1;
+        std.debug.print("FAIL " ++ fmt ++ "\n", args);
+    }
+};
+
 /// Rotated rank rk's slot row of expert e is plain rank (rk - e mod 3) mod 3's, byte for byte (that rank's share).
-fn shares(name: []const u8, got: [world][]u8, want: [world][]u8, pk: []const i32, rows: usize, eb: usize) !void {
+/// One line a rank: how many slot rows differ, the first, and its first value got against want.
+fn shares(t: *Tally, name: []const u8, got: [world][]u8, want: [world][]u8, pk: []const i32, rows: usize, eb: usize) void {
     const n = D * eb;
-    for (0..world) |rk| for (0..rows) |row| for (0..slots) |j| {
-        const e: usize = @intCast(pk[row * slots + j]);
-        const src = if (j == slots - 1) rk else (rk + world - e % world) % world; // the shared slot: the canary
-        const at = (row * slots + j) * n;
-        try check.expect(std.mem.eql(u8, got[rk][at..][0..n], want[src][at..][0..n]), "{s}: rank {d} row {d} slot {d} is plain rank {d}'s share", .{ name, rk, row, j, src });
-    };
+    for (0..world) |rk| {
+        var bad: usize = 0;
+        var first: [4]usize = undefined; // row, slot, source rank, column
+        for (0..rows) |row| for (0..slots) |j| {
+            const e: usize = @intCast(pk[row * slots + j]);
+            const src = if (j == slots - 1) rk else (rk + world - e % world) % world; // the shared slot: the canary
+            const at = (row * slots + j) * n;
+            const g = got[rk][at..][0..n];
+            const w = want[src][at..][0..n];
+            if (std.mem.eql(u8, g, w)) continue;
+            if (bad == 0) first = .{ row, j, src, (std.mem.indexOfDiff(u8, g, w).?) / eb };
+            bad += 1;
+        };
+        if (bad == 0) {
+            t.note(true, "", .{});
+            continue;
+        }
+        const at = ((first[0] * slots + first[1]) * D + first[3]) * eb;
+        const gb = got[rk][at..][0..eb];
+        const wb = want[first[2]][at..][0..eb];
+        const gv: f64 = if (eb == 4) @as(f32, @bitCast(std.mem.readInt(u32, gb[0..4], .little))) else @as(f64, @floatFromInt(std.mem.readInt(u16, gb[0..2], .little)));
+        const wv: f64 = if (eb == 4) @as(f32, @bitCast(std.mem.readInt(u32, wb[0..4], .little))) else @as(f64, @floatFromInt(std.mem.readInt(u16, wb[0..2], .little)));
+        t.note(false, "{s}: rank {d}: {d} of {d} slot rows differ from the plain ranks' shares; first row {d} slot {d} (plain rank {d}) column {d}: got {e}, want {e} ({s})", .{ name, rk, bad, rows * slots, first[0], first[1], first[2], first[3], gv, wv, if (eb == 4) "fp32" else "bf16 bits" });
+    }
 }
 
 /// The slot rows summed over the ranks in rank order: rotated within 2^-22 of the plain partials' summed magnitudes
 /// (two fp32 roundings a sum), and the same bits where the expert's owner is rank 0 (the plain share order).
-fn sums(name: []const u8, got: [world][]u8, want: [world][]u8, pk: []const i32, rows: usize) !f64 {
+/// A NaN in either sum is a failure of its own (@max would drop it from the bound).
+fn sums(t: *Tally, name: []const u8, got: [world][]u8, want: [world][]u8, pk: []const i32, rows: usize) f64 {
     var most: f64 = 0;
+    var nan: usize = 0;
+    var owned: usize = 0;
     for (0..rows) |row| for (0..slots - 1) |j| for (0..D) |c| {
         const at = ((row * slots + j) * D + c) * 4;
         var p: f32 = 0;
@@ -157,13 +191,19 @@ fn sums(name: []const u8, got: [world][]u8, want: [world][]u8, pk: []const i32, 
             q += @as(f32, @bitCast(std.mem.readInt(u32, got[rk][at..][0..4], .little)));
             mag += @abs(a);
         }
+        if (std.math.isNan(p) or std.math.isNan(q)) {
+            nan += 1;
+            continue;
+        }
         const e: usize = @intCast(pk[row * slots + j]);
-        if (e % world == 0) try check.expect(@as(u32, @bitCast(p)) == @as(u32, @bitCast(q)), "{s}: row {d} slot {d} owned by rank 0 keeps its sum's bits", .{ name, row, j });
+        if (e % world == 0 and @as(u32, @bitCast(p)) != @as(u32, @bitCast(q))) owned += 1;
         if (p == q) continue;
         most = @max(most, @abs(@as(f64, p) - q) / (mag * 0x1.00001p-22));
     };
     std.debug.print("RESULT {s}: rank sums within {d:.3} of 2^-22 of their magnitudes\n", .{ name, most });
-    try check.expect(most <= 1, "{s}: rank sums within fp32 reassociation", .{name});
+    t.note(nan == 0, "{s}: {d} rank sums are NaN", .{ name, nan });
+    t.note(owned == 0, "{s}: {d} sums of experts owned by rank 0 lost their bits", .{ name, owned });
+    t.note(most <= 1, "{s}: rank sums within fp32 reassociation (largest {d:.3})", .{ name, most });
     return most;
 }
 
@@ -201,6 +241,7 @@ pub fn run_(gpu: Gpu) !void {
     defer ek.unload();
     var runs: usize = 0;
     var most: f64 = 0;
+    var t: Tally = .{};
     for ([_]usize{ 512, 896 }) |inter| for ([_]bool{ true, false }) |one| { // 4 and 7 blocks: 256/128/128, 384/256/256
         const f = try full(&r, inter, one);
         var plain: [world]x3.Experts = undefined;
@@ -228,15 +269,15 @@ pub fn run_(gpu: Gpu) !void {
                     got[rk] = try run(&r, &k, &ek, w, wr, x, pk, rows, false, 4);
                 }
                 const name = try std.fmt.allocPrint(r.a, "glm-exl3-rotx decode {d} columns, one rotation {any}, {d} rows, loads {t}, fuse {any}, xrow {any}", .{ inter, one, rows, o.loads, o.fuse_down, o.xrow });
-                try shares(name, got, want, pk, rows, 4);
-                most = @max(most, try sums(name, got, want, pk, rows));
+                shares(&t, name, got, want, pk, rows, 4);
+                most = @max(most, sums(&t, name, got, want, pk, rows));
                 runs += 1;
             }
             if (rows > 1) for (0..world) |rk| { // concurrent == solo: each row's bits as the row alone
                 const all = try run(&r, &k, &ek, rotd[rk], wr, x, pk, rows, false, 4);
                 for (0..rows) |row| {
                     const alone = try run(&r, &k, &ek, rotd[rk], wr, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false, 4);
-                    try check.expect(std.mem.eql(u8, alone, all[row * slots * D * 4 ..][0 .. slots * D * 4]), "glm-exl3-rotx decode: rank {d} row {d} of {d} equals the row alone", .{ rk, row, rows });
+                    t.note(std.mem.eql(u8, alone, all[row * slots * D * 4 ..][0 .. slots * D * 4]), "glm-exl3-rotx decode: rank {d} row {d} of {d} equals the row alone", .{ rk, row, rows });
                 }
             };
         }
@@ -259,11 +300,16 @@ pub fn run_(gpu: Gpu) !void {
                     got[rk] = try run(&r, &kr, &ek, rotd[rk], wr, x, pk, rows, true, eb);
                 }
                 const name = try std.fmt.allocPrint(r.a, "glm-exl3-rotx prompt {d} columns, one rotation {any}, {d} rows, switches case {d}", .{ inter, one, rows, c });
-                try shares(name, got, want, pk, rows, eb);
-                if (eb == 4) most = @max(most, try sums(name, got, want, pk, rows));
+                shares(&t, name, got, want, pk, rows, eb);
+                if (eb == 4) most = @max(most, sums(&t, name, got, want, pk, rows));
                 runs += 1;
             }
         }
     };
+    std.debug.print("RESULT glm-exl3-rotx: {d} of {d} comparisons failed\n", .{ t.failed, t.cases });
+    if (t.failed != 0) {
+        std.debug.print("FAIL glm-exl3-rotx: {d} of {d} comparisons failed\n", .{ t.failed, t.cases });
+        return error.TestFailed;
+    }
     check.pass("glm-exl3-rotx: {d} rotated runs give the plain shares' bytes, rank sums within {d:.3} of 2^-22, rows as alone", .{ runs, most });
 }
