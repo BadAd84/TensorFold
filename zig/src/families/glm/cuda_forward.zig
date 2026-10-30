@@ -49,6 +49,7 @@ pub const Modules = struct {
     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
     pools32: bool = false, // TF_GLM_OVN_POOLS32: a split prompt indexer gathers its picks as int32
+    shard_from: usize = 0, // TF_GLM_OVN_DECODE_SHARD: decode windows from this position shard their indexer pools
     onepass: ?onepass_mod.Kernels, // TF_GLM_OVN_SPARSE_ONEPASS: prompt rows' sparse attention in one pass (glm_onepass)
     chunked: ?kda_chunk.Kernel, // TF_GLM_OVN_KDA_CHUNKED: prompt chunks' KDA chain in chunked (WY) form
     tiled: bool = false, // eligible bf16 linears are tiled; KDA inputs with uneven strides retain their row-major path
@@ -112,6 +113,7 @@ pub const Modules = struct {
         };
         m.tiled = false;
         m.pools32 = cuda.ovn.on("POOLS32");
+        m.shard_from = try dsa_block.index_shard.from(); // a typo is refused
         m.packs = null; // `m` starts undefined: the field default does not apply
         m.l2pace = null;
         m.side = try moe_side.Side.init(d); // last: nothing after it fails
@@ -336,7 +338,7 @@ pub const Forward = struct {
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
-                const ks: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
+                const ks: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r), .shard = dsa_block.index_shard.of(f.m.shard_from, b.prefill, f.exchange, r.w.share.rank, r.w.share.world) };
                 if (fronted) try dsa_block.rest(ks, f.stream, a, st.caches[di], b.dsa, rows, st.pos_dev, st.pos, nch, b.part_rows) else try dsa_block.body(ks, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
@@ -552,7 +554,7 @@ pub const Forward = struct {
             try b16.matmul(f.set(), f.stream, b.mcat, 2 * D, m.eh, b.mx, b.kda.mm_part, n, D, 2 * D, false);
             try glue.rmsnormBy(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
-            try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
+            try dsa_block.block(.{ .set = f.set(), .ops = f.m.ops(), .shard = dsa_block.index_shard.of(f.m.shard_from, b.prefill, f.exchange, r.w.share.rank, r.w.share.world) }, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
         }
         try f.gather(n);
         for (f.ranks) |r| {

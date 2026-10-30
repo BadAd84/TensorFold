@@ -27,9 +27,9 @@ const prompt = [_]Case{
 };
 
 /// A case's device inputs: index queries, head weights, pooled keys (on shuffled pages if c.paged) and the position.
-const Inputs = struct { q: u64, w: u64, k: u64, t: glm.latent.Table, pos: u64 };
+pub const Inputs = struct { q: u64, w: u64, k: u64, t: glm.latent.Table, pos: u64 };
 
-fn inputs(gpu: check.Gpu, bufs: *Bufs, rand: std.Random, c: Case, np: usize) !Inputs {
+pub fn inputs(gpu: check.Gpu, bufs: *Bufs, rand: std.Random, c: Case, np: usize) !Inputs {
     const gpa = gpu.gpa;
     const qi = try gpa.alloc(u16, c.rows * c.heads * d);
     defer gpa.free(qi);
