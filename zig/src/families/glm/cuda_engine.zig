@@ -83,6 +83,10 @@ pub const Engine = struct {
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
     profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
+    shared_prof: ?*@import("cuda_engine_prof.zig").Shared = null, // TF_GLM_OVN_SHARED_PROF: shared rounds' sections
+    draw1: ?@import("cuda_draw1.zig").Draw1 = null, // TF_GLM_OVN_DRAW1: a round's draws in one exchange a kind
+    seg_kda: ?@import("cuda_kda_seg.zig").SegKda = null, // TF_GLM_OVN_SEG_KDA: e.bs's segment table (cuda_engine_ovn)
+    seg_commit: ?@import("cuda_commit_seg.zig").SegCommit = null, // TF_GLM_OVN_SEG_COMMIT: a round's commits at once
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024 and prompt_rows rows
     checkpoint_digest: [32]u8,
     l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream
@@ -237,6 +241,8 @@ pub const Engine = struct {
             p.* = try prof_mod.Prof.init(d, io);
             p.*.?.every = 4;
         };
+        try @import("cuda_engine_ovn.zig").open(e, gpa, io);
+        errdefer @import("cuda_engine_ovn.zig").close(e);
         e.prompt_out = try prompt_lp.Output.init(d);
         errdefer e.prompt_out.free();
         e.shared_buf = try cuda.DeviceBuffer.alloc(d, 8);
@@ -261,6 +267,7 @@ pub const Engine = struct {
         e.freeProfs();
         if (e.prompt_bufs) |*b| b.free();
         e.prompt_out.free();
+        @import("cuda_engine_ovn.zig").close(e);
         e.smp.deinit();
         e.pairs.free();
         if (e.bs) |*b| b.deinit();
@@ -489,37 +496,7 @@ pub const Engine = struct {
         return x;
     }
 
-    /// heat.Gate.waitUntil's hooks over the ranks: gathered max reading, rank 0's stop: all pause together.
-    const Wait = struct {
-        e: *Engine,
-        cancel: ?Cancel,
-        failed: ?anyerror = null,
-
-        fn read(ptr: *anyopaque) anyerror!f64 {
-            const w: *Wait = @ptrCast(@alignCast(ptr));
-            const local: f64 = blk: {
-                var dir = std.Io.Dir.cwd().openDir(w.e.io, w.e.heat_gate.root, .{ .iterate = true }) catch break :blk -std.math.inf(f64);
-                defer dir.close(w.e.io);
-                break :blk heat.hottest(w.e.io, dir) catch -std.math.inf(f64);
-            };
-            return w.e.shared(local);
-        }
-
-        fn sleep(ptr: *anyopaque) void {
-            const w: *Wait = @ptrCast(@alignCast(ptr));
-            std.Io.sleep(w.e.io, .fromMilliseconds(2000), .awake) catch {};
-        }
-
-        fn stop(ptr: *anyopaque) bool {
-            const w: *Wait = @ptrCast(@alignCast(ptr));
-            const mine: f64 = if (w.cancel) |c| @floatFromInt(@intFromBool(c.check(c.ptr))) else 0;
-            const any = w.e.shared(mine) catch |err| {
-                w.failed = err;
-                return true;
-            };
-            return any > 0;
-        }
-    };
+    const Wait = @import("cuda_engine_wait.zig").Wait;
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
@@ -532,37 +509,15 @@ pub const Engine = struct {
         try f.run(@ptrCast(ids));
         if (e.drafter) |dr| try dr.noteVerify(e.slot, 0, ids.len, at, true);
         e.cur.rows_at = e.bd.fnormed;
-        try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
+        const d1 = @import("cuda_draw1.zig");
+        if (e.draw1 != null and !e.structured and d1.takes(e.cur.sampling)) {
+            try d1.draw(e, e.bd.logits, &.{.{ .row0 = 0, .rows = ids.len, .first = at + 1, .sampling = e.cur.sampling, .out = out }});
+        } else try e.draw(e.bd.logits, ids.len, at + 1, bits, out);
         if (f.prof) |p| p.end();
     }
 
     const verifyLabel = @import("cuda_engine_prof.zig").verifyLabel;
-
-    /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
-    pub fn verifyShared(e: *Engine, parts: []const Part) !void {
-        const b = if (e.bs) |*x| x else return error.NoSharedWindows;
-        if (parts.len == 0 or parts.len > max_shared) return error.WindowTooWide;
-        var segs: [max_shared]fw.Seg = undefined;
-        var ids: [shared_rows]u32 = undefined;
-        var rows: usize = 0;
-        for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
-            for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
-            try e.bind(p.slot);
-            segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
-            @memcpy(ids[rows..][0..p.ids.len], p.ids);
-            rows += p.ids.len;
-        }
-        var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .taps = if (e.drafter) |dr| dr.taps(false) else null };
-        try f.run(@ptrCast(ids[0..rows]));
-        if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
-        for (parts, segs[0..parts.len]) |p, g| {
-            try e.bind(p.slot);
-            e.cur.rows_at = b.fnormed + g.row0 * e.c.hidden * 2;
-            try e.draw(b.logits + g.row0 * e.share.vocab.len() * 2, g.rows, g.st.pos + 1, p.bits, p.out);
-        }
-    }
+    pub const verifyShared = @import("cuda_engine_shared.zig").verifyShared;
 
     /// DFlash2's round (every rank, the same `reqs`): each stream's kept rows into its context, then the block pass.
     pub fn draftBlock(e: *Engine, reqs: []dflash.Req) !void {
@@ -581,6 +536,7 @@ pub const Engine = struct {
         const f = e.view(&e.bd, &one);
         try f.commit(n);
     }
+    pub const keepShared = @import("cuda_commit_seg.zig").keepShared;
 
     /// decode.draft: the MTP head absorbs the kept rows (committed first) with `follow`, then chains `depth` drafts.
     pub fn draft(e: *Engine, from_prompt: bool, follow: []const u32, depth: usize, out: []u32) !void {

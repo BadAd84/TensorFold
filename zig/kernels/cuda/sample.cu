@@ -540,6 +540,7 @@ extern "C" __global__ void __launch_bounds__(1024) tf_draw(const __nv_bfloat16* 
 }
 
 #include "sample_rows.cuh"
+#include "sample_cands.cuh"
 
 // The same over a column subset whose token ids are IDS (int64, a draft head's vocabulary): noise and token by id.
 extern "C" __global__ void __launch_bounds__(1024) tf_draw_ids(const __nv_bfloat16* L, unsigned V, const tf_sample::Rule* rule,

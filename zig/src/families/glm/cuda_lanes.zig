@@ -30,7 +30,7 @@ fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.c
 }
 
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
-const Lane = struct {
+pub const Lane = struct {
     slot: u32,
     pending_rows: ?usize = null,
     held: [max_held]u32 = undefined,
@@ -51,6 +51,8 @@ pub const Lanes = struct {
     next: u64 = 0,
     bits: ?cuda.HostBuffer = null, // structured output's grammar words (shared_rows rows), device-read, at first use
     bits_dev: u64 = 0,
+    timed: ?@import("cuda_cost_time.zig").Timed = null, // TF_GLM_OVN_COST_TIME: the window costs timed at load
+    multi: bool = false, // TF_GLM_OVN_MULTI_FILL: batched passes take marked and resumed prompts, a piece a pass
 
     pub fn deinit(self: *Lanes) void {
         if (self.bits) |*b| b.free();
@@ -73,7 +75,7 @@ pub const Lanes = struct {
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.together) &steps_many_vt else &steps_vt };
+        return .{ .ptr = self, .vtable = if (self.whole) &whole_vt else if (self.together) (if (self.multi) &steps_multi_vt else &steps_many_vt) else &steps_vt };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -105,6 +107,11 @@ pub const Lanes = struct {
         v.many_rows = @intCast(engine.prompt_rows);
         break :vt v;
     };
+    const steps_multi_vt: be.Backend.VTable = vt: { // TF_GLM_OVN_MULTI_FILL: resumed prompts join batched passes too
+        var v = steps_many_vt;
+        v.many_resumed = true;
+        break :vt v;
+    };
 
     /// Round loop facts: copies up to max_rows, head chains to mtp_rows, shared windows unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
@@ -122,8 +129,8 @@ pub const Lanes = struct {
             .draft_streams = block, // one block pass drafts every stream of the round
             .mtp_step_ms = if (block) 1.6 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (about 1.6 ms)
             .draft_probabilities = block, // the selector's chances size each window against the costs below
-            .window_costs = if (block) &gb10_window_costs else &.{},
-            .shared_costs = if (block) &gb10_shared_costs else &.{},
+            .window_costs = if (block) (if (self.timed) |*t| &t.window else &gb10_window_costs) else &.{},
+            .shared_costs = if (block) (if (self.timed) |*t| &t.shared else &gb10_shared_costs) else &.{},
             .hidden_rows = sharing,
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
@@ -134,7 +141,7 @@ pub const Lanes = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
-    fn take(self: *Lanes, token: u32) u64 {
+    pub fn take(self: *Lanes, token: u32) u64 {
         const h = self.next;
         self.drawn[h % ring] = token;
         self.next += 1;
@@ -173,7 +180,7 @@ pub const Lanes = struct {
     }
 
     /// The stream's sequence bound, its last verify committed (`kept` rows, else all of them).
-    fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
+    pub fn bind(self: *Lanes, s: *const lanes.Stream, kept: ?usize) !*Lane {
         const l = self.lanes.getPtr(s) orelse return error.UnknownStream;
         try self.x.bind(l.slot);
         if (l.pending_rows) |rows| try self.x.keep(kept orelse rows);
@@ -208,6 +215,7 @@ pub const Lanes = struct {
 
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
+        if (self.multi) return @import("cuda_lanes_fill.zig").multiFill(self, ss);
         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
         for (ss) |s| if (!canBatch(s)) return false;
         var opened: usize = 0;
@@ -279,7 +287,7 @@ pub const Lanes = struct {
     }
 
     /// A prompt pass begins: the stream's slot bound and its sequence fresh; where the pass resumes (a kept state).
-    fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
+    pub fn opening(self: *Lanes, s: *lanes.Stream) !?engine.Resume {
         const ids = s.prompt();
         if (ids.len + s.max_new + max_rows >= self.x.e.capacity) return error.PromptTooLong;
         const pages = try self.seat(s, ids.len, s.max_new);
@@ -333,7 +341,7 @@ pub const Lanes = struct {
     }
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
-    fn marksOf(s: *lanes.Stream) ?engine.Marks {
+    pub fn marksOf(s: *lanes.Stream) ?engine.Marks {
         return if (s.reuse.hook == null) null else .{
             .at = s.reuse.marks,
             .ctx = s,
@@ -438,52 +446,20 @@ pub const Lanes = struct {
         }
     }
 
-    /// A round's windows in one forward (Engine.verifyShared), each stream's rows on its own sequence.
-    fn verifyShared(self: *Lanes, windows: []const be.Window, out: []be.Verified) !void {
-        if (windows.len > engine.max_shared) return error.WindowTooWide;
-        var parts: [engine.max_shared]engine.Part = undefined;
-        var ids: [engine.max_shared][max_rows]u32 = undefined;
-        var sampled: [engine.max_shared][max_rows]u32 = undefined;
-        var lane: [engine.max_shared]*Lane = undefined;
-        var row: usize = 0; // the windows' rows so far: each one's grammar rows start there in the bits
-        var structured = false;
-        for (windows, 0..) |w, k| {
-            if (w.parents != null) return error.TreesNotBuilt;
-            const l = try self.bind(w.stream, null);
-            const rows = w.rows();
-            if (rows > max_rows) return error.WindowTooWide;
-            if (w.held > l.held_n) return error.NoHeldDrafts;
-            const pos = self.x.e.pos();
-            for (w.positions, 0..) |p, r| if (p != pos + 1 + r) return error.PositionMismatch;
-            ids[k][0] = w.pending;
-            const drafts = if (w.held > 0) l.held[0..w.held] else w.tokens;
-            @memcpy(ids[k][1..][0..drafts.len], drafts);
-            const bits = try self.putBits(row, rows, w.masks);
-            structured = structured or bits != 0;
-            parts[k] = .{ .slot = l.slot, .ids = ids[k][0..rows], .out = sampled[k][0..rows], .bits = bits };
-            lane[k] = l;
-            row += rows;
-        }
-        self.x.e.structured = structured; // one window under a grammar: the whole step draws from whole rows
-        defer self.x.e.structured = false;
-        try self.x.verifyShared(parts[0..windows.len]);
-        self.shared += 1;
-        for (out[0..windows.len], parts[0..windows.len], lane[0..windows.len]) |*o, p, l| {
-            const rows = p.ids.len;
-            @memcpy(o.sampled[0..rows], p.out);
-            @memcpy(o.drafts[0 .. rows - 1], p.ids[1..rows]);
-            l.pending_rows = rows;
-        }
-    }
+    const verifyShared = @import("cuda_lanes_shared.zig").verifyShared;
 
     fn keepFn(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const self = of(ptr);
+        const prof = try shared_mod.commitProf(self, windows);
+        if (self.x.e.seg_commit != null) try shared_mod.keepAll(self, windows, paths); // TF_GLM_OVN_SEG_COMMIT
         for (windows, paths) |w, path| {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
             _ = try self.bind(w.stream, path.len);
         }
+        shared_mod.commitEnd(self, prof);
     }
+    const shared_mod = @import("cuda_lanes_shared.zig");
 
     fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const self = of(ptr);
@@ -510,6 +486,8 @@ pub const Lanes = struct {
         if (requests.len > dflash.MAX_S) return error.TooManyStreams;
         var reqs: [dflash.MAX_S]dflash.Req = undefined;
         var held: [dflash.MAX_S]*Lane = undefined;
+        const prof = try shared_mod.commitProf(self, requests);
+        if (self.x.e.seg_commit != null) try shared_mod.keepRequests(self, requests); // TF_GLM_OVN_SEG_COMMIT
         for (requests, 0..) |r, i| {
             const l = try self.bind(r.stream, if (r.rows) |rows| rows.len else null);
             if (r.position != self.x.e.pos() + 1) return error.PositionMismatch;
@@ -523,6 +501,7 @@ pub const Lanes = struct {
             reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
             held[i] = l;
         }
+        shared_mod.commitEnd(self, prof);
         try self.x.block(reqs[0..requests.len]);
         const cut = confidence();
         for (requests, held[0..requests.len]) |r, l| {
@@ -559,7 +538,7 @@ pub const Lanes = struct {
     }
 
     /// The stream left the rounds: its sequence is freed, or its pages given back, on every rank (slot 0 stays).
-    fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+    pub fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });

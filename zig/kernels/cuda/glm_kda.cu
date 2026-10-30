@@ -430,3 +430,75 @@ extern "C" __global__ void __launch_bounds__(128) tf_glm_kda_out(
         const __nv_bfloat16* __restrict__ norm_w, float eps, __nv_bfloat16* __restrict__ out) {
     out_kernel_body(H, y_in, G, g_stride, norm_w, eps, out);
 }
+
+// TF_GLM_OVN_SEG_KDA: one shared window's segment (a stream's rows) as cuda_kda_seg.zig's table holds it, layer 0's
+// places; layer li's are li strides on. Each kernel below runs the body above on its segment's own pointers.
+struct KdaSeg {
+    long long row0, rows;
+    const __nv_bfloat16* cs;
+    const float* state_in;
+    float* state_out;
+    float* k;
+    __nv_bfloat16* v;
+    float* g;
+    float* b;
+};
+
+// Block (row, head, segment): tf_glm_kda_prep on the segment's rows (window rows; rows past its own return).
+extern "C" __global__ void __launch_bounds__(512) tf_glm_kda_prep_seg(
+        const KdaSeg* __restrict__ seg, long long li, long long conv_e, long long kv_e, long long b_e, int H,
+        const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A,
+        int a_stride, const float* __restrict__ cw, const float* __restrict__ a_log,
+        const float* __restrict__ dt_bias, float lower, float* __restrict__ q_out) {
+    const KdaSeg s = seg[blockIdx.z];
+    if (static_cast<long long>(blockIdx.x) >= s.rows) return;
+    prep_kernel_body(
+        H, P + s.row0 * p_stride, p_stride, b_off, A + s.row0 * a_stride, a_stride, s.cs + li * conv_e, cw, a_log,
+        dt_bias, lower, q_out + s.row0 * H * DK, s.k + li * kv_e, s.v + li * kv_e, s.g + li * kv_e, s.b + li * b_e);
+}
+
+// Block (head, part, segment): tf_glm_kda_step on the segment's rows and states.
+extern "C" __global__ void __launch_bounds__(256) tf_glm_kda_step_seg(
+        const KdaSeg* __restrict__ seg, long long li, long long rec_e, long long kv_e, long long b_e, int H,
+        const float* __restrict__ q_in, __nv_bfloat16* __restrict__ y_out) {
+    const KdaSeg s = seg[blockIdx.z];
+    step_kernel_body<8, 16>(
+        H, s.state_in + li * rec_e, q_in + s.row0 * H * DK, s.k + li * kv_e, s.v + li * kv_e, s.g + li * kv_e,
+        s.b + li * b_e, static_cast<int>(s.rows), y_out + s.row0 * H * DV, s.state_out + li * rec_e);
+}
+
+// Block (head, segment): tf_glm_kda_chain on the segment's rows and states.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_chain_seg(
+        const KdaSeg* __restrict__ seg, long long li, long long conv_e, long long rec_e, long long kv_e, long long b_e,
+        int H, const __nv_bfloat16* __restrict__ P, int p_stride, int b_off, const __nv_bfloat16* __restrict__ A,
+        int a_stride, const __nv_bfloat16* __restrict__ G, int g_stride, const float* __restrict__ cw,
+        const float* __restrict__ a_log, const float* __restrict__ dt_bias, const __nv_bfloat16* __restrict__ norm_w,
+        float eps, float lower, __nv_bfloat16* __restrict__ out) {
+    const KdaSeg s = seg[blockIdx.y];
+    chain_kernel_body(
+        H, P + s.row0 * p_stride, p_stride, b_off, A + s.row0 * a_stride, a_stride, G + s.row0 * g_stride, g_stride,
+        s.cs + li * conv_e, cw, s.state_in + li * rec_e, a_log, dt_bias, norm_w, eps, lower, static_cast<int>(s.rows),
+        out + s.row0 * H * DV, s.state_out + li * rec_e, s.k + li * kv_e, s.v + li * kv_e, s.g + li * kv_e,
+        s.b + li * b_e);
+}
+
+// TF_GLM_OVN_SEG_COMMIT: one stream of a shared round's commit (cuda_commit_seg.zig's table): its kept rows of the
+// pending window, its current and next state copies (layer 0) and its saved rows (layer 0).
+struct KdaKeep {
+    long long keep, pending;
+    const float* state_in;
+    float* state_out;
+    const float* k;
+    const __nv_bfloat16* v;
+    const float* g;
+    const float* b;
+};
+
+// Block (layer x head, stream): tf_glm_kda_replay_layers for each stream that keeps fewer rows than it ran.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_kda_replay_layers_seg(
+        const KdaKeep* __restrict__ seg, int H, size_t state_stride, size_t kv_stride, size_t b_stride) {
+    const KdaKeep s = seg[blockIdx.y];
+    if (s.keep >= s.pending) return;
+    replay_layers_kernel_body(
+        H, s.state_in, state_stride, s.k, s.v, s.g, s.b, kv_stride, b_stride, static_cast<int>(s.keep), s.state_out);
+}

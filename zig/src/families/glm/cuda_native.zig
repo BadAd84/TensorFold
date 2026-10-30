@@ -134,6 +134,7 @@ const Owned = struct {
 };
 
 const env = @import("sys").env;
+const cost_time = @import("cuda_cost_time.zig");
 
 /// Every peer's send/recv connected now, before the weights fill memory (connected on first use, ibv_reg_mr can fail).
 fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group) !void {
@@ -312,6 +313,11 @@ fn finishRank(a: OpenArgs) !Loaded {
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
     own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .together = !off("TF_GLM_PROMPT_MANY"), .alone = off("TF_GLM_SHARED") };
+    own.lanes.multi = cuda.ovn.on("MULTI_FILL"); // TF_GLM_OVN_MULTI_FILL: marked and resumed prompts in batched passes
+    if (cost_time.wanted(own.e)) { // TF_GLM_OVN_COST_TIME: before the layout, so the timed slots are freed by then
+        own.lanes.timed = try own.lanes.x.costs();
+        try own.lanes.x.idle(); // the other ranks back to their lines until the first stream
+    }
     const extra: u64 = (if (o.drafter != null) dflash.ring_bytes else 0) + if (own.e.images) |v| v.streamBytes() else @as(usize, 0);
     own.layout = if (set.pages) try pages_mod.layout(gpa, own.e, extra) else null;
     return .{
