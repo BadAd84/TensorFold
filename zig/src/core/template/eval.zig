@@ -25,6 +25,14 @@ pub const Ctx = struct {
     out: *v.Buffer,
     depth: usize = 0,
     acc: v.Buffer = .{},
+    /// Stops the render a set distance past where its root output leaves a reference text (watch.zig).
+    watch: ?*@import("watch.zig").Watch = null,
+
+    /// After a write to `c.out` that began at `from` bytes: the watch's check, on the root output only.
+    fn wrote(c: *Ctx, from: usize) Error!void {
+        const w = c.watch orelse return;
+        if (w.out != null and w.out.? == c.out) try w.grew(&c.rt, c.out, from);
+    }
 
     fn resolve(c: *Ctx, name: []const u8) Error!Value {
         if (c.vars.get(name)) |x| return x;
@@ -106,9 +114,13 @@ fn assignByName(c: *Ctx, act: *Activation, t: ast.Target, x: Value) Error!void {
 
 fn exec(c: *Ctx, act: *Activation, body: []const ast.Stmt) Error!Flow {
     for (body) |st| switch (st) {
-        .output => |pieces| for (pieces) |pc| switch (pc) {
-            .text => |t| try c.out.literal(c.rt.a, t),
-            .expr => |e| try c.out.append(c.rt.a, try v.asStr(&c.rt, try eval(c, act, e))),
+        .output => |pieces| for (pieces) |pc| {
+            const from = c.out.text.items.len;
+            switch (pc) {
+                .text => |t| try c.out.literal(c.rt.a, t),
+                .expr => |e| try c.out.append(c.rt.a, try v.asStr(&c.rt, try eval(c, act, e))),
+            }
+            try c.wrote(from);
         },
         .for_ => |f| try execFor(c, act, f),
         .if_ => |n| {
@@ -127,7 +139,12 @@ fn exec(c: *Ctx, act: *Activation, body: []const ast.Stmt) Error!Flow {
             mv.* = .{ .node = m, .closure = act, .name = m.name.id };
             (try slotOf(c, act, m.name.frame, m.name.slot)).* = .{ .macro = mv };
         },
-        .scoped => |sc| try c.out.append(c.rt.a, try capture(c, try enter(c, act, sc.frame), sc.body)),
+        .scoped => |sc| {
+            const text = try capture(c, try enter(c, act, sc.frame), sc.body);
+            const from = c.out.text.items.len;
+            try c.out.append(c.rt.a, text);
+            try c.wrote(from);
+        },
         .break_ => return .brk,
         .continue_ => return .cont,
     };
@@ -509,4 +526,12 @@ pub fn eval(c: *Ctx, act: *Activation, e: *const ast.Expr) Error!Value {
 
 pub fn root(c: *Ctx, t: ast.Template) Error!void {
     _ = try exec(c, try enter(c, null, t.frame), t.body);
+}
+
+/// `root`, `mark` set to the output's length when statement `split` starts (if it starts).
+pub fn rootMarked(c: *Ctx, t: ast.Template, split: usize, mark: *?usize) Error!void {
+    const act = try enter(c, null, t.frame);
+    if (try exec(c, act, t.body[0..split]) != .normal) return;
+    mark.* = c.out.text.items.len;
+    _ = try exec(c, act, t.body[split..]);
 }

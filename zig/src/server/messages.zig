@@ -175,14 +175,26 @@ pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_u
     return .{ .array = out.items };
 }
 
+/// A message's call arguments as ``toolArguments`` made them, by the message object: one request parses each once.
+pub const Args = std.AutoHashMapUnmanaged(*const json.Object, Value);
+
 /// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.
 pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
+    return toolArgumentsWith(cx, messages, null);
+}
+
+/// `toolArguments`, each message object's result kept in `memo` for the request's later renders of it.
+pub fn toolArgumentsWith(cx: *Cx, messages: Value, memo: ?*Args) errors.Refused!Value {
     if (messages != .array) return messages;
     const out = try cx.a.alloc(Value, messages.array.len);
     for (messages.array, out) |message, *slot| {
         slot.* = message;
         const calls = message.get("tool_calls") orelse continue;
         if (calls != .array or calls.array.len == 0) continue;
+        if (memo) |m| if (m.get(message.object)) |done| {
+            slot.* = done;
+            continue;
+        };
         var touched = false;
         const new_calls = try cx.a.alloc(Value, calls.array.len);
         for (calls.array, new_calls) |call, *dst| {
@@ -210,6 +222,7 @@ pub fn toolArguments(cx: *Cx, messages: Value) errors.Refused!Value {
             touched = true;
         }
         if (touched) slot.* = .{ .object = try withField(cx, message.object, "tool_calls", .{ .array = new_calls }) };
+        if (memo) |m| try m.put(cx.a, message.object, slot.*);
     }
     return .{ .array = out };
 }

@@ -254,6 +254,9 @@ pub const HfText = struct {
             .token_bytes = tokenBytesFn,
             .encode_plain = encodePlainFn,
             .encode_masked = encodeMaskedFn,
+            .keep = keepFn,
+            .pieces = piecesFn,
+            .prefix_pieces = prefixFn,
         } };
     }
 
@@ -283,16 +286,37 @@ pub const HfText = struct {
     }
 
     fn encodeMaskedFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const model_text.Span, problem: *[]const u8) model_text.Error![]u32 {
-        return self(ctx).tok.encodeMasked(a, s, spans) catch |err| {
-            if (err == error.OutOfMemory) return error.OutOfMemory;
-            problem.* = if (err == error.UnsafeNormalizedAddedTokenMask)
-                "normalized added tokens cannot be matched safely through this normalizer with request text"
-            else if (err == error.UnsafeAddedTokenMask)
-                "request text tokenizes to an added-token id in this tokenizer; the prompt cannot be encoded safely"
-            else
-                "the tokenizer cannot encode this prompt with request byte provenance";
-            return error.Template;
-        };
+        return self(ctx).tok.encodeMasked(a, s, spans) catch |err| return masked(err, problem);
+    }
+
+    fn keepFn(ctx: *anyopaque, a: Allocator, s: []const u8, spans: []const model_text.Span, problem: *[]const u8) model_text.Error!model_text.Kept {
+        const k = try a.create(tokenizer.kept.Kept);
+        k.* = tokenizer.kept.keep(&self(ctx).tok, a, s, spans) catch |err| return masked(err, problem);
+        return .{ .ids = k.ids, .state = k };
+    }
+
+    fn piecesFn(ctx: *anyopaque, a: Allocator, kept: model_text.Kept, s: []const u8, spans: []const model_text.Span, problem: *[]const u8) model_text.Error!model_text.Pieces {
+        const k: *const tokenizer.kept.Kept = @ptrCast(@alignCast(kept.state.?));
+        const p = tokenizer.kept.pieces(&self(ctx).tok, a, k, s, spans) catch |err| return masked(err, problem);
+        return .{ .head = p.head, .mid = p.mid, .tail = p.tail };
+    }
+
+    fn prefixFn(ctx: *anyopaque, a: Allocator, kept: model_text.Kept, s: []const u8, spans: []const model_text.Span, problem: *[]const u8) model_text.Error!?model_text.Pieces {
+        const k: *const tokenizer.kept.Kept = @ptrCast(@alignCast(kept.state.?));
+        const p = (tokenizer.kept.prefix(&self(ctx).tok, a, k, s, spans) catch |err| return masked(err, problem)) orelse return null;
+        return .{ .head = p.head, .mid = p.mid };
+    }
+
+    /// A masked encoding's failure as the request reads it.
+    fn masked(err: tokenizer.Error, problem: *[]const u8) model_text.Error {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        problem.* = if (err == error.UnsafeNormalizedAddedTokenMask)
+            "normalized added tokens cannot be matched safely through this normalizer with request text"
+        else if (err == error.UnsafeAddedTokenMask)
+            "request text tokenizes to an added-token id in this tokenizer; the prompt cannot be encoded safely"
+        else
+            "the tokenizer cannot encode this prompt with request byte provenance";
+        return error.Template;
     }
 
     fn decodeFn(ctx: *anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
@@ -371,12 +395,14 @@ pub const HfText = struct {
         if (t.clear_thinking) |clear| try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse clear });
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
-        const out = template.renderProvenanceGlobals(a, compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag) catch |e| {
+        var watch: template.Watch = .{ .against = if (options.stop) |s| s.against else "", .slack = if (options.stop) |s| s.slack else 0 };
+        var more: template.More = .{ .watch = if (options.stop != null) &watch else null };
+        const out = template.renderMore(a, compiled, try toStd(a, messages), tools, .{ .object = context }, .{ .object = globals }, options.add_generation_prompt, &diag, &more) catch |e| {
             if (e == error.OutOfMemory) return error.OutOfMemory;
             problem.* = diag.msg;
             return error.Template;
         };
-        return .{ .text = out.s, .spans = out.spans };
+        return .{ .text = out.s, .spans = out.spans, .history = more.history, .cut = more.cut };
     }
 };
 

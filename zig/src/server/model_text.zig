@@ -12,15 +12,27 @@ pub const RenderOptions = struct {
     reasoning_effort: ?[]const u8 = null,
     /// A request's ``clear_thinking``; a GLM-5.3 template takes it over the server's.
     clear_thinking: ?bool = null,
+    /// Stop rendering `slack` bytes past where the text first differs from `against`; the text is then cut.
+    stop: ?struct { against: []const u8, slack: usize } = null,
 };
 
 pub const Error = error{ Template, OutOfMemory };
 pub const Span = [2]usize;
 
+/// A rendered prompt's ids with what `Text.pieces` reuses of them; null `state`: nothing to reuse.
+pub const Kept = struct { ids: []const u32, state: ?*const anyopaque = null };
+
+/// Ids whose concatenation `head ++ mid ++ tail` is a text's masked encoding.
+pub const Pieces = struct { head: []const u32 = &.{}, mid: []const u32 = &.{}, tail: []const u32 = &.{} };
+
 /// The real rendered bytes and the half-open request ranges within them.
 pub const Rendered = struct {
     text: []const u8,
     spans: []const Span = &.{},
+    /// With the generation prompt on: the length of the text the template renders with it off, when that is a prefix.
+    history: ?usize = null,
+    /// The render stopped early (`RenderOptions.stop`): text and spans are a prefix of the full render's.
+    cut: bool = false,
 
     pub fn isTemplate(r: Rendered, start: usize, end: usize) bool {
         if (start == end) return true;
@@ -54,6 +66,27 @@ pub const Rendered = struct {
 
     pub fn encode(r: Rendered, t: Text, a: Allocator, problem: *[]const u8) Error![]u32 {
         return t.encodeMasked(a, r.text, r.spans, problem);
+    }
+
+    /// `encode`'s ids, kept so a later rendering of the same request reuses the segments it repeats.
+    pub fn keep(r: Rendered, t: Text, a: Allocator, problem: *[]const u8) Error!Kept {
+        if (r.spans.len == 0) return .{ .ids = try r.encode(t, a, problem) };
+        const f = t.vtable.keep orelse return .{ .ids = try r.encode(t, a, problem) };
+        return f(t.ctx, a, r.text, r.spans, problem);
+    }
+
+    /// `encode`'s ids as pieces, reusing `kept`'s for the segments this rendering repeats.
+    pub fn pieces(r: Rendered, t: Text, a: Allocator, kept: Kept, problem: *[]const u8) Error!Pieces {
+        const f = t.vtable.pieces orelse return .{ .mid = try r.encode(t, a, problem) };
+        if (kept.state == null or r.spans.len == 0) return .{ .mid = try r.encode(t, a, problem) };
+        return f(t.ctx, a, kept, r.text, r.spans, problem);
+    }
+
+    /// For a cut render: the full render's leading ids its text already fixes, as pieces; null when unknown.
+    pub fn prefixPieces(r: Rendered, t: Text, a: Allocator, kept: Kept, problem: *[]const u8) Error!?Pieces {
+        const f = t.vtable.prefix_pieces orelse return null;
+        if (kept.state == null or r.spans.len == 0) return null;
+        return f(t.ctx, a, kept, r.text, r.spans, problem);
     }
 
     pub fn appendPlain(r: Rendered, a: Allocator, label: []const u8) Allocator.Error!Rendered {
@@ -125,6 +158,12 @@ pub const Text = struct {
         encode_masked: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, spans: []const Span, problem: *[]const u8) Error![]u32 = null,
         /// A token's own bytes (a partial UTF-8 sequence kept whole) for logprob rows; null: the tokenizer can't say.
         token_bytes: ?*const fn (ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 = null,
+        /// ``encode_masked`` with what ``pieces`` reuses; null: nothing is kept.
+        keep: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8, spans: []const Span, problem: *[]const u8) Error!Kept = null,
+        /// ``encode_masked`` of `text` as pieces, a kept text's ids standing for the segments `text` repeats.
+        pieces: ?*const fn (ctx: *anyopaque, a: Allocator, kept: Kept, text: []const u8, spans: []const Span, problem: *[]const u8) Error!Pieces = null,
+        /// A cut text's fixed leading ids as pieces: those every text extending it encodes to; null: none known.
+        prefix_pieces: ?*const fn (ctx: *anyopaque, a: Allocator, kept: Kept, text: []const u8, spans: []const Span, problem: *[]const u8) Error!?Pieces = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
