@@ -149,7 +149,7 @@ pub fn leave(e: *engine.Engine, marks: ?engine.Marks) !void {
     if (!on) return;
     const cap = e.one orelse return;
     const n = cap.marks;
-    cap.marks = 0;
+    defer cap.marks = 0; // after the keeps: keepAt refuses a mark past it
     for (cap.at[0..n], 0..) |at, k| {
         cap.taking = k;
         defer cap.taking = null;
