@@ -5,6 +5,7 @@ const driver = @import("driver.zig");
 const stream_ = @import("stream.zig");
 const memory = @import("memory.zig");
 const roce = @import("roce.zig");
+const prx = @import("prx.zig");
 const p2p_report = @import("p2p_report.zig");
 
 const Stream = stream_.Stream;
@@ -16,6 +17,7 @@ pub const Group = struct {
     world: usize,
     aborted: std.atomic.Value(bool) = .init(false),
     fast: ?*roce.Gather = null, // two ranks' small all-gathers by RoCE writes (openRoce), when both ranks brought it up
+    prx: ?*prx.Channel = null, // TF_GLM_OVN_PRX: a prompt chunk's split exchanges by the NICs (openPrx)
 
     /// Rank `rank` of `world` (NCCL opened at run time; NCCL_COMM_ID names rank 0's address, every rank the same).
     pub fn open(d: *const driver.Driver, rank: usize, world: usize) !Group {
@@ -35,6 +37,7 @@ pub const Group = struct {
 
     pub fn close(g: *Group) void {
         p2p_report.ready(); // a transport line still owed is reported before the communicator goes
+        if (g.prx) |c| c.deinit();
         if (g.fast) |f| f.deinit();
         g.destroyComm();
         g.lib.close();
@@ -55,9 +58,16 @@ pub const Group = struct {
         g.fast = try roce.Gather.init(gpa, io, d, g, s, roce.wanted(), max_bytes);
     }
 
-    /// A failed RoCE gather's error (its rows hold nothing valid): call it after a synchronize that reads a gather.
+    /// TF_GLM_OVN_PRX (every rank alike, cuda_ranks agrees it): the prompt exchanges' channel, if all bring it up.
+    pub fn openPrx(g: *Group, gpa: std.mem.Allocator, io: std.Io, d: *const driver.Driver, s: Stream) !void {
+        if (g.world < 2 or g.world > prx.max_world or g.prx != null) return;
+        g.prx = try prx.Channel.open(gpa, io, d, g, s, try prx.Settings.read());
+    }
+
+    /// A failed RoCE gather's or PRX channel's error (rows hold nothing valid): after a synchronize reading them.
     pub fn check(g: *const Group) !void {
         if (g.fast) |f| try f.check();
+        if (g.prx) |c| try c.check();
     }
 
     /// `bytes` at `mine` from every rank into `all` in rank order (world * bytes there), on `s`.

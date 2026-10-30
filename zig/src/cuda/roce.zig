@@ -21,134 +21,18 @@ const max_peers = max_world_roce - 1;
 const slots = 2;
 const flag_stride = 128;
 const send_depth = 256;
-const port_num: u8 = 1;
 const threads = 512;
 const max_blocks = 8; // the largest grid; smaller shards launch fewer (a power of two)
 const classes = 4; // grid size classes 1, 2, 4, 8 (each its own arrival counters)
 const idle_spins: u64 = 20_000_000; // doorbell polls before the proxy naps between them (a model's gaps are short)
 const spin_limit: u32 = 100_000_000; // the kernel's flag polls before it gives up and poisons the exchange
 
-// -- libibverbs (the ABI of rdma-core's verbs.h; offsets checked against its headers) ---------------------------------
-const Device = opaque {};
-const Context = opaque {};
-const Pd = opaque {};
-const Cq = extern struct { context: *Context };
-const Mr = extern struct { context: *Context, pd: *Pd, addr: ?*anyopaque, length: usize, handle: u32, lkey: u32, rkey: u32 };
-const Qp = extern struct { context: *Context, qp_context: ?*anyopaque, pd: *Pd, send_cq: *Cq, recv_cq: *Cq, srq: ?*anyopaque, handle: u32, qp_num: u32 };
-const QpCap = extern struct { max_send_wr: u32 = 0, max_recv_wr: u32 = 0, max_send_sge: u32 = 0, max_recv_sge: u32 = 0, max_inline_data: u32 = 0 };
-const QpInitAttr = extern struct { qp_context: ?*anyopaque = null, send_cq: ?*Cq = null, recv_cq: ?*Cq = null, srq: ?*anyopaque = null, cap: QpCap = .{}, qp_type: c_int = 0, sq_sig_all: c_int = 0 };
-const GlobalRoute = extern struct { dgid: [16]u8 = @splat(0), flow_label: u32 = 0, sgid_index: u8 = 0, hop_limit: u8 = 0, traffic_class: u8 = 0 };
-const AhAttr = extern struct { grh: GlobalRoute = .{}, dlid: u16 = 0, sl: u8 = 0, src_path_bits: u8 = 0, static_rate: u8 = 0, is_global: u8 = 0, port_num: u8 = 0 };
-const QpAttr = extern struct {
-    qp_state: u32 = 0,
-    cur_qp_state: u32 = 0,
-    path_mtu: u32 = 0,
-    path_mig_state: u32 = 0,
-    qkey: u32 = 0,
-    rq_psn: u32 = 0,
-    sq_psn: u32 = 0,
-    dest_qp_num: u32 = 0,
-    qp_access_flags: u32 = 0,
-    cap: QpCap = .{},
-    ah_attr: AhAttr = .{},
-    alt_ah_attr: AhAttr = .{},
-    pkey_index: u16 = 0,
-    alt_pkey_index: u16 = 0,
-    en_sqd_async_notify: u8 = 0,
-    sq_draining: u8 = 0,
-    max_rd_atomic: u8 = 0,
-    max_dest_rd_atomic: u8 = 0,
-    min_rnr_timer: u8 = 0,
-    port_num: u8 = 0,
-    timeout: u8 = 0,
-    retry_cnt: u8 = 0,
-    rnr_retry: u8 = 0,
-    alt_port_num: u8 = 0,
-    alt_timeout: u8 = 0,
-    rate_limit: u32 = 0,
-    _tail: u32 = 0,
-};
-const Sge = extern struct { addr: u64, length: u32, lkey: u32 };
-const SendWr = extern struct {
-    wr_id: u64 = 0,
-    next: ?*SendWr = null,
-    sg_list: ?*Sge = null,
-    num_sge: c_int = 0,
-    opcode: u32 = 0,
-    send_flags: u32 = 0,
-    imm_data: u32 = 0,
-    remote_addr: u64 = 0,
-    rkey: u32 = 0,
-    _tail: [128 - 52]u8 = @splat(0),
-};
-const Wc = extern struct { wr_id: u64, status: u32, opcode: u32, vendor_err: u32, _rest: [48 - 20]u8 };
-const PortAttr = extern struct { bytes: [56]u8 align(8) };
-
-comptime {
-    std.debug.assert(@sizeOf(QpInitAttr) == 64 and @offsetOf(QpInitAttr, "cap") == 32 and @offsetOf(QpInitAttr, "qp_type") == 52);
-    std.debug.assert(@sizeOf(AhAttr) == 32 and @offsetOf(AhAttr, "dlid") == 24 and @offsetOf(AhAttr, "port_num") == 30);
-    std.debug.assert(@sizeOf(QpAttr) == 144 and @offsetOf(QpAttr, "ah_attr") == 56 and @offsetOf(QpAttr, "pkey_index") == 120);
-    std.debug.assert(@offsetOf(QpAttr, "rnr_retry") == 132 and @offsetOf(QpAttr, "qp_access_flags") == 32);
-    std.debug.assert(@sizeOf(SendWr) == 128 and @offsetOf(SendWr, "remote_addr") == 40 and @offsetOf(SendWr, "rkey") == 48);
-    std.debug.assert(@sizeOf(Wc) == 48 and @offsetOf(Mr, "lkey") == 36 and @offsetOf(Qp, "qp_num") == 52);
-}
-
-// struct ibv_context's ops: the two calls verbs.h inlines
-const ops_poll_cq = 96;
-const ops_post_send = 208;
-const PollCq = *const fn (*Cq, c_int, [*]Wc) callconv(.c) c_int;
-const PostSend = *const fn (*Qp, *SendWr, *?*SendWr) callconv(.c) c_int;
-
-const wr_rdma_write = 0;
-const send_signaled = 2;
-const send_inline = 8;
-const qpt_rc = 2;
-const qps_init = 1;
-const qps_rtr = 2;
-const qps_rts = 3;
-const port_active = 4;
-const access_local_write = 1;
-const access_remote_write = 2;
-const qp_state = 1;
-const qp_access_flags = 8;
-const qp_pkey_index = 16;
-const qp_port = 32;
-const qp_av = 128;
-const qp_path_mtu = 256;
-const qp_timeout = 512;
-const qp_retry_cnt = 1024;
-const qp_rnr_retry = 2048;
-const qp_rq_psn = 4096;
-const qp_max_qp_rd_atomic = 8192;
-const qp_min_rnr_timer = 32768;
-const qp_sq_psn = 65536;
-const qp_max_dest_rd_atomic = 131072;
-const qp_dest_qpn = 1048576;
-
-const Api = struct {
-    ibv_get_device_list: *const fn (?*c_int) callconv(.c) ?[*]?*Device,
-    ibv_free_device_list: *const fn ([*]?*Device) callconv(.c) void,
-    ibv_get_device_name: *const fn (*Device) callconv(.c) ?[*:0]const u8,
-    ibv_open_device: *const fn (*Device) callconv(.c) ?*Context,
-    ibv_close_device: *const fn (*Context) callconv(.c) c_int,
-    ibv_query_port: *const fn (*Context, u8, *PortAttr) callconv(.c) c_int,
-    ibv_query_gid: *const fn (*Context, u8, c_int, *[16]u8) callconv(.c) c_int,
-    ibv_alloc_pd: *const fn (*Context) callconv(.c) ?*Pd,
-    ibv_dealloc_pd: *const fn (*Pd) callconv(.c) c_int,
-    ibv_reg_mr: *const fn (*Pd, ?*anyopaque, usize, c_int) callconv(.c) ?*Mr,
-    ibv_dereg_mr: *const fn (*Mr) callconv(.c) c_int,
-    ibv_create_cq: *const fn (*Context, c_int, ?*anyopaque, ?*anyopaque, c_int) callconv(.c) ?*Cq,
-    ibv_destroy_cq: *const fn (*Cq) callconv(.c) c_int,
-    ibv_create_qp: *const fn (*Pd, *QpInitAttr) callconv(.c) ?*Qp,
-    ibv_destroy_qp: *const fn (*Qp) callconv(.c) c_int,
-    ibv_modify_qp: *const fn (*Qp, *QpAttr, c_int) callconv(.c) c_int,
-    ibv_wc_status_str: *const fn (u32) callconv(.c) ?[*:0]const u8,
-};
-
-fn opsCall(comptime T: type, ctx: *Context, offset: usize) T {
-    const slot: *const T = @ptrFromInt(@intFromPtr(ctx) + offset);
-    return slot.*;
-}
+const verbs = @import("roce_verbs.zig");
+const Api = verbs.Api;
+const Wc = verbs.Wc;
+const Sge = verbs.Sge;
+const SendWr = verbs.SendWr;
+const opsCall = verbs.opsCall;
 
 pub const Error = error{ VerbsUnavailable, NoHca, HcaFailed, PeerRefused, ProxyFailed, ExchangeTimedOut, Misaligned };
 
@@ -214,11 +98,11 @@ fn BlobOf(comptime n: usize) type {
 }
 
 const Hca = struct {
-    ctx: ?*Context = null,
-    pd: ?*Pd = null,
-    mr: ?*Mr = null,
-    cq: ?*Cq = null,
-    qps: [max_peers]?*Qp = @splat(null), // one queue pair per peer on this HCA's completion queue
+    ctx: ?*verbs.Context = null,
+    pd: ?*verbs.Pd = null,
+    mr: ?*verbs.Mr = null,
+    cq: ?*verbs.Cq = null,
+    qps: [max_peers]?*verbs.Qp = @splat(null), // one queue pair per peer on this HCA's completion queue
     gid: [16]u8 = @splat(0),
     gid_index: c_int = 0,
     lid: u16 = 0,
@@ -381,41 +265,32 @@ pub const Gather = struct {
 
     fn openHca(g: *Gather, io: std.Io, gpa: std.mem.Allocator, h: usize, name: []const u8) !void {
         const a = &g.api;
-        var num: c_int = 0;
-        const list = a.ibv_get_device_list(&num) orelse return error.NoHca;
-        defer a.ibv_free_device_list(list);
-        var dev: ?*Device = null;
-        for (0..@intCast(num)) |i| {
-            const n = a.ibv_get_device_name(list[i].?) orelse continue;
-            if (std.mem.eql(u8, std.mem.span(n), name)) dev = list[i];
-        }
         const hca = &g.hcas[h];
-        hca.ctx = a.ibv_open_device(dev orelse {
-            g.fail("RDMA device {s} not found", .{name});
-            return error.NoHca;
-        }) orelse return error.HcaFailed;
-        var port: PortAttr = std.mem.zeroes(PortAttr);
-        if (a.ibv_query_port(hca.ctx.?, port_num, &port) != 0) return error.HcaFailed;
-        if (std.mem.readInt(u32, port.bytes[0..4], .little) != port_active) {
-            g.fail("{s} port 1 is not active", .{name});
-            return error.NoHca;
-        }
-        hca.mtu = std.mem.readInt(u32, port.bytes[8..12], .little);
-        hca.lid = std.mem.readInt(u16, port.bytes[34..36], .little);
+        hca.ctx = verbs.openDevice(a, name) catch |e| switch (e) {
+            error.NotFound => {
+                g.fail("RDMA device {s} not found", .{name});
+                return error.NoHca;
+            },
+            else => |x| return x,
+        };
+        const port = verbs.activePort(a, hca.ctx.?) catch |e| switch (e) {
+            error.PortDown => {
+                g.fail("{s} port 1 is not active", .{name});
+                return error.NoHca;
+            },
+            else => |x| return x,
+        };
+        hca.mtu = port.mtu;
+        hca.lid = port.lid;
         hca.gid_index = try rails.gidIndex(io, gpa, name);
-        if (a.ibv_query_gid(hca.ctx.?, port_num, hca.gid_index, &hca.gid) != 0) return error.HcaFailed;
+        if (a.ibv_query_gid(hca.ctx.?, verbs.port_num, hca.gid_index, &hca.gid) != 0) return error.HcaFailed;
         hca.pd = a.ibv_alloc_pd(hca.ctx.?) orelse return error.HcaFailed;
-        hca.mr = a.ibv_reg_mr(hca.pd.?, g.region.bytes.ptr, g.region.bytes.len, access_local_write | access_remote_write) orelse {
+        hca.mr = a.ibv_reg_mr(hca.pd.?, g.region.bytes.ptr, g.region.bytes.len, verbs.access_local_write | verbs.access_remote_write) orelse {
             g.fail("{s}: registering the pinned region failed", .{name});
             return error.HcaFailed;
         };
         hca.cq = a.ibv_create_cq(hca.ctx.?, send_depth, null, null, 0) orelse return error.HcaFailed;
-        var attr: QpInitAttr = .{ .send_cq = hca.cq, .recv_cq = hca.cq, .qp_type = qpt_rc, .cap = .{ .max_send_wr = send_depth, .max_recv_wr = 1, .max_send_sge = 1, .max_recv_sge = 1, .max_inline_data = 16 } };
-        for (0..g.n_peers) |p| {
-            hca.qps[p] = a.ibv_create_qp(hca.pd.?, &attr) orelse return error.HcaFailed;
-            var init_attr: QpAttr = .{ .qp_state = qps_init, .port_num = port_num, .qp_access_flags = access_remote_write };
-            if (a.ibv_modify_qp(hca.qps[p].?, &init_attr, qp_state | qp_pkey_index | qp_port | qp_access_flags) != 0) return error.HcaFailed;
-        }
+        for (0..g.n_peers) |p| hca.qps[p] = try verbs.makeQp(a, hca.pd.?, hca.cq.?, send_depth);
     }
 
     fn blob(g: *Gather, b: anytype) void {
@@ -460,16 +335,13 @@ pub const Gather = struct {
             const q = g.peer_links[p][i];
             const x = &g.hcas[h];
             g.peer_rkey[p][h] = peer.rkey[q];
-            var rtr: QpAttr = .{ .qp_state = qps_rtr, .path_mtu = @min(peer.mtu[q], x.mtu), .dest_qp_num = peer.qpn[me_there][q], .max_dest_rd_atomic = 1, .min_rnr_timer = 12, .ah_attr = .{ .is_global = 1, .dlid = peer.lid[q], .port_num = port_num, .grh = .{ .dgid = peer.gid[q], .sgid_index = @intCast(x.gid_index), .hop_limit = 64 } } };
-            if (g.api.ibv_modify_qp(x.qps[p].?, &rtr, qp_state | qp_av | qp_path_mtu | qp_dest_qpn | qp_rq_psn | qp_max_dest_rd_atomic | qp_min_rnr_timer) != 0) {
-                g.fail("HCA {d} to peer {d} HCA {d}: the queue pair refused RTR (errno {d})", .{ h, p, q, std.c._errno().* });
+            verbs.connectQp(&g.api, x.qps[p].?, x.mtu, x.gid_index, .{ .mtu = peer.mtu[q], .lid = peer.lid[q], .gid = peer.gid[q], .qpn = peer.qpn[me_there][q] }) catch |e| {
+                switch (e) {
+                    error.Rtr => g.fail("HCA {d} to peer {d} HCA {d}: the queue pair refused RTR (errno {d})", .{ h, p, q, std.c._errno().* }),
+                    error.Rts => g.fail("HCA {d} to peer {d} HCA {d}: the queue pair refused RTS", .{ h, p, q }),
+                }
                 return error.PeerRefused;
-            }
-            var rts: QpAttr = .{ .qp_state = qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .max_rd_atomic = 1 };
-            if (g.api.ibv_modify_qp(x.qps[p].?, &rts, qp_state | qp_timeout | qp_retry_cnt | qp_rnr_retry | qp_sq_psn | qp_max_qp_rd_atomic) != 0) {
-                g.fail("HCA {d} to peer {d} HCA {d}: the queue pair refused RTS", .{ h, p, q });
-                return error.PeerRefused;
-            }
+            };
         }
     }
 
@@ -480,7 +352,7 @@ pub const Gather = struct {
     fn drain(g: *Gather, h: usize) !void {
         const x = &g.hcas[h];
         var wc: [32]Wc = undefined;
-        const n = opsCall(PollCq, x.ctx.?, ops_poll_cq)(x.cq.?, wc.len, &wc);
+        const n = opsCall(verbs.PollCq, x.ctx.?, verbs.ops_poll_cq)(x.cq.?, wc.len, &wc);
         if (n < 0) return error.ProxyFailed;
         for (wc[0..@intCast(n)]) |w| {
             if (w.status != 0) {
@@ -520,12 +392,12 @@ pub const Gather = struct {
                 if (i < packs % links) n += 1;
                 const bytes: u32 = n * 16;
                 var flag_sge: Sge = .{ .addr = @intFromPtr(&seq_copy), .length = 4, .lkey = 0 };
-                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = wr_rdma_write, .send_flags = send_signaled | send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + g.flagSet(links) + at_peer * g.layout.flag_peer_stride + (slot * links + i) * flag_stride, .rkey = g.peer_rkey[p][h] };
+                var flag: SendWr = .{ .wr_id = h, .sg_list = &flag_sge, .num_sge = 1, .opcode = verbs.wr_rdma_write, .send_flags = verbs.send_signaled | verbs.send_inline, .remote_addr = g.peer_addr[p] + g.layout.flags + g.flagSet(links) + at_peer * g.layout.flag_peer_stride + (slot * links + i) * flag_stride, .rkey = g.peer_rkey[p][h] };
                 var data_sge: Sge = .{ .addr = base + g.layout.send + slot * g.layout.slot_bytes + offset, .length = bytes, .lkey = x.mr.?.lkey };
-                var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = wr_rdma_write, .remote_addr = g.peer_addr[p] + g.layout.recv + at_peer * g.layout.recv_peer_stride + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[p][h] };
+                var data: SendWr = .{ .wr_id = h, .next = &flag, .sg_list = &data_sge, .num_sge = 1, .opcode = verbs.wr_rdma_write, .remote_addr = g.peer_addr[p] + g.layout.recv + at_peer * g.layout.recv_peer_stride + slot * g.layout.slot_bytes + offset, .rkey = g.peer_rkey[p][h] };
                 var bad: ?*SendWr = null;
                 const first: *SendWr = if (bytes != 0) &data else &flag;
-                const rc = opsCall(PostSend, x.ctx.?, ops_post_send)(x.qps[p].?, first, &bad);
+                const rc = opsCall(verbs.PostSend, x.ctx.?, verbs.ops_post_send)(x.qps[p].?, first, &bad);
                 if (rc != 0) {
                     g.fail("ibv_post_send: {d}", .{rc});
                     return error.ProxyFailed;

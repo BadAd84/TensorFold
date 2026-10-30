@@ -364,3 +364,11 @@ test "TF_GLM_INDEX_SPLIT: 2048 by default, 0 for never, a position, and a refusa
     try std.testing.expectError(error.BadSetting, Settings.read(Reader.bad, &problem));
     try std.testing.expectEqualStrings("TF_GLM_INDEX_SPLIT: the position a prompt chunk's indexer rows split from, or 0 for never", problem);
 }
+
+test "TF_GLM_OVN_PRX: the knob is a bit of ovn_comms, so ranks that differ are refused before its collective setup" {
+    cuda.ovn.fake("PRX", "1");
+    defer cuda.ovn.fake("PRX", null);
+    try std.testing.expectEqual(@as(u32, 1 << 3), try ranks.ovnComms() & 1 << 3);
+    cuda.ovn.fake("PRX", null);
+    try std.testing.expectEqual(@as(u32, 0), try ranks.ovnComms() & 1 << 3);
+}

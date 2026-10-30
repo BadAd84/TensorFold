@@ -97,6 +97,7 @@ test {
     _ = weights;
     _ = forward;
     _ = relay;
+    _ = @import("cuda_forward_prx.zig");
     _ = quant;
     _ = q4;
     _ = ranks;
