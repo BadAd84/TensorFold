@@ -41,6 +41,26 @@ pub const Layer = struct {
     gate_base: u64 = 0, // every expert's gate trellis back to back, expert e at e * expertWords (0: not known)
     up_base: u64 = 0,
     down_base: u64 = 0,
+    rot: Rot = .{}, // TF_GLM_OVN_X3_ROTEXPERT: per-expert share widths (off: every expert `width` columns)
+};
+
+/// TF_GLM_OVN_X3_ROTEXPERT: expert e's share is wn + wx columns when e % m == r, else wn; m 0 is off.
+pub const Rot = struct {
+    m: usize = 0,
+    r: usize = 0,
+    wn: usize = 0,
+    wx: usize = 0,
+    pub fn on(t: Rot) bool {
+        return t.m != 0;
+    }
+    /// Expert e's share columns (exl3_ovn.cuh rot_share).
+    pub fn cols(t: Rot, e: usize) usize {
+        return t.wn + if (e % t.m == t.r) t.wx else 0;
+    }
+    /// Share columns of the experts before e laid back to back (exl3_ovn.cuh rot_before).
+    pub fn before(t: Rot, e: usize) usize {
+        return e * t.wn + t.wx * ((e + t.m - 1 - t.r) / t.m);
+    }
 };
 
 /// The TF_GLM_OVN_X3_* decode variants (GLM's loader reads them; all off is run() itself). Every one keeps the bits.
@@ -252,18 +272,19 @@ pub const Experts = struct {
     }
 
     /// The TF_GLM_OVN_X3_* kernel of one grouped launch, or null for run()'s own (the variants are mcg only).
-    fn ovnKernel(e: *const Experts, l: Layer, loads: Ovn.Loads, xrow: bool, fuse: bool, k: usize, sk: u32, ns: usize, b0: u64, b1: u64) ?Function {
+    /// `kn`: a rotated narrow expert's K (`k` otherwise); `rot`: TF_GLM_OVN_X3_ROTEXPERT, which only the variants run.
+    fn ovnKernel(e: *const Experts, l: Layer, loads: Ovn.Loads, xrow: bool, fuse: bool, rot: bool, k: usize, kn: usize, sk: u32, ns: usize, b0: u64, b1: u64) ?Function {
         const four = l.uniform_k2 == 8;
         const steps = k / 16 / sk / 4; // k steps a warp
         switch (loads) {
             .nc1, .nc2 => {
                 const pd: usize = if (loads == .nc1) 1 else 2;
-                if (four and ns == 0 and b0 != 0 and b1 != 0 and steps % pd == 0) return e.ovn_nc[pd - 1];
+                if (four and ns == 0 and b0 != 0 and b1 != 0 and steps % pd == 0 and (kn / 16 / sk / 4) % pd == 0) return e.ovn_nc[pd - 1];
             },
             .word => if (four) return e.ovn_walk[1],
             .off => {},
         }
-        return if (xrow or fuse) e.ovn_walk[0] else null;
+        return if (xrow or fuse or rot) e.ovn_walk[0] else null;
     }
 
     /// run() with the TF_GLM_OVN_X3_* variants `o` (all off: run()'s launches); a fused down writes `ey` [P][D].
@@ -288,6 +309,9 @@ pub const Experts = struct {
         const ov: Ovn = if (l.codebook == .mcg) o else .{}; // the variants' kernels are mcg only
         const xrow = ov.xrow and l.shared_input;
         const fuse = ov.fuse_down;
+        const rot = l.rot.on();
+        if (rot) try rotChecked(l, d_sk);
+        const kn = if (rot) l.rot.wn else w; // a narrow expert's down K (TF_GLM_OVN_X3_ROTEXPERT)
 
         var a: launch_.Args = .{};
         a.add(pick);
@@ -339,8 +363,8 @@ pub const Experts = struct {
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
         g.add(i32d(decOrder()));
-        const gk = e.ovnKernel(l, ov.loads, xrow, false, d, g_sk, l.gu_stride, l.gate_base, l.up_base);
-        if (gk != null) addTail(&g, l.gate_base, l.up_base, expertWords(d, w), 0, 0, xrow, false);
+        const gk = e.ovnKernel(l, ov.loads, xrow, false, rot, d, d, g_sk, l.gu_stride, l.gate_base, l.up_base);
+        if (gk != null) addTail(&g, l.gate_base, l.up_base, expertWords(d, w), 0, 0, xrow, false, l.rot, false, d);
         const ord_g: u32 = decOrder();
         const gx: u32 = @intCast(if (ord_g == 1) w / 128 else maxu);
         const gy: u32 = @intCast(if (ord_g == 1) maxu else w / 128);
@@ -384,8 +408,8 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
         dn.add(i32d(decOrder()));
-        const dk = e.ovnKernel(l, ov.loads, false, fuse, w, d_sk, 0, l.down_base, l.down_base);
-        if (dk != null) addTail(&dn, l.down_base, l.down_base, expertWords(w, d), l.svh_d, ey, false, fuse);
+        const dk = e.ovnKernel(l, ov.loads, false, fuse, rot, w, kn, d_sk, 0, l.down_base, l.down_base);
+        if (dk != null) addTail(&dn, l.down_base, l.down_base, expertWords(w, d), l.svh_d, ey, false, fuse, l.rot, true, d);
         const ord_d: u32 = decOrder();
         const dx: u32 = @intCast(if (ord_d == 1) d / 128 else maxu);
         const dy: u32 = @intCast(if (ord_d == 1) maxu else d / 128);
@@ -408,8 +432,8 @@ pub const Experts = struct {
     }
 };
 
-/// OvnTail (exl3_ovn.cuh) after a grouped launch's GroupedArgs, in its field order.
-fn addTail(a: *launch_.Args, tb0: u64, tb1: u64, ew: i64, svh: u64, y: u64, xrow: bool, fuse: bool) void {
+/// OvnTail (exl3_ovn.cuh) after a grouped launch's GroupedArgs, in its field order. `down`: the share is the K axis.
+fn addTail(a: *launch_.Args, tb0: u64, tb1: u64, ew: i64, svh: u64, y: u64, xrow: bool, fuse: bool, rot: Rot, down: bool, dims: usize) void {
     a.add(tb0);
     a.add(tb1);
     a.add(ew);
@@ -417,6 +441,16 @@ fn addTail(a: *launch_.Args, tb0: u64, tb1: u64, ew: i64, svh: u64, y: u64, xrow
     a.add(y);
     a.add(@as(i32, @intFromBool(xrow)));
     a.add(@as(i32, @intFromBool(fuse)));
+    a.add(@divExact(expertWords(dims, 128), 128)); // words a share column: gate, up and down all span `dims`
+    inline for (.{ rot.m, rot.r, rot.wn, rot.wx }) |v| a.add(@as(i32, @intCast(v)));
+    a.add(@as(i32, @intFromBool(down)));
+}
+
+/// TF_GLM_OVN_X3_ROTEXPERT's geometry: mcg, contiguous rows, `width` the wide share, both shares one down K split.
+fn rotChecked(l: Layer, d_sk: u32) !void {
+    const t = l.rot;
+    if (l.codebook != .mcg or l.gu_stride != 0 or t.m == 0 or t.r >= t.m or t.wx == 0 or t.wn + t.wx != l.width) return error.TileNotBuilt;
+    if (t.wn % 128 != 0 or t.wx % 128 != 0 or (plan(t.wn, l.dims, false) catch return error.TileNotBuilt) != d_sk) return error.TileNotBuilt;
 }
 
 test "the plan matches experts.py's for known shapes" {

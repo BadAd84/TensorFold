@@ -2,7 +2,8 @@
 
 const std = @import("std");
 const modelopt = @import("core").modelopt;
-const Span = @import("cuda_shard.zig").Span;
+const shard = @import("cuda_shard.zig");
+const Span = shard.Span;
 const cuda = @import("cuda");
 const experts = @import("cuda_experts.zig");
 
@@ -60,6 +61,7 @@ pub const Experts = struct {
     ub: u64 = 0,
     db: u64 = 0,
     ovn: cuda.exl3_experts.Ovn = .{}, // the TF_GLM_OVN_X3_* decode variants, read once at load
+    rot: common.Rot = .{}, // TF_GLM_OVN_X3_ROTEXPERT: per-expert share widths (gb + rot.before(e) columns' words)
 };
 
 /// TF_GLM_OVN_X3_NC (1, 2 or w), TF_GLM_OVN_X3_FUSEDOWN and TF_GLM_OVN_X3_XROW: the decode variants (unset: none).
@@ -70,12 +72,70 @@ fn ovnKnobs() !cuda.exl3_experts.Ovn {
     return .{ .loads = loads, .fuse_down = cuda.ovn.on("X3_FUSEDOWN"), .xrow = cuda.ovn.on("X3_XROW") };
 }
 
+/// TF_GLM_OVN_X3_ROTEXPERT (a numerics trade): rank r holds share (r - e mod world) mod world of expert e, the
+/// standard split's column ranges, so each rank holds the wide share of a world-th of the experts. Off: none.
+pub fn rotation(inter: usize, rank: usize, world: usize) !common.Rot {
+    if (!cuda.ovn.on("X3_ROTEXPERT")) return .{};
+    return rotationOf(inter, rank, world) catch |err| {
+        std.log.err("TF_GLM_OVN_X3_ROTEXPERT: {d} expert columns over {d} ranks split into more than one wide share", .{ inter, world });
+        return err;
+    };
+}
+
+/// rotation() with the knob on: one wide share (the split's first), the rest equal; an even split rotates nothing.
+pub fn rotationOf(inter: usize, rank: usize, world: usize) !common.Rot {
+    const wide = (try shard.span(inter, 128, 0, world)).len();
+    const narrow = (try shard.span(inter, 128, world - 1, world)).len();
+    if (wide == narrow) return .{};
+    for (1..world) |s| if ((try shard.span(inter, 128, s, world)).len() != narrow) return error.RotExpertShares;
+    return .{ .m = world, .r = rank, .wn = narrow, .wx = wide - narrow };
+}
+
+/// Expert e's columns on `rank` of `world`: the standard split's share (rank - e mod world) mod world under `rot`.
+pub fn expertCut(inter: usize, rank: usize, world: usize, e: usize, rot: common.Rot) !Span {
+    return shard.span(inter, 128, if (rot.on()) (rank + world - e % world) % world else rank, world);
+}
+
+/// The routed width a rank's kernels and buffers take: its share, or the wide share under TF_GLM_OVN_X3_ROTEXPERT.
+pub fn routedWidth(share: shard.Share, inter: usize) !usize {
+    const rot = try rotation(inter, share.rank, share.world);
+    return if (rot.on()) rot.wn + rot.wx else share.moe.len();
+}
+
+fn cutOf(inter: usize, share: shard.Share, e: usize, rot: common.Rot) !Span {
+    return if (rot.on()) expertCut(inter, share.rank, share.world, e, rot) else share.moe;
+}
+
 const tile = 128; // a 16 x 16 tile's bytes at 4 bits
 
-/// Layer `i`'s EXL3 experts through `L` (cuda_weights' loader): gate, up by `cut`'s tile columns, down by its rows.
-pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Span) !Experts {
+/// One expert's share of a K x N trellis: gate, up (`by_cols`) every tile row's tile columns of `cut`, down its rows.
+pub fn trellisShare(gpa: std.mem.Allocator, host: *std.ArrayList(u8), bytes: []const u8, k: usize, n: usize, by_cols: bool, cut: Span) !void {
+    const kt = (if (by_cols) k else cut.len()) / 16;
+    const nt = (if (by_cols) cut.len() else n) / 16;
+    if (by_cols) {
+        const row = (n / 16) * tile;
+        for (0..kt) |r| try host.appendSlice(gpa, bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
+    } else try host.appendSlice(gpa, bytes[(cut.lo / 16) * nt * tile ..][0 .. kt * nt * tile]);
+}
+
+/// The bytes trellisShare appends.
+pub fn shareBytes(k: usize, n: usize, by_cols: bool, cut: Span) usize {
+    return (if (by_cols) k else cut.len()) / 16 * ((if (by_cols) cut.len() else n) / 16) * tile;
+}
+
+/// One expert's `cut` of an fp16 scale vector, zero-padded to `pad` values (the wide share's under the rotation).
+pub fn scaleShare(gpa: std.mem.Allocator, host: *std.ArrayList(u8), bytes: []const u8, cut: Span, pad: usize) !void {
+    try host.appendSlice(gpa, bytes[cut.lo * 2 .. cut.hi * 2]);
+    try host.appendNTimes(gpa, 0, (pad - cut.len()) * 2);
+}
+
+/// Layer `i`'s EXL3 experts through `L` (cuda_weights' loader): gate, up by each expert's share's tile columns, down
+/// by its rows (`share.moe`, or cutOf's per-expert share under TF_GLM_OVN_X3_ROTEXPERT, scales padded to the widest).
+pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, share: shard.Share) !Experts {
+    const cut = share.moe;
     if (dims % 128 != 0 or cut.lo % 128 != 0 or cut.hi % 128 != 0) return error.NotExl3Mcg4;
-    const width = cut.len();
+    const rot = try rotation(inter, share.rank, share.world);
+    const pad = if (rot.on()) rot.wn + rot.wx else cut.len(); // every expert's gate/up svh and down suh row
     var out: Experts = undefined;
     out.shx = true;
     const Mat = struct { k: usize, n: usize, by_cols: bool };
@@ -86,8 +146,6 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     };
     var first_suh: ?[]const u8 = null;
     inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "gb", "ub", "db" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }) |m, proj, tw, tb, su, sv| {
-        const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
-        const nt = (if (m.by_cols) width else m.n) / 16;
         for (0..count) |e| {
             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
             if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16 or t.dim(2) != 64) return error.NotExl3Mcg4;
@@ -95,34 +153,32 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
             if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
                 std.mem.readInt(u32, marker.bytes[0..4], .little) != @import("core").exl3_load.markers[0].value)
                 return error.NotExl3Mcg4;
-            if (m.by_cols) { // every tile row, the rank's tile columns
-                const row = (m.n / 16) * tile;
-                for (0..kt) |r| try L.host.appendSlice(L.gpa, t.bytes[r * row + (cut.lo / 16) * tile ..][0 .. nt * tile]);
-            } else try L.host.appendSlice(L.gpa, t.bytes[(cut.lo / 16) * nt * tile ..][0 .. kt * nt * tile]); // its tile rows
+            try trellisShare(L.gpa, &L.host, t.bytes, m.k, m.n, m.by_cols, try cutOf(inter, share, e, rot));
         }
         const base = try L.put("layers.{d}.moe.exl3." ++ tw, .{i});
         @field(out, tb) = base;
+        var at: u64 = base;
         for (0..count) |e| {
-            const ptr = base + e * kt * nt * tile;
+            const ptr = at;
+            at += shareBytes(m.k, m.n, m.by_cols, try cutOf(inter, share, e, rot));
             try L.host.appendSlice(L.gpa, std.mem.asBytes(&ptr));
         }
         @field(out, tw) = try L.put("layers.{d}.moe.exl3." ++ tw ++ "_ptrs", .{i});
-        for (0..count) |e| { // suh: the input's scales (gate, up: every input; down: the rank's)
+        for (0..count) |e| { // suh: the input's scales (gate, up: every input; down: the expert's share)
             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".suh", .{ i, e });
             if (t.dtype != .f16 or t.numel() != m.k) return error.NotExl3Mcg4;
-            const mine = if (m.by_cols) t.bytes else t.bytes[cut.lo * 2 .. cut.hi * 2];
             if (m.by_cols) { // one rotation shared by the layer's every gate and up input?
-                if (first_suh) |f| (if (!std.mem.eql(u8, f, mine)) {
+                if (first_suh) |f| (if (!std.mem.eql(u8, f, t.bytes)) {
                     out.shx = false;
-                }) else first_suh = mine;
-            }
-            try L.host.appendSlice(L.gpa, mine);
+                }) else first_suh = t.bytes;
+                try L.host.appendSlice(L.gpa, t.bytes);
+            } else try scaleShare(L.gpa, &L.host, t.bytes, try cutOf(inter, share, e, rot), pad);
         }
         @field(out, su) = try L.put("layers.{d}.moe.exl3." ++ su, .{i});
-        for (0..count) |e| { // svh: the output's scales (gate, up: the rank's; down: every output)
+        for (0..count) |e| { // svh: the output's scales (gate, up: the expert's share; down: every output)
             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".svh", .{ i, e });
             if (t.dtype != .f16 or t.numel() != m.n) return error.NotExl3Mcg4;
-            try L.host.appendSlice(L.gpa, if (m.by_cols) t.bytes[cut.lo * 2 .. cut.hi * 2] else t.bytes);
+            if (m.by_cols) try scaleShare(L.gpa, &L.host, t.bytes, try cutOf(inter, share, e, rot), pad) else try L.host.appendSlice(L.gpa, t.bytes);
         }
         @field(out, sv) = try L.put("layers.{d}.moe.exl3." ++ sv, .{i});
     }
@@ -132,6 +188,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     }
     out.k2 = try L.put("layers.{d}.moe.exl3.k2", .{i});
     out.ovn = try ovnKnobs();
+    out.rot = rot;
     return out;
 }
 
@@ -144,7 +201,7 @@ pub const top_k = 8;
 /// (cuda_state.prefill_rows) runs as one call, where two calls of half a chunk would read every expert twice.
 pub const chunk_rows = @import("cuda_state.zig").prefill_rows;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx, .gate_base = w.gb, .up_base = w.ub, .down_base = w.db };
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx, .gate_base = w.gb, .up_base = w.ub, .down_base = w.db, .rot = w.rot };
 }
 fn shape(dims: usize, width: usize) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
@@ -155,7 +212,7 @@ fn picksBytes(rows: usize) usize {
     const cap: usize = @min(rows, chunk_rows);
     return std.mem.alignForward(usize, cap * top_k * 4, 256);
 }
-/// The prompt path's TF_GLM_OVN_* switches (EY_DIRECT, X3_PROMPT_K64, X3_PROMPT_ORDER, X3_YBF16); all off by default.
+/// The prompt path's TF_GLM_OVN_* switches (EY_DIRECT, X3_PROMPT_K64, _ORDER, X3_YBF16, X3_ROTEXPERT); all off.
 pub const Ovn = common.prompt.Ovn;
 /// `o`: the switches the kernels run with (Kernels' `prompt.ovn`; Ovn.fromEnv() before they load).
 pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, o: Ovn) [4]usize {
@@ -187,7 +244,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     var at: usize = 0;
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
-        if (!prompt and w.ovn.any()) {
+        if (!prompt and (w.ovn.any() or w.rot.on())) { // TF_GLM_OVN_X3_ROTEXPERT runs only the variants' kernels
             try decodeOvn(k, stream, l, w.ovn, sc.picks, arena, cap, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, ey + at * slots * dims * 4);
             continue;
         }
@@ -250,4 +307,62 @@ test "a chunk's compacted picks end before the common scratch at every row count
 
 test "GLM's routed experts run on the common EXL3 module's kernels" {
     try std.testing.expect(Kernels == cuda.exl3_experts.Experts);
+}
+
+test "TF_GLM_OVN_X3_ROTEXPERT at TP=3: each expert's three shares are the standard ones, rank r wide where e mod 3 == r" {
+    const t = std.testing;
+    const inter = 2048;
+    var held: [3]usize = @splat(0);
+    for (0..3) |r| {
+        const rot = try rotationOf(inter, r, 3);
+        try t.expectEqual(common.Rot{ .m = 3, .r = r, .wn = 640, .wx = 128 }, rot);
+        var at: usize = 0; // the loader's back-to-back layout, as the kernels address it (rot.before)
+        for (0..288) |e| {
+            const c = try expertCut(inter, r, 3, e, rot);
+            try t.expectEqual(c, try shard.span(inter, 128, (r + 3 - e % 3) % 3, 3)); // the unrotated rank's share
+            try t.expectEqual(rot.cols(e), c.len());
+            try t.expectEqual((e % 3 == r), c.len() == 768);
+            try t.expectEqual(at, rot.before(e));
+            at += c.len();
+        }
+        held[r] = at;
+    }
+    for (0..288) |e| { // the three ranks' shares of an expert cover its 16 blocks once
+        var covered: [16]u8 = @splat(0);
+        for (0..3) |r| {
+            const c = try expertCut(inter, r, 3, e, try rotationOf(inter, r, 3));
+            for (c.lo / 128..c.hi / 128) |b| covered[b] += 1;
+        }
+        for (covered) |n| try t.expectEqual(@as(u8, 1), n);
+    }
+    try t.expectEqual([3]usize{ 196608, 196608, 196608 }, held); // 96 x 768 + 192 x 640; unrotated 288 x 768 on rank 0
+    try t.expectEqual(common.Rot{}, try rotationOf(inter, 1, 2)); // even splits: nothing to spread
+    try t.expectEqual(common.Rot{}, try rotationOf(inter, 3, 4));
+    try t.expectEqual(common.Rot{}, try rotationOf(inter, 0, 1));
+    try t.expectError(error.RotExpertShares, rotationOf(inter, 0, 6)); // 3/3/3/3/2/2 blocks: four wide shares
+    try t.expectEqual(try shard.span(inter, 128, 1, 3), try expertCut(inter, 1, 3, 5, .{})); // off: the rank's share
+}
+
+test "an expert's share of a trellis and of its scales is the plain loader's bytes; scales zero-padded to the widest" {
+    const t = std.testing;
+    const gpa = t.allocator;
+    var src: [2 * 16 * tile]u8 = undefined; // gate/up: K 32, N 256 (2 x 16 tiles); down: K 256, N 32 (16 x 2 tiles)
+    for (&src, 0..) |*b, j| b.* = @truncate(j *% 7 +% j / 251);
+    const cut: Span = .{ .lo = 128, .hi = 256 };
+    var host: std.ArrayList(u8) = .empty;
+    defer host.deinit(gpa);
+    try trellisShare(gpa, &host, &src, 32, 256, true, cut);
+    try t.expectEqual(shareBytes(32, 256, true, cut), host.items.len);
+    for (0..2) |r| try t.expectEqualSlices(u8, src[r * 16 * tile + 8 * tile ..][0 .. 8 * tile], host.items[r * 8 * tile ..][0 .. 8 * tile]);
+    host.clearRetainingCapacity();
+    try trellisShare(gpa, &host, &src, 256, 32, false, cut);
+    try t.expectEqual(shareBytes(256, 32, false, cut), host.items.len);
+    try t.expectEqualSlices(u8, src[8 * 2 * tile ..][0 .. 8 * 2 * tile], host.items);
+    host.clearRetainingCapacity();
+    try scaleShare(gpa, &host, src[0..512], cut, 256);
+    try t.expectEqualSlices(u8, src[256..512], host.items[0..256]);
+    try t.expect(std.mem.allEqual(u8, host.items[256..512], 0));
+    host.clearRetainingCapacity();
+    try scaleShare(gpa, &host, src[0..512], cut, cut.len()); // off: no padding
+    try t.expectEqualSlices(u8, src[256..512], host.items);
 }

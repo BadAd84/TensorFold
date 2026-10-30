@@ -17,15 +17,16 @@ pub const Ovn = struct {
     k64: u8 = 0, // X3_PROMPT_K64: 1 ots0106's 64-k stages, 2 plus ots0127's hoisted addressing and scales
     order: bool = false, // X3_PROMPT_ORDER: production's item order (single- and multi-item experts interleaved)
     ybf16: bool = false, // X3_YBF16, a numerics trade: the down kernel's slot rows in bf16
+    rot: bool = false, // X3_ROTEXPERT (a numerics trade): a layer's per-expert shares (Layer.rot) run the switched kernels
 
     pub fn fromEnv() !Ovn {
         const k64 = try knob.int("X3_PROMPT_K64", 0);
         if (k64 > 2) return error.BadOvnKnob;
-        return .{ .ey_direct = knob.on("EY_DIRECT"), .k64 = @intCast(k64), .order = knob.on("X3_PROMPT_ORDER"), .ybf16 = knob.on("X3_YBF16") };
+        return .{ .ey_direct = knob.on("EY_DIRECT"), .k64 = @intCast(k64), .order = knob.on("X3_PROMPT_ORDER"), .ybf16 = knob.on("X3_YBF16"), .rot = knob.on("X3_ROTEXPERT") };
     }
 
     fn any(o: Ovn) bool {
-        return o.ey_direct or o.k64 != 0 or o.order or o.ybf16;
+        return o.ey_direct or o.k64 != 0 or o.order or o.ybf16 or o.rot;
     }
 };
 
@@ -122,6 +123,7 @@ pub const Kernels = struct {
         }
         const items = grouped.maxItems(pairs, l.experts, tile);
         if (k.extra) |xk| return k.switched(xk, s, l, sc, p, out, items);
+        if (l.rot.on()) return error.Exl3Shape; // per-expert shares (TF_GLM_OVN_X3_ROTEXPERT) run only the switched kernels
         if (out.y != sc.y or out.slots != sc.slots) return error.Exl3Shape; // other rows than the scratch's: EY_DIRECT
         try go(k.gateup, s, .{ l.width / 128, items, 1 }, 256, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode });
         try go(k.down, s, .{ l.dims / 256, items, 1 }, 256, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, sc.y, i(l.width), i(l.dims), i(sc.slots) });
@@ -134,7 +136,8 @@ pub const Kernels = struct {
         if (o.order) try go(xk.order, s, .{ 1, 1, 1 }, 1024, .{ p.items, p.counts, sc.order, i(items), i(l.experts) });
         const order: u64 = if (o.order) sc.order else 0;
         const shared: u32 = if (o.k64 != 0) k64_shared else 0;
-        try goShared(xk.gateup, s, .{ l.width / 128, items, 1 }, 256, shared, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, order });
-        try goShared(xk.down, s, .{ l.dims / 256, items, 1 }, 256, shared, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, out.y, i(l.width), i(l.dims), i(sc.slots), i(out.slots), @as(i32, @intFromBool(o.ybf16)), order });
+        const rot = l.rot; // TF_GLM_OVN_X3_ROTEXPERT, the kernels' last four arguments (m 0: off)
+        try goShared(xk.gateup, s, .{ l.width / 128, items, 1 }, 256, shared, .{ sc.xg, sc.xu, l.gate, l.up, p.items, p.counts, p.members, l.svh_g, l.svh_u, l.suh_d, sc.xd, i(l.dims), i(l.width), i(if (l.shared_input) sc.slots else 1), l.limit, l.act_mode, order, i(rot.m), i(rot.r), i(rot.wn), i(rot.wx) });
+        try goShared(xk.down, s, .{ l.dims / 256, items, 1 }, 256, shared, .{ sc.xd, l.down, p.items, p.counts, p.members, l.svh_d, out.y, i(l.width), i(l.dims), i(sc.slots), i(out.slots), @as(i32, @intFromBool(o.ybf16)), order, i(rot.m), i(rot.r), i(rot.wn), i(rot.wx) });
     }
 };

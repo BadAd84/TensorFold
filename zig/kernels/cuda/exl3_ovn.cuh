@@ -13,12 +13,36 @@ struct OvnTail {
     float* y; // fp32 [P, N], the fused down epilogue's slot rows
     int xrow; // X holds one rotated row a token: pair p reads row p / slots (TF_GLM_OVN_X3_XROW)
     int fuse; // the down launch writes y through tf_exl3_down_combine's per-slot arithmetic, no Z
+    long long rcw; // 32-bit words a share column (TF_GLM_OVN_X3_ROTEXPERT: expert e at tb + rcw * rot_before(e))
+    int rm, rr; // the experts e with e % rm == rr hold the wide share here (rm 0: every expert alike, `n` or `k`)
+    int rwn, rwx; // a narrow share's columns; the wide share has rwx more
+    int rk; // 1: the share is the K axis (down), 0: the N axis (gate and up)
 };
 
 struct OvnArgs {
     GroupedArgs g;
     OvnTail t;
 };
+
+// TF_GLM_OVN_X3_ROTEXPERT: expert e's share columns (exl3_experts.zig Rot.cols); `full` when off.
+__device__ __forceinline__ int rot_share(int e, int full, int m, int r, int wn, int wx) {
+    return m ? wn + (e % m == r ? wx : 0) : full;
+}
+__device__ __forceinline__ int rot_cols(const OvnTail& t, int e, int full) { return rot_share(e, full, t.rm, t.rr, t.rwn, t.rwx); }
+// Share columns of the experts before e laid back to back by the loader (exl3_experts.zig Rot.before).
+__device__ __forceinline__ long long rot_before(const OvnTail& t, int e) {
+    return (long long)e * t.rwn + (long long)t.rwx * ((e + t.rm - 1 - t.rr) / t.rm);
+}
+
+// A narrow share's missing column block of gate/up: zero partials for its members, so the epilogue reads zeros.
+template <int NT>
+__device__ __forceinline__ void rot_zero(const GroupedArgs& a, const int* rows_sh, int mat, int split, int nt0) {
+    for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += blockDim.x) {
+        const int row = idx / (NT * 16), col = idx % (NT * 16);
+        const int r = rows_sh[row];
+        if (r >= 0) a.z[(((size_t)mat * a.sk + split) * a.p + r) * a.n + nt0 * 16 + col] = 0.f;
+    }
+}
 
 // 16 bytes of trellis words through the read-only path without L1 allocation (exl3.cu ldg_nc_v4).
 __device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
@@ -103,9 +127,6 @@ __device__ __forceinline__ void nc_body(const OvnArgs o, int u, int nblock, int 
     const int mat = zz / MT / a.sk;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
-    const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4);
-    const int per_warp = (a.k >> 4) / a.sk / W;
-    const int kt0 = split * (per_warp * W) + warp * per_warp;
     const int nt0 = nblock * NT;
     const int total = a.ucount[0];
     const int e = a.uids[u];
@@ -113,19 +134,27 @@ __device__ __forceinline__ void nc_body(const OvnArgs o, int u, int nblock, int 
     const int m = mtile * 16 + (int)threadIdx.x;
     if (threadIdx.x < 16 && m < a.maxm) code = a.members[u * a.maxm + m];
     if (u >= total) return;
+    const int ncols = o.t.rm && !o.t.rk ? rot_cols(o.t, e, a.n) : a.n; // TF_GLM_OVN_X3_ROTEXPERT: this expert's share
+    const int NTILES = a.ns > 0 ? a.ns : (ncols >> 4);
+    const int per_warp = ((o.t.rm && o.t.rk ? rot_cols(o.t, e, a.k) : a.k) >> 4) / a.sk / W;
+    const int kt0 = split * (per_warp * W) + warp * per_warp;
+    const bool past = nt0 * 16 >= ncols; // a narrow share has no such column block: zeros, and no loads
     const size_t kstep = (size_t)NTILES * TW;
-    const uint32_t* tbase = (mat ? o.t.tb1 : o.t.tb0) + (size_t)e * o.t.ew + (size_t)kt0 * kstep + (size_t)nt0 * TW;
+    const size_t at = o.t.rm ? (size_t)rot_before(o.t, e) * o.t.rcw : (size_t)e * o.t.ew;
+    const uint32_t* tbase = (mat ? o.t.tb1 : o.t.tb0) + at + (size_t)kt0 * kstep + (size_t)nt0 * TW;
     uint4 rv[PD][NV];
+    if (!past)
 #pragma unroll
-    for (int d = 0; d < PD; ++d)
+        for (int d = 0; d < PD; ++d)
 #pragma unroll
-        for (int v = 0; v < NV; ++v) rv[d][v] = ldg_nc_v4(tbase + d * kstep + 128 * v + 4 * lane);
+            for (int v = 0; v < NV; ++v) rv[d][v] = ldg_nc_v4(tbase + d * kstep + 128 * v + 4 * lane);
 
     __shared__ int rows_sh[16];
     __shared__ __align__(16) float red[W][16][NT * 16];
     if (threadIdx.x < 16) rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
     __syncthreads();
     if (rows_sh[0] < 0) return; // members come first, so this tile is empty
+    if (past) return rot_zero<NT>(a, rows_sh, mat, split, nt0);
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const int xr0 = r0 < 0 ? 0 : (o.t.xrow ? r0 / a.slots : r0), xr1 = r1 < 0 ? 0 : (o.t.xrow ? r1 / a.slots : r1);
     const half* X = mat ? a.x1 : a.x0;
