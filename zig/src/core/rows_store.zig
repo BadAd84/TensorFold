@@ -34,6 +34,9 @@ pub const Image = struct {
     scatter: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, in: []const u8) anyerror!void,
     /// Whether `saved`'s image can still be read whole (null: always).
     whole: ?*const fn (ptr: *anyopaque, saved: pc.Saved) bool = null,
+    /// TF_GLM_OVN_DISK_CARRY's replay: from each image's first `canon_head` bytes, the stored bytes fresh ones answer.
+    canon: ?*const fn (ptr: *anyopaque, at: u32, stored: []const u8, fresh: []const u8, out: *std.ArrayList(image.Match), a: Allocator) anyerror!void = null,
+    canon_head: u32 = 0, // the leading bytes `canon` reads of a stored and a fresh image (a family's words)
 };
 
 /// A state on disk: its name and position, what it read, its file's bytes and its blocks' (each counted whole).

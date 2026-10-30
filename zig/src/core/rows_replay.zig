@@ -5,6 +5,7 @@ const pc = @import("prompt_cache.zig");
 const chain = @import("rows_chain.zig");
 const file = @import("lanes").rows_file;
 const compare = @import("lanes").carry_compare;
+const image = @import("lanes").rows_image;
 const rows_store = @import("rows_store.zig");
 const prefetch = @import("rows_prefetch.zig");
 const local = @import("rows_local.zig");
@@ -124,7 +125,7 @@ fn one(view: *Rows, s: *const State, e: Engine) !struct { prefilled: bool, resul
     }
     const saved = try e.fresh(e.ctx, s.tokens, s.at);
     defer view.family.vtable.drop(view.family.ptr, saved);
-    const here = try mine(view, &plan, saved);
+    const here = try mine(view, &plan, saved, s.at);
     if (here != .same) return .{ .prefilled = true, .result = result(0, here) };
     const others = e.others orelse return .{ .prefilled = true, .result = .same };
     const files = try view.gpa.alloc(local.File, plan.pieces.len);
@@ -151,8 +152,8 @@ fn result(rank: usize, c: compare.Compare) Result {
     };
 }
 
-/// Rank 0's files of the plan against the fresh state's image, as the store gathers it, one file after another.
-fn mine(view: *Rows, plan: *const prefetch.Plan, saved: pc.Saved) !compare.Compare {
+/// Rank 0's files of the plan against the fresh state's image, as the store gathers it and its family matches them.
+fn mine(view: *Rows, plan: *const prefetch.Plan, saved: pc.Saved, at: u32) !compare.Compare {
     var most_bytes: u64 = 0;
     for (plan.pieces) |p| most_bytes = @max(most_bytes, p.len);
     const stage = try view.staged(most_bytes);
@@ -160,19 +161,38 @@ fn mine(view: *Rows, plan: *const prefetch.Plan, saved: pc.Saved) !compare.Compa
     defer view.gpa.free(buf);
     var g: Gather = .{ .view = view, .saved = saved };
     const fresh: compare.Fresh = .{ .ctx = &g, .gather = Gather.gather };
+    var ms: std.ArrayList(image.Match) = .empty;
+    defer ms.deinit(view.gpa);
+    const matched = if (view.img.canon != null) (try matches(view, plan, saved, at, stage, &ms)) orelse return .unreadable else null;
     for (plan.pieces) |p| {
         var pb: [1200]u8 = undefined;
-        const c = try compare.same(try path(&pb, view, p), p.kind, p.name, view.keying.block, p.at, plan.rangesOf(p), stage, buf, fresh);
+        const c = try compare.same(view.gpa, try path(&pb, view, p), p.kind, p.name, view.keying.block, p.at, plan.rangesOf(p), matched, stage, buf, fresh);
         if (c != .same) return c;
     }
     return .same;
+}
+
+/// The family's matches of the stored state to the fresh one (Image.canon), from both images' heads; null: unread.
+fn matches(view: *Rows, plan: *const prefetch.Plan, saved: pc.Saved, at: u32, stage: file.Stage, out: *std.ArrayList(image.Match)) !?[]const image.Match {
+    const head = view.img.canon_head;
+    const both = try view.gpa.alloc(u8, 2 * @as(usize, head));
+    defer view.gpa.free(both);
+    const held = for (plan.pieces) |p| {
+        var pb: [1200]u8 = undefined;
+        if (try compare.storedBytes(try path(&pb, view, p), p.kind, p.name, view.keying.block, p.at, plan.rangesOf(p), 0, stage, both[0..head])) break true;
+    } else false;
+    if (!held) return null;
+    try view.img.gather(view.family.ptr, saved, &.{.{ .off = 0, .len = head }}, both[head..]);
+    try view.img.canon.?(view.family.ptr, at, both[0..head], both[head..], out, view.gpa);
+    compare.order(out.items);
+    return out.items;
 }
 
 const Gather = struct {
     view: *Rows,
     saved: pc.Saved,
 
-    fn gather(ctx: *anyopaque, ranges: []const @import("lanes").rows_image.Range, out: []u8) anyerror!void {
+    fn gather(ctx: *anyopaque, ranges: []const image.Range, out: []u8) anyerror!void {
         const g: *Gather = @ptrCast(@alignCast(ctx));
         try g.view.img.gather(g.view.family.ptr, g.saved, ranges, out);
     }
@@ -184,6 +204,7 @@ fn path(buf: []u8, view: *const Rows, p: prefetch.Piece) ![:0]const u8 {
 
 test {
     _ = @import("rows_replay_test.zig");
+    _ = @import("rows_replay_canon_test.zig");
 }
 
 test "rows_carry replay order: the newest file first, the longest among equals, then by name" {

@@ -108,7 +108,7 @@ const Rank = struct {
             const buf = try gpa.alloc(u8, @intCast(n));
             defer gpa.free(buf);
             var pb: [600]u8 = undefined;
-            const c = try compare.same(try k.path(&pb, dir, f), f.kind, f.name, rows.block_tokens, if (f.kind == .state) at else 0, rs.items, stage, buf, .{ .ctx = &g, .gather = Gather.gather });
+            const c = try compare.same(gpa, try k.path(&pb, dir, f), f.kind, f.name, rows.block_tokens, if (f.kind == .state) at else 0, rs.items, null, stage, buf, .{ .ctx = &g, .gather = Gather.gather });
             if (c != .same) return c;
         }
         return .same;

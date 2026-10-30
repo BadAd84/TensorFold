@@ -14,7 +14,7 @@ const Engine = glm.engine.Engine;
 const Kept = glm.engine.Kept;
 const Allocator = std.mem.Allocator;
 
-pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole };
+pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blank, .scatter = scatter, .whole = whole, .canon = canon, .canon_head = img.Words.bytes };
 
 /// Every rank's prefix bytes, read at attach (one GLM engine a process; rank 0 alone serves).
 var prefix_buf: [8]u64 = undefined;
@@ -35,6 +35,25 @@ fn parts(ptr: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allo
     defer list.deinit(a);
     try img.storeParts(try ranks.shape(engineOf(ptr)), store_pre, at, &list, a);
     for (list.items) |p| try out.append(a, .{ .bytes = p.bytes, .row = p.row, .per = p.per });
+}
+
+/// TF_GLM_OVN_DISK_CARRY's replay: rank 0's image by its words, then each other rank's prefix as rank 0's if as long.
+fn canon(ptr: *anyopaque, at: u32, stored: []const u8, fresh: []const u8, out: *std.ArrayList(rows.image.Match), a: Allocator) anyerror!void {
+    const sh = try ranks.shape(engineOf(ptr));
+    const s = try img.Words.decode(wordsIn(stored), at);
+    const f = try img.Words.decode(wordsIn(fresh), at);
+    try img.canon(sh, at, s, f, out, a);
+    var off = img.imageBytes(sh, at);
+    for (store_pre[1..]) |p| { // a prefix of another length lays its fields out otherwise: every byte, in place
+        if (p == sh.prefix) try img.prefix(sh, off, s.cur, f.cur, out, a) else try out.append(a, .{ .off = off, .len = p, .fresh = off });
+        off += p;
+    }
+}
+
+fn wordsIn(head: []const u8) [6]u64 {
+    var x: [6]u64 = undefined;
+    @memcpy(std.mem.sliceAsBytes(&x), head[0..img.Words.bytes]);
+    return x;
 }
 
 /// The other ranks asleep before a disk call go back to sleep after it (their lines, not NCCL, wait meanwhile).

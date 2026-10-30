@@ -13,6 +13,9 @@ pub const Part = struct {
 /// `len` bytes at `off` of an image.
 pub const Range = struct { off: u64, len: u64 };
 
+/// Stored image bytes [off, off + len) that answer a fresh image's from `fresh` (equal states may place them apart).
+pub const Match = struct { off: u64, len: u64, fresh: u64 };
+
 /// Where a group's whole blocks of `block` tokens lie for a state at `at`: blocks [first, end).
 pub const Span = struct { first: u32, end: u32 };
 

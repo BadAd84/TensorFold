@@ -52,6 +52,9 @@ pub const Shape = struct {
     pooled_row: u32,
     capacity: u32,
     head: bool, // the MTP head's caches are kept (drafting)
+    kda: Kda = .{}, // the prefix's fields a state holds (canon): the rest is a decode window's scratch and padding
+    hidden: u64 = 0, // the tail's first-draft row: its offset in the tail
+    hidden_len: u64 = 0,
 
     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
         if (st.rings.len == 0) return error.SnapshotShape;
@@ -60,6 +63,7 @@ pub const Shape = struct {
         const end = if (st.table != 0) st.table else base + st.arena.buf.len;
         if (first < base or st.mtp_pos_dev < first or end < st.mtp_pos_dev) return error.SnapshotShape;
         const fp8 = st.mtp_caches.ls != 0;
+        const kda: Kda = .{ .pos = st.pos_dev -% base, .conv = st.conv -% base, .conv_len = st.kda_layers * 3 * st.conv_c * 2, .rec = st.rec -% base, .rec_layer = st.rec_layer, .layers = @intCast(st.kda_layers) };
         return .{
             .prefix = first - base,
             .tail = end - st.mtp_pos_dev,
@@ -72,6 +76,9 @@ pub const Shape = struct {
             .pooled_row = @intCast(sparse.pooledRow(c.i_dim)),
             .capacity = @intCast(capacity),
             .head = head,
+            .kda = kda,
+            .hidden = st.prompt_hidden -% st.mtp_pos_dev,
+            .hidden_len = c.hidden * 2,
         };
     }
 
@@ -90,6 +97,68 @@ fn cache(sh: Shape, n: u64) [5]u64 {
         @min(n, sh.ring_rows) * sh.ring_row,
         @min(n / sparse.pool + 2, sh.pk_rows) * sh.pooled_row,
     };
+}
+
+/// A prefix's fields a state holds: its position word, the conv states, and both copies of each KDA layer's state.
+pub const Kda = struct { pos: u64 = 0, conv: u64 = 0, conv_len: u64 = 0, rec: u64 = 0, rec_layer: u64 = 0, layers: u32 = 0 };
+
+const Match = @import("lanes").rows_image.Match;
+
+/// TF_GLM_OVN_DISK_CARRY's replay: which bytes of a stored image at `at` (words `s`) answer a fresh one's (`f`).
+pub fn canon(sh: Shape, at: u32, s: Words, f: Words, out: *std.ArrayList(Match), a: std.mem.Allocator) !void {
+    if (sh.tail < 4 or sh.hidden + sh.hidden_len > sh.tail) return error.SnapshotShape;
+    for ([_]Words{ s, f }) |w| {
+        if (!holds(w.base, at, @min(at, sh.ring_rows))) return error.DiskWords;
+        if (sh.head and (w.mtp_len > sh.headRows(at) or !holds(w.mtp_base, w.mtp_len, @min(w.mtp_len, sh.ring_rows)))) return error.DiskWords;
+    }
+    // the words' format, position and head rows; the ring bases and KDA copy bits only say where a state's bytes sit
+    try same(0, 24, out, a);
+    if (s.mtp_len != f.mtp_len) return; // another head: its rows word differs, and nothing past it lines up
+    try prefix(sh, Words.bytes, s.cur, f.cur, out, a);
+    var img: u64 = Words.bytes + sh.prefix;
+    for (0..sh.layers) |_| img = try cacheMatches(sh, img, cache(sh, at), at, s.base, f.base, out, a);
+    if (sh.head) img = try cacheMatches(sh, img, cache(sh, sh.headRows(at)), s.mtp_len, s.mtp_base, f.mtp_base, out, a);
+    try same(img, 4, out, a); // the head's position word
+    try same(img + sh.hidden, sh.hidden_len, out, a); // the first-draft row; the rest of the tail is padding
+}
+
+/// A prefix at image offset `img` (rank 0's, or another rank's in the store): its fields, each KDA layer's live copy.
+pub fn prefix(sh: Shape, img: u64, s_cur: u64, f_cur: u64, out: *std.ArrayList(Match), a: std.mem.Allocator) !void {
+    const k = sh.kda;
+    if (k.layers > 64 or k.pos + 4 > sh.prefix or k.conv + k.conv_len > sh.prefix or k.rec + 2 * k.layers * k.rec_layer > sh.prefix) return error.SnapshotShape;
+    try same(img + k.pos, 4, out, a);
+    try same(img + k.conv, k.conv_len, out, a);
+    // the live copy is the one a layer's last pass wrote (cuda_forward: state_out is the other, then `cur` flips to it)
+    for (0..k.layers) |li| {
+        const sb = (s_cur >> @intCast(li)) & 1;
+        const fb = (f_cur >> @intCast(li)) & 1;
+        try out.append(a, .{ .off = img + k.rec + (sb * k.layers + li) * k.rec_layer, .len = k.rec_layer, .fresh = img + k.rec + (fb * k.layers + li) * k.rec_layer });
+    }
+}
+
+/// One cache at `img` (parts `size`) holding `n` rows: rows by position, the rings' rows both hold, completed pools.
+fn cacheMatches(sh: Shape, img: u64, size: [5]u64, n: u64, s_base: u64, f_base: u64, out: *std.ArrayList(Match), a: std.mem.Allocator) !u64 {
+    try same(img, n * sh.latent, out, a);
+    try same(img + size[0], if (sh.scales) n * 4 else 0, out, a);
+    // a ring keeps position p at row p - base (State.setBases); a rebase drops only rows no later read takes
+    const lo = @max(s_base, f_base);
+    var ring = img + size[0] + size[1];
+    for (0..2) |_| {
+        if (lo < n) try out.append(a, .{ .off = ring + (lo - s_base) * sh.ring_row, .len = (n - lo) * sh.ring_row, .fresh = ring + (lo - f_base) * sh.ring_row });
+        ring += size[2];
+    }
+    try same(ring, n / sparse.pool * sh.pooled_row, out, a); // pool_keys writes completed pools alone, none past them
+    return ring + size[4];
+}
+
+/// Whether a ring based at `base` holds positions [base, n) within its `rows` rows.
+fn holds(base: u64, n: u64, rows: u64) bool {
+    return base <= n and n - base <= rows;
+}
+
+/// `len` bytes at `off` answered at the same place.
+fn same(off: u64, len: u64, out: *std.ArrayList(Match), a: std.mem.Allocator) !void {
+    if (len > 0) try out.append(a, .{ .off = off, .len = len, .fresh = off });
 }
 
 /// The image at `at` (any row, as layout.Plan keeps it): words, prefix, each DSA layer's rows, the head, the tail.
@@ -248,4 +317,5 @@ pub const Copy = struct {
 
 test {
     _ = @import("cuda_disk_image_test.zig");
+    _ = @import("cuda_disk_canon_test.zig");
 }

@@ -61,15 +61,21 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
     try gather(l, e, compare.word(c), out[0..e.share.world]);
 }
 
-/// This rank's part of `files` in `dir` (its own names) against its own image of kept state `id` at `at`.
+/// This rank's part of `files` in `dir` against its own image of kept state `id` at `at`, as image.canon matches them.
 fn mine(e: *Engine, dir: []const u8, id: u64, at: u32, block: u32, files: []const File) !compare.Compare {
     const parts = try part.layout(e, at, e.gpa);
     defer e.gpa.free(parts);
     var segs: std.ArrayList(image.Seg) = .empty;
     defer segs.deinit(e.gpa);
     var w: [6]u64 = undefined;
-    var g: Fresh = .{ .copy = try ranks.copier(e, id, image.imageBytes(try ranks.shape(e), at), &segs, &w) };
+    const sh = try ranks.shape(e);
+    var g: Fresh = .{ .copy = try ranks.copier(e, id, image.imageBytes(sh, at), &segs, &w) };
     const rank: u32 = @intCast(e.share.rank);
+    const stored = (try storedWords(e, dir, rank, at, block, parts, files)) orelse return .unreadable;
+    var ms: std.ArrayList(rimg.Match) = .empty;
+    defer ms.deinit(e.gpa);
+    try image.canon(sh, at, stored, try ranks.wordsOf(e, id), &ms, e.gpa);
+    compare.order(ms.items);
     for (files) |f| {
         var rs: std.ArrayList(rimg.Range) = .empty;
         defer rs.deinit(e.gpa);
@@ -81,10 +87,27 @@ fn mine(e: *Engine, dir: []const u8, id: u64, at: u32, block: u32, files: []cons
         defer e.gpa.free(buf);
         var pb: [1200]u8 = undefined;
         const path = try part.pathIn(&pb, dir, rank, .{ .stem = f.name[0..16].*, .kind = f.kind }, false);
-        const c = try compare.same(path, f.kind, f.name, block, if (f.kind == .state) at else 0, rs.items, stage, buf, .{ .ctx = &g, .gather = Fresh.gather });
+        const c = try compare.same(e.gpa, path, f.kind, f.name, block, if (f.kind == .state) at else 0, rs.items, ms.items, stage, buf, .{ .ctx = &g, .gather = Fresh.gather });
         if (c != .same) return c;
     }
     return .same;
+}
+
+/// The words this rank's own file of `files` leads with (part.ranges), or null when it cannot be read.
+fn storedWords(e: *Engine, dir: []const u8, rank: u32, at: u32, block: u32, parts: []const rimg.Part, files: []const File) !?image.Words {
+    for (files) |f| if (f.kind == .state) {
+        var rs: std.ArrayList(rimg.Range) = .empty;
+        defer rs.deinit(e.gpa);
+        try part.ranges(parts, at, block, f, &rs, e.gpa);
+        const stage = try file.stage(e.gpa, rimg.total(rs.items));
+        defer e.gpa.free(stage);
+        var pb: [1200]u8 = undefined;
+        const path = try part.pathIn(&pb, dir, rank, .{ .stem = f.name[0..16].*, .kind = f.kind }, false);
+        var x: [6]u64 = undefined;
+        if (!try compare.storedBytes(path, f.kind, f.name, block, at, rs.items, 0, stage, std.mem.sliceAsBytes(&x))) return null;
+        return image.Words.decode(x, at) catch null;
+    };
+    return null;
 }
 
 /// This rank's image of the fresh state, ranges of it copied out as a part's save copies them.
