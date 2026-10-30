@@ -71,7 +71,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
         for ([_]u32{ paged_slot, twin_slot }, 0..) |slot, j| {
             try x.bind(slot);
             if (slot == paged_slot) try x.beginOn(null, held) else try x.begin(null);
-            first[j] = try x.prefill(ids, null, null, null);
+            first[j] = try x.prefill(ids, null, null);
             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
             try x.draft(true, &.{first[j]}, 2, &drafts[j]);
         }
