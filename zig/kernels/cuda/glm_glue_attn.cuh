@@ -45,16 +45,17 @@ __device__ __forceinline__ int wide(int row, int u) { return row * LW + ((u ^ (r
 // p's [32][32] rows (64 bytes): unit u of row r.
 __device__ __forceinline__ int narrow(int row, int u) { return row * KT + ((u ^ ((row >> 1) & 3)) << 3); }
 
-// latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads, chunk), 8 warps: online softmax by 32 keys.
+// latent._dense_chunks/_sparse_chunks (sparse 0/1), block (row, HB heads) on chunk c, 8 warps: online softmax, 32 keys.
 template <int HB>
 constexpr int wide_smem() {
   return (HB * LW + 2 * KT * LW + HB * KT) * 2 + (HB * 4 + 2 * HB) * 4;
 }
 
 template <int HB, bool FP8 = false>
-__device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok,
-                            const int* cnt, float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w,
-                            float scale, int sparse, const int* pt, int64_t pstep, const float* scales = nullptr) {
+__device__ void chunks_wide(int64_t c, const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos,
+                            const int* tok, const int* cnt, float* po, float* pm, float* pl, int64_t rows,
+                            int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep,
+                            const float* scales = nullptr) {
   constexpr int MT = HB / 16;
   extern __shared__ __align__(16) unsigned char smem[];
   __nv_bfloat16* qs = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -64,7 +65,7 @@ __device__ void chunks_wide(const __nv_bfloat16* qa, const __nv_bfloat16* lc, co
   float* stat = red + HB * 4;
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5, g = lane >> 2, q = lane & 3;
   const int kg = warp & 3, hh = warp >> 2;
-  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB, c = blockIdx.z;
+  const int64_t r = blockIdx.x, h0 = (int64_t)blockIdx.y * HB;
   const int64_t n = sparse ? cnt[r] : 0, limit = sparse ? 0 : (int64_t)pos[0] + r, start = c * CH;
   const bool live = sparse ? start < n : start <= limit;
   // a dense chunk's 512 keys are one page, its rows from that page's; a sparse key's row comes as the token list has it
@@ -271,14 +272,14 @@ extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_16(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
-  glm_attn::chunks_wide<16>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+  glm_attn::chunks_wide<16>(blockIdx.z, qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
 }
 
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32(const __nv_bfloat16* qa, const __nv_bfloat16* lc, const int* pos, const int* tok, const int* cnt,
                      float* po, float* pm, float* pl, int64_t rows, int64_t heads, int64_t w, float scale, int sparse,
                      const int* pt, int64_t pstep) {
-  glm_attn::chunks_wide<32>(qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
+  glm_attn::chunks_wide<32>(blockIdx.z, qa, lc, pos, tok, cnt, po, pm, pl, rows, heads, w, scale, sparse, pt, pstep);
 }
 
 // E4M3 cache variants reconstruct the existing BF16 shared tile before the unchanged attention math; on pages (pt set)
@@ -287,21 +288,22 @@ extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_16_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
-  glm_attn::chunks_wide<16, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+  glm_attn::chunks_wide<16, true>(blockIdx.z, qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                  po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
 }
 extern "C" __global__ void __launch_bounds__(256)
     tf_glm_chunks_32_fp8(const __nv_bfloat16* qa, const unsigned char* lc, const float* scales, const int* pos,
                          const int* tok, const int* cnt, float* po, float* pm, float* pl,
                          int64_t rows, int64_t heads, int64_t w, float scale, int sparse, const int* pt, int64_t pstep) {
-  glm_attn::chunks_wide<32, true>(qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
+  glm_attn::chunks_wide<32, true>(blockIdx.z, qa, reinterpret_cast<const __nv_bfloat16*>(lc), pos, tok, cnt,
                                  po, pm, pl, rows, heads, w, scale, sparse, pt, pstep, scales);
 }
 
+namespace glm_attn {
+
 // latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
-                 int64_t heads, int nch, int sparse) {
+__device__ __forceinline__ void merge_body(const float* po, const float* pm, const float* pl, __nv_bfloat16* out,
+                                           const int* cnt, int64_t rows, int64_t heads, int nch, int sparse) {
   constexpr int LW = glm_attn::LW;
   const int64_t r = blockIdx.x, h = blockIdx.y;
   if (sparse && cnt[r] == 0) return;
@@ -326,11 +328,22 @@ extern "C" __global__ void __launch_bounds__(128)
   for (int j = 0; j < 4; ++j) out[(r * heads + h) * LW + k0 + j] = __float2bfloat16_rn(glm_triton::div_full(o[j], l));
 }
 
-// sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.
+}  // namespace glm_attn
+
+// latent._merge, block (row, head), 128 threads: chunks merged in order, o / l by div.full; skips sparse count-0 rows.
 extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
-                  float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
-                  int loop, const int* pt, int64_t ps) {
+    tf_glm_merge(const float* po, const float* pm, const float* pl, __nv_bfloat16* out, const int* cnt, int64_t rows,
+                 int64_t heads, int nch, int sparse) {
+  glm_attn::merge_body(po, pm, pl, out, cnt, rows, heads, nch, sparse);
+}
+
+namespace glm_attn {
+
+// sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.
+__device__ __forceinline__ void scores_body(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride,
+                                            const __nv_bfloat16* pk, float* out, const int* pos, int64_t np,
+                                            int64_t nb, float scale, float wscale, int64_t heads, int loop,
+                                            const int* pt, int64_t ps) {
   constexpr int D = 128, HP = 32, BP = 64;
   __shared__ __align__(16) __nv_bfloat16 sm[4 * 2 * 16 * D];  // q's 32 rows, then each warp's two 16-pool buffers
   auto at = [](int row, int u) { return row * D + ((u ^ (row & 7)) << 3); };
@@ -409,4 +422,14 @@ extern "C" __global__ void __launch_bounds__(128)
         if (g == 0 && p < np) out[r * np + p] = p < npool ? s : -INFINITY;
       }
   }
+}
+
+}  // namespace glm_attn
+
+// sparse._scores, block (row, L pool blocks) of 4 warps, 16 pools a warp: sum_h w relu(dots scale), -inf past visible.
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_scores(const __nv_bfloat16* qi, const __nv_bfloat16* wts, int64_t w_stride, const __nv_bfloat16* pk,
+                  float* out, const int* pos, int64_t np, int64_t nb, float scale, float wscale, int64_t heads,
+                  int loop, const int* pt, int64_t ps) {
+  glm_attn::scores_body(qi, wts, w_stride, pk, out, pos, np, nb, scale, wscale, heads, loop, pt, ps);
 }

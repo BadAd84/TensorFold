@@ -87,6 +87,7 @@ pub const Engine = struct {
     draw1: ?@import("cuda_draw1.zig").Draw1 = null, // TF_GLM_OVN_DRAW1: a round's draws in one exchange a kind
     seg_kda: ?@import("cuda_kda_seg.zig").SegKda = null, // TF_GLM_OVN_SEG_KDA: e.bs's segment table (cuda_engine_ovn)
     seg_commit: ?@import("cuda_commit_seg.zig").SegCommit = null, // TF_GLM_OVN_SEG_COMMIT: a round's commits at once
+    seg_dsa: ?@import("cuda_dsa_seg.zig").SegDsa = null, // TF_GLM_OVN_SEG_DSA: e.bs's DSA segment table
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024 and prompt_rows rows
     checkpoint_digest: [32]u8,
     l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream

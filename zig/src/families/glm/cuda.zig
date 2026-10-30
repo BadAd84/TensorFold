@@ -19,6 +19,7 @@ pub const onepass = @import("cuda_onepass.zig");
 pub const moe = @import("cuda_moe.zig");
 pub const kda_block = @import("cuda_kda_block.zig");
 pub const dsa_block = @import("cuda_dsa_block.zig");
+pub const dsa_seg = @import("cuda_dsa_seg.zig");
 pub const mlp = @import("cuda_mlp.zig");
 pub const shard = @import("cuda_shard.zig");
 pub const weights = @import("cuda_weights.zig");
