@@ -105,5 +105,5 @@ pub fn keepRequests(self: *Lanes, requests: []const be.DraftRequest) !void {
 }
 
 comptime {
-    std.debug.assert(max_rows <= engine.shared_rows);
+    std.debug.assert(max_rows <= @import("cuda_ranks.zig").least_shared_rows); // a window fits any shared setting
 }

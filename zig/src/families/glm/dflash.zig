@@ -29,7 +29,7 @@ pub const MAX_S: usize = 16; // streams one block pass drafts for
 pub const MAX_M: usize = MAX_S * BLOCK; // block rows at most
 pub const MAX_CTX: usize = 2048; // context rows one ingest takes: a prompt step's piece (ingestPrompt), its own size
 pub const TAP_ROWS: usize = @import("cuda_state.zig").prefill_rows; // a prompt pass's tap rows (taps_prefill)
-pub const STEP_ROWS: usize = 32; // a verify's tap rows (the shared windows' rows at most)
+pub const STEP_ROWS: usize = @import("cuda_ranks.zig").most_shared_rows; // a verify's tap rows: the widest shared one
 pub const TAP_ROW: usize = taps_mod.layers.len * D * 2; // bytes of one row's taps
 
 /// Device bytes a stream's context ring takes (K and V of every layer).

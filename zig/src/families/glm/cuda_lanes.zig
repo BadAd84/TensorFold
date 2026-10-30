@@ -21,7 +21,7 @@ const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's c
 
 /// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
-const gb10_shared_costs = costTable(engine.shared_rows, 76.0, 4.1);
+const gb10_shared_costs = costTable(engine.max_shared_rows, 76.0, 4.1); // to 64 rows; facts takes the load's
 
 fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.config.Cost {
     var c: [n]lanes.config.Cost = undefined;
@@ -52,7 +52,7 @@ pub const Lanes = struct {
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
-    bits: ?cuda.HostBuffer = null, // structured output's grammar words (shared_rows rows), device-read, at first use
+    bits: ?cuda.HostBuffer = null, // structured output's grammar words (the load's shared rows), device-read, at first use
     bits_dev: u64 = 0,
     timed: ?@import("cuda_cost_time.zig").Timed = null, // TF_GLM_OVN_COST_TIME: the window costs timed at load
     multi: bool = false, // TF_GLM_OVN_MULTI_FILL: batched passes take marked and resumed prompts, a piece a pass
@@ -66,9 +66,9 @@ pub const Lanes = struct {
     pub fn putBits(self: *Lanes, row: usize, rows: usize, masks: []const u32) !u64 {
         if (masks.len == 0) return 0;
         const words = (self.x.e.c.vocab + 31) / 32;
-        if (masks.len != rows * words or row + rows > engine.shared_rows) return error.InvalidGrammarMasks;
+        if (masks.len != rows * words or row + rows > self.x.e.settings.shared_rows) return error.InvalidGrammarMasks;
         if (self.bits == null) {
-            var buf = try cuda.HostBuffer.allocMapped(self.x.e.d, engine.shared_rows * words * 4);
+            var buf = try cuda.HostBuffer.allocMapped(self.x.e.d, self.x.e.settings.shared_rows * words * 4);
             errdefer buf.free();
             self.bits_dev = try buf.device();
             self.bits = buf;
@@ -137,9 +137,9 @@ pub const Lanes = struct {
                 std.math.floatMin(f64)
             else if (block) null else self.mtp_confidence,
             .window_costs = if (block) (if (self.timed) |*t| &t.window else &gb10_window_costs) else &.{},
-            .shared_costs = if (block) (if (self.timed) |*t| &t.shared else &gb10_shared_costs) else &.{},
+            .shared_costs = if (block) (if (self.timed) |*t| t.shared[0..self.x.e.settings.shared_rows] else gb10_shared_costs[0..self.x.e.settings.shared_rows]) else &.{},
             .hidden_rows = sharing,
-            .batch_rows = if (sharing) engine.shared_rows else 0,
+            .batch_rows = if (sharing) self.x.e.settings.shared_rows else 0, // TF_GLM_OVN_SHARED_ROWS: the allocator's cap
             .max_streams = if (sharing) engine.max_shared else 1,
         };
     }

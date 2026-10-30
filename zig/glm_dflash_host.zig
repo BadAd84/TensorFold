@@ -14,6 +14,10 @@ test "glm dflash: gather and read fit for every supported rank count" {
     };
 }
 
+test "glm dflash: a verify's tap rows (taps_step) hold the widest shared window TF_GLM_OVN_SHARED_ROWS allows" {
+    try t.expect(glm.dflash.STEP_ROWS >= glm.ranks.most_shared_rows); // the tap kernel writes every row of the forward
+}
+
 test "glm dflash: the raw scratch holds every 4-bit linear's words, scales and biases at every rank count" {
     const df = glm.dflash;
     var short: usize = 0;

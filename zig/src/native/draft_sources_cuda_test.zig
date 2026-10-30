@@ -36,6 +36,7 @@ test "draft sources: CUDA GLM distinguishes its checkpoint head from loaded DFla
     b.mtp_confidence = null;
     e.mtp = false;
     e.drafter = null;
+    e.settings = .{}; // the shared rows facts reads (TF_GLM_OVN_SHARED_ROWS, unset)
     try check(b.facts(), null, false, false);
     e.mtp = true;
     try check(b.facts(), null, true, true);

@@ -92,7 +92,7 @@ fn fused(r: *Rig, set: glue.Set, v: Dev, x: u64, xout: u64, g: u64, count: u64, 
 
 /// GLUE_FUSE: two sites by hcGlue (x into x_alt and back) equal hcPost then hcPre twice; the counts end at zero.
 fn fuse(r: *Rig, set: glue.Set) !void {
-    for ([_]bool{ false, true }) |f32w| for ([_]usize{ 1, 2, 5, 8, 32 }) |rows| {
+    for ([_]bool{ false, true }) |f32w| for ([_]usize{ 1, 2, 5, 8, 32, 33, 48, 63 }) |rows| { // to TF_GLM_OVN_SHARED_ROWS
         const w = try site(r, f32w);
         const h = try host(r, rows);
         const g2 = std.mem.sliceAsBytes((try host(r, rows)).g);
@@ -108,7 +108,23 @@ fn fuse(r: *Rig, set: glue.Set) !void {
         try same(r, "fused glue, second site", rows, a, a.x, b, b.x, true);
         for (std.mem.bytesAsSlice(u32, try r.back(count, rows * 4))) |n| try check.expect(n == 0, "fused glue: the row counts return to zero", .{});
     };
-    check.pass("TF_GLM_OVN_GLUE_FUSE: hcGlue's residual, normed rows, sums, post, comb and partials equal hcPost + hcPre", .{});
+    // 64 rows: hcGlue refuses them, so the forward glues them unfused; each row equals the fused glue's at 63
+    for ([_]bool{ false, true }) |f32w| {
+        const w = try site(r, f32w);
+        const h = try host(r, 64);
+        const g = try r.a.alloc(f32, world * 63 * d); // [world][rows][d]: each rank's first 63 rows
+        for (0..world) |q| @memcpy(g[q * 63 * d ..][0 .. 63 * d], h.g[q * 64 * d ..][0 .. 63 * d]);
+        const h63: Host = .{ .x = h.x[0 .. 63 * wide], .g = g, .post = h.post[0 .. 63 * s], .comb = h.comb[0 .. 63 * s * s] };
+        const a = try dev(r, h, 64);
+        const b = try dev(r, h63, 63);
+        const alt = try r.zeros(63 * wide * 2);
+        const refused = if (fused(r, set, a, a.x, alt, a.g, try counts(r, 64), w, 64)) false else |err| err == error.HcGlueWindow;
+        try check.expect(refused, "hcGlue refuses 64 rows (the forward's unfused path takes them)", .{});
+        try split(r, set, a, a.g, w, 64);
+        try fused(r, set, b, b.x, alt, b.g, try counts(r, 63), w, 63);
+        try same(r, "unfused glue at 64 rows against the fused glue at 63", 63, a, a.x, b, alt, true);
+    }
+    check.pass("TF_GLM_OVN_GLUE_FUSE: hcGlue's residual, normed rows, sums, post, comb and partials equal hcPost + hcPre (1 to 63 rows), and the unfused 64-row glue's each row", .{});
 }
 
 /// GLUE_ROW: hcRow equals hcPost in place then hcPre, prompt rows and a decode window's.

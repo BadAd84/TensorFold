@@ -57,8 +57,9 @@ test "a prompt chunk ends on the chunk grid, at the prompt's end or at the first
 pub const max_together = @import("cuda_state.zig").prompt_heads;
 pub const Prompt = struct { slot: u32, ids: []const u32 };
 
-/// A shared verify's max rows and streams: under hc_pre's 64-row block change; 16 streams take 2 rows each.
-pub const shared_rows = 32;
+/// A shared verify's widest rows (TF_GLM_OVN_SHARED_ROWS; e.settings.shared_rows is the load's): arrays size by it.
+pub const max_shared_rows = ranks.most_shared_rows;
+/// A shared verify's streams at most: 16 take 2 rows each at 32; 64 rows glue unfused, same bits a row.
 pub const max_shared = 16;
 
 const types = @import("cuda_engine_types.zig");
@@ -134,6 +135,7 @@ pub const Engine = struct {
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
         if (world > ranks.max_world) return error.TooManyRanks; // before anything is allocated
+        if (!ranks.validRows(o.settings.shared_rows)) return error.BadSharedRows; // auto resolved at open (autoRows)
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -241,7 +243,8 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
+        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, o.settings.shared_rows, o.capacity);
+        if (e.bs) |b| if (rank == 0) std.log.info("glm: shared verify windows of up to {d} rows (TF_GLM_OVN_SHARED_ROWS), their buffers {d} MiB", .{ b.rows, b.arena.buf.len >> 20 });
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
         errdefer e.pairs.free();

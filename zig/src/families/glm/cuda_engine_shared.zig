@@ -1,20 +1,32 @@
-//! Engine.verifyShared: several streams' verify windows in one forward, then each part's draws.
+//! Engine.verifyShared: several streams' windows in one forward, then each part's draws.
+const std = @import("std");
 const fw = @import("cuda_forward.zig");
 const engine = @import("cuda_engine.zig");
 const draw1 = @import("cuda_draw1.zig");
 const Engine = engine.Engine;
 const Part = engine.Part;
 
+/// The parts' total rows; refused past `cap` (TF_GLM_OVN_SHARED_ROWS), max_shared streams, a window, or a slot twice.
+pub fn rowsOf(parts: []const Part, cap: usize) !usize {
+    if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
+    var rows: usize = 0;
+    for (parts, 0..) |p, i| {
+        if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > cap) return error.WindowTooWide;
+        for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
+        rows += p.ids.len;
+    }
+    return rows;
+}
+
 /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
 pub fn verifyShared(e: *Engine, parts: []const Part) !void {
     const b = if (e.bs) |*x| x else return error.NoSharedWindows;
-    if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
+    std.debug.assert(b.rows == e.settings.shared_rows); // Engine.init sized e.bs by the setting
+    _ = try rowsOf(parts, e.settings.shared_rows);
     var segs: [engine.max_shared]fw.Seg = undefined;
-    var ids: [engine.shared_rows]u32 = undefined;
+    var ids: [engine.max_shared_rows]u32 = undefined;
     var rows: usize = 0;
     for (parts, 0..) |p, i| {
-        if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > engine.shared_rows) return error.WindowTooWide;
-        for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
         try e.bind(p.slot);
         segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };
         @memcpy(ids[rows..][0..p.ids.len], p.ids);
@@ -51,4 +63,44 @@ fn drawPacked(e: *Engine, b: *const fw.Buffers, parts: []const Part, segs: []con
         n += 1;
     }
     if (n > 0) try draw1.draw(e, b.logits, packed_parts[0..n]);
+}
+
+test "a shared verify's parts: up to the load's rows, each a window, each slot once, at most max_shared streams" {
+    var ids: [engine.max_shared_rows]u32 = @splat(7);
+    var out: [engine.max_shared_rows]u32 = undefined;
+    var parts: [engine.max_shared]Part = undefined;
+    for (&parts, 0..) |*p, i| p.* = .{ .slot = @intCast(i), .ids = ids[0..fw.window_rows], .out = out[0..fw.window_rows] };
+    for ([_]usize{ 32, 40, 48, 56, 64 }) |cap| {
+        const full = cap / fw.window_rows; // windows of 8 rows that fill the setting exactly
+        try std.testing.expectEqual(cap, try rowsOf(parts[0..full], cap));
+        try std.testing.expectError(error.WindowTooWide, rowsOf(parts[0 .. full + 1], cap)); // one window past it
+    }
+    try std.testing.expectError(error.WindowTooWide, rowsOf(parts[0..5], 32)); // 40 rows at the default
+    parts[1].slot = 0;
+    try std.testing.expectError(error.SlotTwice, rowsOf(parts[0..2], 64));
+    parts[1] = .{ .slot = 1, .ids = ids[0 .. fw.window_rows + 1], .out = out[0 .. fw.window_rows + 1] };
+    try std.testing.expectError(error.WindowTooWide, rowsOf(parts[0..2], 64));
+    try std.testing.expectError(error.WindowTooWide, rowsOf(parts[0..0], 64));
+}
+
+test "a shared verify past the load's TF_GLM_OVN_SHARED_ROWS is refused before any rank hears it or a slot binds" {
+    var e: Engine = undefined; // no slot, link or device: a refusal touches none of them
+    e.settings = .{}; // the default 32 rows
+    var b: fw.Buffers = undefined;
+    b.rows = e.settings.shared_rows;
+    e.bs = b;
+    var ids: [fw.window_rows]u32 = @splat(7);
+    var out: [5][fw.window_rows]u32 = undefined;
+    var parts: [5]Part = undefined;
+    for (&parts, &out, 0..) |*p, *o, i| p.* = .{ .slot = @intCast(i), .ids = &ids, .out = o };
+    try std.testing.expectError(error.WindowTooWide, verifyShared(&e, &parts)); // 40 rows
+    const x: @import("cuda_follow.zig").Leader = .{ .e = &e, .link = undefined };
+    try std.testing.expectError(error.WindowTooWide, x.verifyShared(&parts));
+}
+
+test "an engine refuses shared rows TF_GLM_OVN_SHARED_ROWS does not allow (auto unresolved) before anything else" {
+    for ([_]u32{ 0, 36, 72 }) |rows| {
+        const o: engine.Options = .{ .capacity = 4096, .mtp = true, .settings = .{ .shared_rows = rows } };
+        try std.testing.expectError(error.BadSharedRows, Engine.init(std.testing.allocator, std.testing.io, undefined, undefined, "/no-such-glm", undefined, null, 0, 1, o));
+    }
 }

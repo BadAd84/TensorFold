@@ -72,6 +72,39 @@ test "TF_GLM_SPLIT_MIN is read, refused when not a row count, and part of what t
     try std.testing.expectError(error.BadSetting, Settings.read(&splitMinBad, &problem));
 }
 
+fn sharedRows48(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_OVN_SHARED_ROWS")) return "48";
+    return null;
+}
+
+fn sharedRowsAuto(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_OVN_SHARED_ROWS")) return "auto";
+    return null;
+}
+
+fn sharedRowsOdd(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_OVN_SHARED_ROWS")) return "36";
+    return null;
+}
+
+test "TF_GLM_OVN_SHARED_ROWS: 32 to 64 in steps of 8, auto by the streams, refused otherwise, agreed by the ranks" {
+    var problem: []const u8 = "";
+    try std.testing.expectEqual(@as(u32, 32), (try Settings.read(&ringed, &problem)).shared_rows); // unset: today's 32
+    try std.testing.expectEqual(@as(u32, 48), (try Settings.read(&sharedRows48, &problem)).shared_rows);
+    try std.testing.expectEqual(@as(u32, 0), (try Settings.read(&sharedRowsAuto, &problem)).shared_rows);
+    try std.testing.expectError(error.BadSetting, Settings.read(&sharedRowsOdd, &problem));
+    try std.testing.expectStringStartsWith(problem, "TF_GLM_OVN_SHARED_ROWS: ");
+    for ([_][]const u8{ "32", "40", "48", "56", "64" }, [_]u32{ 32, 40, 48, 56, 64 }) |v, n| try std.testing.expectEqual(n, try ranks.sharedRows(v));
+    for ([_][]const u8{ "0", "8", "24", "31", "33", "60", "72", "128", "", "x", "-32" }) |v| try std.testing.expectError(error.BadSetting, ranks.sharedRows(v));
+    try std.testing.expect(!ranks.validRows(0)); // auto must be resolved before an engine sizes anything
+    for ([_]u32{ 1, 2, 3, 4 }) |n| try std.testing.expectEqual(@as(u32, 32), ranks.autoRows(0, n)); // production: PARALLEL <= 4
+    for ([_]u32{ 5, 6, 8, 16 }) |n| try std.testing.expectEqual(@as(u32, 64), ranks.autoRows(0, n));
+    try std.testing.expectEqual(@as(u32, 40), ranks.autoRows(40, 8)); // a number given stays as given
+    const f32r = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
+    const f64r = Fingerprint.of(2, 1, .{ .shared_rows = 64 }, 8192, true, @splat(0), @splat(0), hashBytes("/c"));
+    try std.testing.expectEqual(Fingerprint.Field.shared_rows, mismatch(&.{ f32r, f64r }).?.field);
+}
+
 test "fingerprints: agreeing ranks pass; the first differing field and rank are named" {
     const h0: [32]u8 = @splat(1);
     const h1: [32]u8 = @splat(2);
@@ -207,7 +240,7 @@ test "every media limit is part of the ranks' agreement" {
 test "every scheduling and identity field that differs stops the ranks" {
     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kda_pad", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "ovn_comms", "moe_owners", "capacity", "heat_high", "heat_low" }) |name| {
+    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kda_pad", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "ovn_comms", "moe_owners", "shared_rows", "capacity", "heat_high", "heat_low" }) |name| {
         var all = [_]Fingerprint{ zero, one };
         @field(all[1], name) += 1;
         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);

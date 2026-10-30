@@ -52,6 +52,7 @@ pub const Options = struct {
     drafter: ?[]const u8 = null, // --drafter: DFlash2's folder (the same on every rank; needs drafts on)
     drafter_bits: u8 = 4, // --drafter-bits: 4 (default) or 0 (bf16)
     mtp_confidence: ?f64 = null, // --mtp-confidence: rank 0's lanes stop an MTP chain where its chance falls under it
+    parallel: u32 = 8, // --parallel's streams (auto: 8), read only by TF_GLM_OVN_SHARED_ROWS=auto
 };
 /// --drafter: DFlash2 (incoai/GLM-5.3-Flash-DFlash2, non-commercial weights) drafts instead of the MTP head.
 pub const takes_drafter = true;
@@ -174,17 +175,24 @@ pub fn roceBytes(text: ?[]const u8) !usize {
 const startup = @import("cuda_start.zig");
 const paging = startup.paging;
 
+/// The ranks' settings from `get` and the serve's flags: --kv-cache fp8, and TF_GLM_OVN_SHARED_ROWS=auto by --parallel.
+pub fn settingsOf(get: *const fn ([:0]const u8) ?[]const u8, o: Options, problem: *[]const u8) !ranks.Settings {
+    var set = try ranks.Settings.read(get, problem);
+    set.kv8 = o.kv8;
+    set.shared_rows = ranks.autoRows(set.shared_rows, o.parallel); // auto: production's rule by the streams served
+    return set;
+}
+
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     _ = kernels; // our own kernels: a captured set is not used
     const p = try place();
     const roce_bytes = try roceBytes(if (std.c.getenv("TF_ROCE_MAX_KB")) |v| std.mem.span(v) else null);
     if (p.world > 1 and std.c.getenv("NCCL_COMM_ID") == null) return error.NoCommId;
     var problem: []const u8 = "";
-    var set = ranks.Settings.read(&ranks.environment, &problem) catch |err| {
+    const set = settingsOf(&ranks.environment, o, &problem) catch |err| {
         std.log.err("{s}", .{problem});
         return err;
     };
-    set.kv8 = o.kv8;
     return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes }, openRank);
 }
 
@@ -500,4 +508,18 @@ pub fn linkCapacity(cap: usize, media: ?images_mod.Limits) !usize {
 }
 test "a small text context still sizes the link for every offered media span" {
     try std.testing.expectEqual(@as(usize, 792), try linkCapacity(64, .{ .image_tokens = 2048, .max_images = 8, .video_tokens = 4096, .max_videos = 2, .max_frames = 256 }));
+}
+
+fn autoRowsEnv(name: [:0]const u8) ?[]const u8 {
+    return if (std.mem.eql(u8, name, "TF_GLM_OVN_SHARED_ROWS")) "auto" else null;
+}
+
+test "TF_GLM_OVN_SHARED_ROWS=auto: 64 rows above 4 --parallel streams, else 32; GLM's options hold no `lanes`" {
+    var problem: []const u8 = "";
+    for ([_]u32{ 1, 4, 5, 6, 8 }, [_]u32{ 32, 32, 64, 64, 64 }) |n, rows| {
+        const s = try settingsOf(&autoRowsEnv, .{ .context = 4096, .drafts = true, .parallel = n, .kv8 = true }, &problem);
+        try std.testing.expectEqual(rows, s.shared_rows);
+        try std.testing.expect(s.kv8 and ranks.validRows(s.shared_rows));
+    }
+    try std.testing.expect(!@hasField(Options, "lanes")); // a `lanes` field would change the room the streams plan by
 }

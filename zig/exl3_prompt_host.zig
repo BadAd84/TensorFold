@@ -175,6 +175,7 @@ fn reply(drafts: bool, neighbors: usize, seed: ?u64) ![32]u32 {
     const a = std.testing.allocator;
     var model: glm.engine.Engine = undefined;
     model.mtp = true;
+    model.settings = .{}; // the shared rows facts reads (TF_GLM_OVN_SHARED_ROWS, unset)
     var adapter: glm.lanes.Lanes = .{ .x = .{ .e = &model, .link = undefined } };
     var cfg = try lanes.Config.init(a, adapter.facts(), glm.lanes.max_rows, glm.engine.max_drafts);
     defer cfg.deinit(a);

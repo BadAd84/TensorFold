@@ -306,9 +306,9 @@ pub const Leader = struct {
 
     /// Several streams' windows in one forward on every rank (Engine.verifyShared): parts' slots and rows, then ids.
     pub fn verifyShared(x: Leader, parts: []const engine.Part) !void {
-        if (parts.len == 0 or parts.len > engine.max_shared) return error.WindowTooWide;
+        _ = try @import("cuda_engine_shared.zig").rowsOf(parts, x.e.settings.shared_rows); // before any rank hears it
         try x.flush();
-        var buf: [2 * engine.max_shared + engine.shared_rows]u32 = undefined;
+        var buf: [2 * engine.max_shared + engine.max_shared_rows]u32 = undefined;
         var n: usize = 2 * parts.len;
         for (parts, 0..) |p, i| {
             if (n + p.ids.len > buf.len) return error.WindowTooWide;
@@ -479,7 +479,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 const k = h.depth;
                 if (k == 0 or k > engine.max_shared or step.ids.len < 2 * k) return error.BadStep;
                 var parts: [engine.max_shared]engine.Part = undefined;
-                var outs: [engine.shared_rows]u32 = undefined;
+                var outs: [engine.max_shared_rows]u32 = undefined;
                 var at: usize = 2 * k;
                 var row: usize = 0;
                 for (parts[0..k], 0..) |*p, i| {
