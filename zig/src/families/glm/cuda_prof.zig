@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 pub const prompt_trace = @import("cuda_prompt_trace.zig");
+pub const route = @import("cuda_prof_route.zig");
 
 pub const Section = enum { gate, embed, kda, mla, mla_chunks, mla_merge, gather_a, dense, router, routed, shared, gather_b, head, draw, mtp, commit };
 const names = [_][]const u8{ "gate", "embed", "kda", "mla", "mla_chunks", "mla_merge", "gather_a", "dense", "router", "routed", "shared", "gather_b", "head", "draw", "mtp", "commit" };
@@ -22,6 +23,7 @@ pub const Prof = struct {
     label: []const u8 = "",
     prompt: ?*prompt_trace.Trace = null,
     every: u64 = 64, // calls a report sums
+    route: ?route.Route = null, // TF_GLM_PROF_ROUTE=1 (verify windows on rank 0): distinct experts a MoE layer
 
     pub fn init(d: *const cuda.Driver, io: std.Io) !*Prof {
         return initWith(d, io, cuda.Event.init);
@@ -76,6 +78,17 @@ pub const Prof = struct {
         p.n += 1;
     }
 
+    /// TF_GLM_PROF_ROUTE=1: a MoE layer's picks [rows][slots] read back on `s` (after its select) and counted.
+    pub fn routeLayer(p: *Prof, s: cuda.Stream, pick: u64, rows: usize, slots: usize, top_k: usize) !void {
+        const r = if (p.route) |*v| v else return;
+        if (!p.open) return;
+        const n = rows * slots;
+        if (n > route.max_picks) return error.RouteWindowTooWide;
+        try p.d.check(p.d.api.cuMemcpyDtoHAsync_v2(@ptrCast(&r.picks), pick, n * 4, s.handle), "cuMemcpyDtoHAsync");
+        try s.synchronize();
+        try r.add(r.picks[0..n], rows, slots, top_k);
+    }
+
     /// The call ended (its results read: the stream is idle): sections summed, a report every 64 calls.
     pub fn end(p: *Prof) void {
         if (!p.open) return;
@@ -96,6 +109,12 @@ pub const Prof = struct {
         w.print("glm prof {s} ({d} calls): wall {d:.2} ms, gpu {d:.2} ms a call;", .{ p.label, p.calls, p.wall_ms / k, p.gpu_ms / k }) catch {};
         for (names, p.sections) |nm, ms| if (ms > 0) w.print(" {s} {d:.2}", .{ nm, ms / k }) catch {};
         std.log.info("{s}", .{w.buffered()});
+        if (p.route) |*r| {
+            var rb: [256]u8 = undefined;
+            var rw: std.Io.Writer = .fixed(&rb);
+            r.report(&rw, p.calls);
+            if (rw.buffered().len > 0) std.log.info("{s}", .{rw.buffered()});
+        }
         p.sections = @splat(0);
         p.gpu_ms = 0;
         p.wall_ms = 0;
@@ -168,4 +187,5 @@ pub inline fn context(p: ?*Prof, layer: ?usize, piece: ?usize, site: prompt_trac
 
 test {
     _ = @import("cuda_prompt_trace_test.zig");
+    _ = route;
 }

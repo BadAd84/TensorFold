@@ -74,6 +74,7 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
     }
     stamp.end();
+    if (k.prof) |p| try p.routeLayer(stream, s.pick, rows, slots, l.top_k); // TF_GLM_PROF_ROUTE=1 only
     stamp = prof_mod.span(k.prof, stream, .experts);
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
