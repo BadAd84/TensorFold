@@ -26,7 +26,7 @@ const Cache = extern struct { lc: u64, ls: u64, ik: u64, ig: u64, pk: u64, pt: u
 
 /// The segment lists the launches read: by pass, head block (16 or 32 heads a CTA) and select width.
 const List = enum(u8) { dense, dense16, dense32, sparse, sparse16, sparse32, select_narrow, select_wide };
-const n_lists = @typeInfo(List).@"enum".fields.len;
+const n_lists = @typeInfo(List).@"enum".field_names.len;
 
 /// The table's head: segments, then the lists (i32 segment indices); [layers][segments]Cache follows at caches_at.
 const Head = extern struct { seg: [max_segs]Seg, lists: [n_lists][max_segs]i32 };

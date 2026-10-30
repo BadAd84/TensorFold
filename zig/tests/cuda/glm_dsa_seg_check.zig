@@ -74,7 +74,7 @@ fn capOf(sp: Spec) usize {
 
 /// One layer's part of a page: its 512 latent rows (BF16, or codes then scales), then their 128 pools' keys.
 fn partBytes(fp8: bool) usize {
-    return (if (fp8) 512 * lw + 512 * 4 else 512 * lw * 2) + 128 * id * 2;
+    return (if (fp8) @as(usize, 512 * lw + 512 * 4) else @as(usize, 512 * lw * 2)) + 128 * id * 2;
 }
 
 /// Every page's parts for both layers, in State.place's order.
@@ -105,7 +105,7 @@ fn runs(r: *Rig, fp8: bool, pt: u64) ![2]Run {
             ig[j] = try bfBytes(r, cap * id);
             pk[j] = if (sp.paged) none else try bfBytes(r, (cap / 4 + 2) * id);
         }
-        for (&out) |*run| {
+        for (&out) |*one| {
             const base = if (sp.paged) try r.dev(kv) else 0;
             for (0..layers) |j| {
                 var c: dsa.Caches = .{ .lc = 0, .ik = try r.dev(ik[j]), .ig = try r.dev(ig[j]), .pk = 0, .pk_rows = cap / 4 + 2 };
@@ -120,14 +120,14 @@ fn runs(r: *Rig, fp8: bool, pt: u64) ![2]Run {
                     c.ls = if (fp8) c.lc + cap * lw else 0;
                     c.pk = try r.dev(pk[j]);
                 }
-                run.caches[i][j] = c;
-                run.bufs[i][0][j] = c.lc;
-                run.bufs[i][1][j] = c.ik;
-                run.bufs[i][2][j] = c.ig;
-                run.bufs[i][3][j] = c.pk;
+                one.caches[i][j] = c;
+                one.bufs[i][0][j] = c.lc;
+                one.bufs[i][1][j] = c.ik;
+                one.bufs[i][2][j] = c.ig;
+                one.bufs[i][3][j] = c.pk;
             }
-            if (sp.paged) run.bufs[i][3] = .{ 0, 0 }; // the pooled keys are in the arena, compared as a whole
-            if (sp.paged) run.bufs[i][0] = .{ base, 0 };
+            if (sp.paged) one.bufs[i][3] = .{ 0, 0 }; // the pooled keys are in the arena, compared as a whole
+            if (sp.paged) one.bufs[i][0] = .{ base, 0 };
         }
     }
     return out;
@@ -136,7 +136,7 @@ fn runs(r: *Rig, fp8: bool, pt: u64) ![2]Run {
 fn bytesOf(sp: Spec, fp8: bool, part: usize) usize {
     const cap = capOf(sp);
     return switch (part) {
-        0 => if (sp.paged) pages * layers * partBytes(fp8) else cap * (if (fp8) lw + 4 else lw * 2),
+        0 => if (sp.paged) pages * layers * partBytes(fp8) else cap * (if (fp8) @as(usize, lw + 4) else @as(usize, lw * 2)),
         1, 2 => cap * id * 2,
         else => (cap / 4 + 2) * id * 2,
     };
