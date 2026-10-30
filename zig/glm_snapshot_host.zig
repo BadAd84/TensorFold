@@ -3,6 +3,9 @@ const std = @import("std");
 const glm = @import("glm");
 const cuda = @import("cuda");
 const t = std.testing;
+test {
+    _ = @import("glm_one_chunk_host.zig"); // TF_GLM_OVN_ONE_CHUNK's step planning
+}
 
 const Sizing = struct {
     var next: u64 = 1 << 30;

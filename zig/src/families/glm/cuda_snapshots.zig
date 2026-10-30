@@ -67,7 +67,7 @@ fn windowBytes(e: anytype) u64 {
 }
 
 /// `len` bytes at `live` into a lease's pages from byte `off` on (`into`), or back out of them.
-fn moveFlat(pool: *const pages.Pool, stream: cuda.Stream, lease: *const pages.Lease, off: usize, live: u64, len: usize, into: bool) !void {
+pub fn moveFlat(pool: *const pages.Pool, stream: cuda.Stream, lease: *const pages.Lease, off: usize, live: u64, len: usize, into: bool) !void {
     const arena = pool.arena orelse return error.NoSnapshotRoom;
     if (off + len > lease.ids.items.len * pages.page) return error.SnapshotSize;
     var done: usize = 0;
@@ -99,6 +99,8 @@ pub fn keep(e: anytype) !u64 {
 }
 
 pub fn keepAs(e: anytype, id: u64) !void {
+    const one_chunk = @import("cuda_one_chunk.zig");
+    if (one_chunk.taking(e)) |k| return one_chunk.keep.keepAt(e, id, k); // TF_GLM_OVN_ONE_CHUNK: a mark inside a chunk
     if (e.snaps.contains(id)) return error.StateKept;
     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
         return error.NotAtMark;
