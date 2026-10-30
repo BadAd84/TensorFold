@@ -1,10 +1,12 @@
 // GLM dense linears, ours: one tensor-core kernel for any row count, 64-groups then K slices in order; row-stable bits.
 
+#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <stdint.h>
 
 #include "glm_qmm_frag.cuh"
+#include "glm_swiglu.cuh"
 
 namespace {
 
@@ -72,29 +74,44 @@ __device__ __forceinline__ void bpairs(const uint32_t* __restrict__ p, uint32_t 
     }
 }
 
-template <int BITS, int BM, int WM, int STAGES>
+template <int BITS, int BM, int WM, int STAGES, int BN_ = 64, int WN_ = 4>
 struct Tile {
-    static constexpr int WN = 4, BN = 64, NT = 2, MT = BM / WM / 16, THREADS = WM * WN * 32;
+    static constexpr int WN = WN_, BN = BN_, NT = BN / WN / 8, MT = BM / WM / 16, THREADS = WM * WN * 32;
+    static constexpr int TILES = BN / 8;                     // the block's 8-column tiles
     static constexpr int WPC = BITS / 2;
     static constexpr int ROW = 128, CHUNKS = 8;               // a row's 64 inputs: 128 bytes, 8 chunks of 16
     static constexpr int X = BM * ROW;
-    static constexpr int W = 8 * 32 * WPC * 4;                // 8 column tiles' chunks
-    static constexpr int S = 8 * 8 * 2;                       // their scales (fp16)
+    static constexpr int W = TILES * 32 * WPC * 4;            // the column tiles' chunks
+    static constexpr int S = TILES * 8 * 2;                   // their scales (fp16)
     static constexpr int STAGE = X + W + S;
     static constexpr int SMEM = STAGES * STAGE;
+    static constexpr int PARK = MT * NT * 4 * THREADS * 4;    // a K slice's partials, parked for the cluster sum
 };
 
-// ROWS_FIRST: row blocks fastest, so the blocks reading one weight tile run together and share it in L2 (prompts)
-template <int BITS, int BM, int WM, int STAGES, bool ROWS_FIRST = false>
+// Block order: column tiles fastest, row blocks fastest (blocks of one weight tile share it in L2), or L2 row bands
+enum Raster { COLS, ROWS, BANDS };
+
+// BANDS: qmm_prefill.cu's tile_of order (prod-src cuda/kernels/qmm_prefill.cu); CLUSTER: K slices summed through DSMEM
+template <int BITS, int BM, int WM, int STAGES, int RASTER = COLS, int BN = 64, int WN = 4, bool CLUSTER = false>
 __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, long long ldx,
         const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
         int f32, int M, int N, int K, int SK) {
-    using T = Tile<BITS, BM, WM, STAGES>;
+    using T = Tile<BITS, BM, WM, STAGES, BN, WN>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / T::WN, wn = warp % T::WN;
     const int KG = K >> 6, per = KG / SK, N8 = N >> 3;
-    const int n0 = (ROWS_FIRST ? blockIdx.y : blockIdx.x) * T::BN, m0 = (ROWS_FIRST ? blockIdx.x : blockIdx.y) * BM;
+    int n0, m0;
+    if constexpr (RASTER == BANDS) {
+        const int rows_t = (M + BM - 1) / BM;                 // a band's inputs stay near 12 MB of L2 (qmm_prefill.cu)
+        const int group = max(1, min(rows_t, (int)((12LL << 20) / ((long long)BM * K * 2))));
+        const int2 at = tile_of(blockIdx.x, M, N, BM, T::BN, group);
+        m0 = at.x;
+        n0 = at.y;
+    } else {
+        n0 = (RASTER == ROWS ? blockIdx.y : blockIdx.x) * T::BN;
+        m0 = (RASTER == ROWS ? blockIdx.x : blockIdx.y) * BM;
+    }
     const int slice = blockIdx.z, g0 = slice * per;
     const int t0 = n0 >> 3;                                   // the block's first column tile
     auto stage = [&](int st) { return buf + st * T::STAGE; };
@@ -109,7 +126,7 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
     auto loadW = [&](int st, int g) {
         unsigned char* pw = stage(st) + T::X;
         constexpr int PER_TILE = 32 * T::WPC * 4 / 16;        // 16-byte pieces of one column tile's chunks
-        for (int c = tid; c < 8 * PER_TILE; c += T::THREADS) {
+        for (int c = tid; c < T::TILES * PER_TILE; c += T::THREADS) {
             const int tt = c / PER_TILE, off = c % PER_TILE;
             if (t0 + tt >= N8) continue;
             const long long src = ((long long)(t0 + tt) * KG + g) * 32 * T::WPC * 4 + off * 16;
@@ -117,7 +134,7 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
         }
         if constexpr (BITS != 16) {
             unsigned char* ps = pw + T::W;
-            for (int tt = tid; tt < 8; tt += T::THREADS) {
+            for (int tt = tid; tt < T::TILES; tt += T::THREADS) {
                 if (t0 + tt >= N8) continue;
                 cp16(ps + tt * 16, s + ((long long)(t0 + tt) * KG + g) * 8);
             }
@@ -189,6 +206,40 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
         }
     }
     wait<0>();
+    if constexpr (CLUSTER) {
+#if __CUDA_ARCH__ < 900
+        __trap();                                             // no clusters before sm_90: the host never launches these
+#else
+        // a tile's K slices form a cluster: slice 0 adds the peers' partials in slice order, as glm_mm_reduce does
+        static_assert(T::PARK <= T::SMEM, "the parked partials reuse the stages");
+        __syncthreads();                                      // every warp is done with the stages
+        auto cluster = cooperative_groups::this_cluster();
+        float* mine = reinterpret_cast<float*>(buf);
+        if (slice != 0) {
+#pragma unroll
+            for (int i = 0; i < T::MT; ++i)
+#pragma unroll
+                for (int j = 0; j < T::NT; ++j)
+#pragma unroll
+                    for (int e = 0; e < 4; ++e) mine[((i * T::NT + j) * 4 + e) * T::THREADS + tid] = acc[i][j][e];
+        }
+        cluster.sync();
+        if (slice == 0) {
+            for (int peer = 1; peer < SK; ++peer) {
+                const float* theirs = cluster.map_shared_rank(mine, peer);
+#pragma unroll
+                for (int i = 0; i < T::MT; ++i)
+#pragma unroll
+                    for (int j = 0; j < T::NT; ++j)
+#pragma unroll
+                        for (int e = 0; e < 4; ++e)
+                            acc[i][j][e] = acc[i][j][e] + theirs[((i * T::NT + j) * 4 + e) * T::THREADS + tid];
+            }
+        }
+        cluster.sync();                                       // peers keep their memory until slice 0 has read it
+        if (slice != 0) return;
+#endif
+    }
 #pragma unroll
     for (int i = 0; i < T::MT; ++i)
 #pragma unroll
@@ -200,7 +251,7 @@ __device__ __forceinline__ void mm_kernel(const __nv_bfloat16* __restrict__ x, l
                 const int row = m0 + wm * (BM / WM) + i * 16 + (lane >> 2) + h * 8;
                 if (row >= M) continue;
                 const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
-                if (SK > 1) {
+                if (SK > 1 && !CLUSTER) {
                     float* dst = part + ((long long)slice * M + row) * N + col;
                     dst[0] = v0;
                     dst[1] = v1;
@@ -229,6 +280,22 @@ extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* _
     else reinterpret_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16_rn(acc);
 }
 
+// TF_GLM_OVN_SWIGLU_REDUCE: glm_mm_reduce of [gate | up] then glue.swiglu's value, one pass (no 64-sums: no reader)
+extern "C" __global__ void glm_mm_reduce_swiglu(const float* __restrict__ part, __nv_bfloat16* __restrict__ act,
+                                                long long rows, long long W, int SK, float limit) {
+    qmm_frag::grid_launch();
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * W) return;
+    const long long total = rows * 2 * W;                     // the partials of one slice: [rows][gate | up]
+    const float* p = part + i / W * 2 * W + i % W;
+    float g = p[0], u = p[W];
+    for (int sl = 1; sl < SK; ++sl) {
+        g = g + p[sl * total];
+        u = u + p[sl * total + W];
+    }
+    act[i] = __float2bfloat16_rn(glm_moe::swiglu1(glm_triton::rbf(g), glm_triton::rbf(u), limit));
+}
+
 // one instance a (bits, row bucket): (16, 1 warp row), (32, 1), (64, 2), (128, 2); three stages
 #define GLM_MM_ALL(B)                                                                                                  \
     extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16(const __nv_bfloat16* __restrict__ x, long long ldx, \
@@ -246,11 +313,45 @@ extern "C" __global__ void glm_mm_reduce(const float* __restrict__ part, void* _
 // prompts: 128-row blocks, row blocks fastest (one slice: a prompt's rows fill the GPU)
 extern "C" __global__ void __launch_bounds__(256) glm_mm16_rows(const __nv_bfloat16* __restrict__ x, long long ldx,
     const uint32_t* __restrict__ w, const __half* __restrict__ s, void* __restrict__ out, float* __restrict__ part,
-    int f32, int M, int N, int K, int SK) { mm_kernel<16, 128, 2, 3, true>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
+    int f32, int M, int N, int K, int SK) { mm_kernel<16, 128, 2, 3, ROWS>(x, ldx, w, s, out, part, f32, M, N, K, SK); }
 GLM_MM_ALL(4)
 GLM_MM_ALL(6)
 GLM_MM_ALL(8)
 GLM_MM_ALL(16)
+
+#define GLM_MM_ARGS                                                                                                    \
+    const __nv_bfloat16 *__restrict__ x, long long ldx, const uint32_t *__restrict__ w, const __half *__restrict__ s,  \
+        void *__restrict__ out, float *__restrict__ part, int f32, int M, int N, int K, int SK
+#define GLM_MM_PASS x, ldx, w, s, out, part, f32, M, N, K, SK
+// TF_GLM_OVN_MM_WIDE (prompts): 128 x 128 blocks in L2 row bands, warps of 64 x 32 (w2x4) or 32 x 32 (w4x4)
+#define GLM_MM_WIDE(B)                                                                                                 \
+    extern "C" __global__ void __launch_bounds__(256) glm_mm##B##_w2x4(GLM_MM_ARGS) {                                 \
+        mm_kernel<B, 128, 2, 3, BANDS, 128, 4>(GLM_MM_PASS);                                                           \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(512) glm_mm##B##_w4x4(GLM_MM_ARGS) {                                 \
+        mm_kernel<B, 128, 4, 3, BANDS, 128, 4>(GLM_MM_PASS);                                                           \
+    }
+// TF_GLM_OVN_MM_DECTILE: 16-row windows on 32-column tiles of 4 warps, 4 stages (qmm.cu dispatch_cfg's case 12)
+#define GLM_MM_DEC(B)                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16n32(GLM_MM_ARGS) {                                \
+        mm_kernel<B, 16, 1, 4, COLS, 32, 4>(GLM_MM_PASS);                                                              \
+    }
+// TF_GLM_OVN_MM_CLUSTER: the decode buckets 16, 32, 64 with a tile's K slices summed in a cluster (qmm.cu:329-342)
+#define GLM_MM_CLUSTER(B)                                                                                              \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_16c(GLM_MM_ARGS) {                                  \
+        mm_kernel<B, 16, 1, 3, COLS, 64, 4, true>(GLM_MM_PASS);                                                        \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(128) glm_mm##B##_32c(GLM_MM_ARGS) {                                  \
+        mm_kernel<B, 32, 1, 3, COLS, 64, 4, true>(GLM_MM_PASS);                                                        \
+    }                                                                                                                  \
+    extern "C" __global__ void __launch_bounds__(256) glm_mm##B##_64c(GLM_MM_ARGS) {                                  \
+        mm_kernel<B, 64, 2, 3, COLS, 64, 4, true>(GLM_MM_PASS);                                                        \
+    }
+#define GLM_MM_OVN(B) GLM_MM_WIDE(B) GLM_MM_DEC(B) GLM_MM_CLUSTER(B)
+GLM_MM_OVN(4)
+GLM_MM_OVN(6)
+GLM_MM_OVN(8)
+GLM_MM_OVN(16)
 
 // -- tiling at load: ops.cu's packed rows and fp16 scales [N][K / 64] -> the tiled chunks and scales ---------------
 template <int BITS>

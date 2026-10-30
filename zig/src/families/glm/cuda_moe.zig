@@ -7,6 +7,7 @@ const experts = @import("cuda_experts.zig");
 const exl3 = @import("cuda_exl3.zig");
 const prof_mod = @import("cuda_prof.zig");
 const projection = @import("cuda_proj.zig");
+const mm = @import("cuda_mm.zig");
 
 /// One MoE layer on a rank: router (bf16 [count][dims]) and fp32 bias, routed experts, shared [gate | up] and down.
 pub const Layer = struct {
@@ -96,8 +97,12 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
 pub fn sharedFront(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
     const d = l.routed.dims;
     const n = hi - lo;
-    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
-    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+    const sact = s.sact + lo * l.shared * 2;
+    // TF_GLM_OVN_SWIGLU_REDUCE: gate/up's K slices summed and SwiGLU'd in one kernel (bf16 projections on glm_mm)
+    if (!(l.shared_gu == .bf16 and try mm.swigluReduceB16(k.set.mm, k.set.packs, k.set.prompt, stream, x + lo * x_stride * 2, x_stride, l.shared_gu.bf16, 2 * l.shared, d, sact, s.mm_part, n, l.routed.limit))) {
+        try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+        try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, sact, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+    }
     try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
 }
 

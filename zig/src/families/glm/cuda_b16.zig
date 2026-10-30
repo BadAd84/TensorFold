@@ -57,7 +57,7 @@ pub fn partBytes(m: usize, n: usize, k: usize) usize {
 pub fn matmul(set: glue.Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
     if (k % bk != 0) return error.KNotMultipleOf64;
     if (set.mm) |mk| { // tiled weights, packed or bf16
-        const t: mm.Tiled = if (set.packs) |p| p.tiled(w, n, k) else .{ .w = w, .n = n, .k = k };
+        const t = mm.tiledBy(set.packs, w, n, k);
         return mm.matmul(mk, stream, x, x_stride, t, out, part, m, wide, set.prompt);
     }
     const sk = splitK(n, k);

@@ -61,10 +61,15 @@ pub const Kernels = struct {
     chunks_32_fp8: cuda.Function,
     merge: cuda.Function,
     scores: cuda.Function,
+    router16: ?cuda.Function, // TF_GLM_OVN_ROUTER16=<stages, 3 or 4>: 16-row router tiles for up to 16 rows (else null)
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
-        inline for (@typeInfo(Kernels).@"struct".field_names) |name| @field(k, name) = try m.function("tf_glm_" ++ name);
+        inline for (@typeInfo(Kernels).@"struct".field_names) |name| {
+            if (@FieldType(Kernels, name) == cuda.Function) @field(k, name) = try m.function("tf_glm_" ++ name);
+        }
+        const router16 = try cuda.ovn.int("ROUTER16", 0);
+        k.router16 = if (router16 == 0) null else try m.function(if (router16 == 4) "tf_glm_router16_s4" else "tf_glm_router16_s3");
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -174,10 +179,12 @@ pub fn routerSlices(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u
     if (d % (router_ks * 64) != 0) return error.RouterWidth; // the Python family's single-pass _router: no GLM width
     var a: cuda.Args = .{};
     inline for (.{ x, w, part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
-    if (x % 16 == 0 and x_stride % 8 == 0) // rows on 16 bytes: 64-row tiles staged by cp.async (decode's rows past m load as zeros)
-        try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a)
-    else
-        try cuda.launch.launch(set.glue.router_part, .{ .grid = .{ .x = cdiv(m, 16), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
+    if (x % 16 == 0 and x_stride % 8 == 0) { // rows on 16 bytes: cp.async tiles (decode's rows past m load as zeros)
+        if (set.glue.router16) |f| if (m <= 16) { // TF_GLM_OVN_ROUTER16: 16-row tiles, each warp 8 experts
+            return cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
+        };
+        try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
+    } else try cuda.launch.launch(set.glue.router_part, .{ .grid = .{ .x = cdiv(m, 16), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
 }
 
 /// glue.select: top_k by sigmoid + bias (lower id on ties), normed if `norm`, times `scale`, then the shared expert.
