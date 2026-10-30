@@ -29,6 +29,7 @@ const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
 const moe_side = @import("cuda_moe_side.zig");
 const hc_glue = @import("cuda_forward_glue.zig");
+const onepass_mod = @import("cuda_onepass.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -47,6 +48,7 @@ pub const Modules = struct {
     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
     pools32: bool = false, // TF_GLM_OVN_POOLS32: a split prompt indexer gathers its picks as int32
+    onepass: ?onepass_mod.Kernels, // TF_GLM_OVN_SPARSE_ONEPASS: prompt rows' sparse attention in one pass (glm_onepass)
     tiled: bool = false, // eligible bf16 linears are tiled; KDA inputs with uneven strides retain their row-major path
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     copy_rows: cuda.Function,
@@ -98,6 +100,12 @@ pub const Modules = struct {
         m.glue_row = try cuda.ovn.int("GLUE_ROW", 0);
         m.pdl_early = try cuda.ovn.int("PDL_EARLY", 0);
         m.moe_ovn = moe.Ovn.read();
+        m.onepass = null;
+        errdefer if (m.onepass) |*x| x.unload();
+        if (onepass_mod.wanted()) m.onepass = onepass_mod.Kernels.load(d, k.glm_onepass, @intCast(try ctx.attribute(.compute_capability_major))) catch |err| blk: {
+            std.log.warn("TF_GLM_OVN_SPARSE_ONEPASS: the onepass kernel is not used ({t}); prompt rows keep the chunk programs", .{err});
+            break :blk null;
+        };
         m.tiled = false;
         m.pools32 = cuda.ovn.on("POOLS32");
         m.packs = null; // `m` starts undefined: the field default does not apply
@@ -119,6 +127,7 @@ pub const Modules = struct {
         if (m.side) |*x| x.deinit();
         if (m.l2pace) |*p| p.deinit();
         if (m.index) |*x| x.unload();
+        if (m.onepass) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
@@ -236,7 +245,7 @@ pub const Forward = struct {
 
     pub fn set(f: *const Forward) glue.Set {
         const pdl = f.m.pdl_early >= @as(u64, if (f.ranks[0].b.prefill) 2 else 1);
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .pdl_early = pdl, .mla = f.m.mla };
+        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .pdl_early = pdl, .mla = f.m.mla, .onepass = if (f.m.onepass) |x| x.f else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
