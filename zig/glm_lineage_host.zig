@@ -245,7 +245,7 @@ fn arm(a: std.mem.Allocator, on: bool, out: *std.ArrayList([]u8)) !glm.lineage_c
     const first = [_]u32{ 3, 1, 0, 2, 4, 5, 6, 7, 8, 9 };
     const again = [_]u32{ 3, 2, 0, 1, 4, 5, 6, 7, 8, 9 };
     var paged = f.seq;
-    paged.st = try sequence(&d, &f, kv.ptr, page, &first);
+    paged.st = try sequence(&d, &f, 16448, kv.ptr, page, &first);
     defer paged.st.deinit();
     const window = e.cur;
     e.cur = &paged;
