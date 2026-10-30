@@ -2,6 +2,8 @@
 
 /// Nemotron's generated kernels (tools/zig/gen_nemotron_kernels.py).
 pub const nemotron = @import("nemotron/kernels.zig");
+/// Nemotron's KV in pages of the core pool: twins of its seven K/V kernels, each library beside its original.
+pub const nemotron_paged = @import("nemotron/paged.zig");
 
 pub const qwen35 = @import("qwen3_5/kernels.zig");
 pub const qwen35_layout = @embedFile("qwen3_5/layout.metal");
@@ -34,6 +36,8 @@ pub const core_exlr8_dense = @embedFile("core/exlr8_dense.metal");
 pub const core_exlr8_prompt = @embedFile("core/exlr8_prompt.metal");
 pub const core_exlr8_dense_prompt = @embedFile("core/exlr8_dense_prompt.metal");
 pub const core_pair = @embedFile("core/pair.metal");
+/// The row-split seam's kernels (see `pair_rows.zig`): `pair.metal` above stays as it is for glm_dsa.
+pub const core_pair_rows = @embedFile("core/pair_rows.metal");
 
 /// GLM-5.3 (glm_moe_dsa): MLA with rope over a bf16 latent cache, the DSA indexer and its top-k, fp32 glue.
 pub const glm_dsa_mla = @embedFile("glm_dsa/mla.metal");

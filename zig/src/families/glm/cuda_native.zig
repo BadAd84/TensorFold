@@ -51,6 +51,7 @@ pub const Options = struct {
     vision: ?images_mod.Limits = null, // --vision: rank 0's tower, every rank's image rows
     drafter: ?[]const u8 = null, // --drafter: DFlash2's folder (the same on every rank; needs drafts on)
     drafter_bits: u8 = 4, // --drafter-bits: 4 (default) or 0 (bf16)
+    mtp_confidence: ?f64 = null, // --mtp-confidence: rank 0's lanes stop an MTP chain where its chance falls under it
 };
 /// --drafter: DFlash2 (incoai/GLM-5.3-Flash-DFlash2, non-commercial weights) drafts instead of the MTP head.
 pub const takes_drafter = true;
@@ -319,7 +320,7 @@ fn finishRank(a: OpenArgs) !Loaded {
         }
     }.get;
     own.link.asleep = cuda.tp_watch.open(); // the other ranks begin asleep (follow): the first step wakes them
-    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .together = !off("TF_GLM_PROMPT_MANY"), .alone = off("TF_GLM_SHARED") };
+    own.lanes = .{ .x = .{ .e = own.e, .link = &own.link }, .whole = off("TF_GLM_PROMPT_STEPS"), .together = !off("TF_GLM_PROMPT_MANY"), .alone = off("TF_GLM_SHARED"), .mtp_confidence = o.mtp_confidence };
     own.lanes.multi = cuda.ovn.on("MULTI_FILL"); // TF_GLM_OVN_MULTI_FILL: marked and resumed prompts in batched passes
     if (cost_time.wanted(own.e)) { // TF_GLM_OVN_COST_TIME: before the layout, so the timed slots are freed by then
         own.lanes.timed = try own.lanes.x.costs();

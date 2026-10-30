@@ -161,6 +161,11 @@ pub const Geometry = struct {
     }
 };
 
+/// The dense Qwen3.8-27B's shape (hidden 5120, 64 layers, no experts), whatever its checkpoint format.
+pub fn dense27(g: anytype) bool {
+    return g.hidden == 5120 and g.layers == 64 and g.experts == 0;
+}
+
 /// The supported geometry: the prompt tiles take an even group and a chunk's rows; the partials the verify rows.
 pub fn supported(g: Geometry, rows: usize, prompt: bool, partial_rows: usize) bool {
     const group = g.q_heads / g.kv_heads;
@@ -325,7 +330,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8) !Geometry {
         return g;
     }
     if (exl3) {
-        if (!moe or g.pocket != 0) return error.UnsupportedQwenQuantization;
+        if (g.pocket != 0) return error.UnsupportedQwenQuantization; // dense (Qwen3.8-27B) and MoE checkpoints alike
         return g;
     }
     g.bits = try widths(gpa, root, try object(qv.?), g);

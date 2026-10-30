@@ -72,8 +72,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // ours: a prompt chunk's gated delta rule (v0.6.6's chain)
     .{ .name = "qwen35_kv8", .flags = &.{"-O3"} }, // ours: --kv-cache fp8's e4m3 attention rows for the Qwen3.5 hybrids
     .{ .name = "qwen35_bf16_rows", .flags = &.{"-O3"} }, // ours: bf16 token rows and small bf16 dense projections (qwen3_5/cuda_bf16_rows.zig)
-    .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
-    .{ .name = "nemotron_route", .flags = glue },
+    .{ .name = "nemotron_route", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
     .{ .name = "nemotron_mamba", .flags = glue },
     .{ .name = "nemotron_attention", .flags = glue },
     .{ .name = "nemotron_keyed", .flags = glue },
@@ -94,7 +93,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "block_attention", .flags = &.{"-O3"} }, // ours: a drafter's block over its context (cuda/block_attention.zig)
     .{ .name = "window_attention", .flags = &.{"-O3"} }, // ours: sliding-window attention (cuda/window_attention.zig)
     .{ .name = "window_rows", .flags = &.{"-O3"} }, // ours: window attention at head dims 256 and 512 (cuda/window_attention.zig)
-    .{ .name = "window_pages", .flags = &.{"-O3"} }, // ours: window_rows.cuh over Dory's paged caches (cuda/window_attention.zig)
+    .{ .name = "window_pages", .flags = &.{"-O3"} }, // ours: window_rows.cuh over paged caches (Dory, Gemma 4)
     .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k and the weighted combine (cuda/moe_glue.zig)
     .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig)
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts

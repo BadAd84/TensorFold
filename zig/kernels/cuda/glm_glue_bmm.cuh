@@ -2,7 +2,7 @@
 #pragma once
 
 #include "glm_glue_router.cuh"
-#include "glm_qmm_frag.cuh"
+#include "common/qmm_frag.cuh"
 
 namespace glm_bmm {
 

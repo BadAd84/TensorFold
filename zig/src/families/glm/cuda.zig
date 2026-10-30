@@ -103,6 +103,7 @@ test {
     _ = lanes;
     _ = native;
     _ = @import("cuda_qpack.zig");
+    _ = @import("cuda_mtp_chance.zig");
     _ = @import("cuda_tile.zig");
     _ = @import("cuda_draw1.zig");
     _ = @import("cuda_cost_time.zig");

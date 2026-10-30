@@ -114,7 +114,7 @@ pub const Rows = struct {
     stopped: bool = false,
     flush_clock: ?u64 = null, // a close protects states touched after this clock from older queued saves
     next_job: u64 = 0,
-    waiting: ?*pc.Entry = null, // the queued save the jobs in flight left no room for (a reap lets it try again)
+    waiting: ?*pc.Entry = null, // the newest save refused room; while it is next, step waits for a reap
     failures: write.Failures = .{},
     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
     pump: ?*@import("rows_pump.zig").Pump = null, // TF_GLM_OVN_DISK_PUMP: the job whose payloads stage a few a round
@@ -533,6 +533,7 @@ test {
     _ = @import("rows_prefetch_stack_test.zig");
     _ = @import("rows_pump_test.zig");
     _ = @import("rows_local_test.zig");
+    _ = @import("rows_refusal_test.zig");
 }
 
 /// TENSORFOLD_ROWS_STAGING_GIB: the host bytes the write worker stages at once (a save larger than that is skipped, so a

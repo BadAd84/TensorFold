@@ -46,6 +46,7 @@ pub const Kernels = struct {
     combine_sy: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
+    top1_sums: cuda.Function,
     put_words: cuda.Function,
     snap_copy: cuda.Function, // TF_GLM_OVN_SNAP_GATHER's copy (launched only with it on)
     embed_b16: cuda.Function,

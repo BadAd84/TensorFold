@@ -97,6 +97,7 @@ const gdn_prep_tests = @import("gdn_prep_tests.zig");
 const qk_rows_tests = @import("qk_rows_tests.zig");
 const window_tests = @import("window_tests.zig");
 const window_rows_tests = @import("window_rows_tests.zig");
+const window_pages512_tests = @import("window_pages512_tests.zig");
 const window_bench = @import("window_bench.zig");
 const moe_glue_tests = @import("moe_glue_tests.zig");
 const dense_rows_tests = @import("dense_rows_tests.zig");
@@ -243,6 +244,7 @@ const usage =
     \\  block                     DFlash block attention over windowed contexts against float64 (synthetic)
     \\  window                    sliding-window attention against float64 references (synthetic)
     \\  window-rows               window attention at head dims 256 and 512 against float64 ranges (synthetic)
+    \\  window-pages-512          head dim 512 decode and prompt rows over shuffled pages: the contiguous bits (synthetic)
     \\  window-bench WHICH        window attention's GPU time: callers (Kolibri-1's shapes) or gemma (head dims 256, 512)
     \\  moe-glue                  sigmoid top-k routing and the weighted combine against float64 references (synthetic)
     \\  dense-rows                bf16 rows times weight rows (routers, heads) against float64 references (synthetic)
@@ -254,6 +256,7 @@ const usage =
     \\  qmm-prefill-many-contract the GB10 bit-exact multi-projection prompt launch against separate launches
     \\  qmm-prefill-tile22-contract the GB10 large-prompt 2x2 tile against the default tile
     \\  qmm-prefill-many-bench    same-process A-B-A screening for the GB10 launch fusion
+    \\  mtp-rows                  tf_q36m_attn_rows: gates 1-4 (byte-equal to tf_q36m_attn a segment) and float64 alone
     \\  qwen-pages                qwen35.cu's attention cache through a page table: paged == contiguous, float64, red controls
     \\  kernel-contract-limits DIR   each registered launch against sm_80/86/89/120/121 from the fatbins in DIR
     \\  glm-exl3                  GLM's EXL3 routed experts, decode and prompt, against float64 (synthetic)
@@ -517,12 +520,14 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "qmm-prefill-many-contract")) return qmm_prefill_many_contract.run(gpu);
     if (std.mem.eql(u8, cmd, "qmm-prefill-tile22-contract")) return qmm_prefill_tile22_contract.run(gpu);
     if (std.mem.eql(u8, cmd, "qmm-prefill-many-bench")) return qmm_prefill_many_contract.bench(gpu);
+    if (std.mem.eql(u8, cmd, "mtp-rows")) return @import("contract_qwen_mtp_rows.zig").alone(gpu);
     if (std.mem.eql(u8, cmd, "qwen-pages")) return @import("contract_qwen_pages.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "kernel-contract-limits")) return contract_tests.fatbins(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-rows")) return window_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "window-pages-512")) return window_pages512_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window-bench")) return window_bench.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "moe-glue")) return moe_glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);

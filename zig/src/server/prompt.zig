@@ -242,7 +242,6 @@ fn continuedLen(once: *Once, cx: *Cx, messages: Value, history: []const u32, his
     const i = probe.diff(history) orelse return history_len;
     return if (i > 0 and i < history_len) i else history_len;
 }
-
 /// The history ends the last user only when that user is the final input message. Other ends stay unknown.
 fn userEnd(messages: Value, history_len: usize) usize {
     if (messages != .array or messages.array.len == 0) return 0;

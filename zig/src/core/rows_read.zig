@@ -47,7 +47,7 @@ pub fn read(r: *Rows, i: usize) !pc.Saved {
 /// The plan's files into `saved`: from a read ahead, by the reader pool, or one after another; their bytes on disk.
 fn fill(r: *Rows, plan: *const prefetch.Plan, ahead: ?*prefetch.Read, saved: pc.Saved) !u64 {
     if (ahead) |a| {
-        for (plan.pieces) |p| try r.img.scatter(r.family.ptr, saved, plan.rangesOf(p), a.payload(p));
+        for (plan.pieces) |p| try scatter(r, p.name, prefetch.ext(p.kind), saved, plan.rangesOf(p), a.payload(p));
         return a.disk;
     }
     if (r.readers > 1 or r.mirror != null) return piped(r, plan, saved);
@@ -112,7 +112,8 @@ const Piped = struct {
     }
 
     pub fn consume(c: *Piped, i: usize, payload: []const u8) !void {
-        try c.r.img.scatter(c.r.family.ptr, c.saved, c.plan.rangesOf(c.plan.pieces[i]), payload);
+        const p = c.plan.pieces[i];
+        try scatter(c.r, p.name, prefetch.ext(p.kind), c.saved, c.plan.rangesOf(p), payload);
     }
 };
 
@@ -126,8 +127,21 @@ fn one(r: *Rows, name: Name, kind: file.Kind, ext: []const u8, at: u32, ranges: 
     if (o.trailer.payload != n or o.trailer.block != r.keying.block or o.trailer.at != at) return bad(r, name, ext, error.RowsRead);
     const stage = try r.staged(n);
     const got = file.payload(&o, stage) catch |err| return bad(r, name, ext, err);
-    try r.img.scatter(r.family.ptr, saved, ranges, got);
+    try scatter(r, name, ext, saved, ranges, got);
     return o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer);
+}
+
+/// Whether a family refused what a file holds (words that differ, a size or a range that does not fit its blank).
+fn refused(err: anyerror) bool {
+    return switch (err) {
+        error.SnapshotSize, error.BadKeptRange, error.DiskWords, error.KeptWordsDiffer => true,
+        else => false,
+    };
+}
+
+/// A file's payload copied into `ranges` of `saved`; a refusal of its words is a failed check of the file.
+fn scatter(r: *Rows, name: Name, ext: []const u8, saved: pc.Saved, ranges: []const image.Range, in: []const u8) !void {
+    r.img.scatter(r.family.ptr, saved, ranges, in) catch |err| return if (refused(err)) bad(r, name, ext, err) else err;
 }
 
 /// A file that failed its checks deleted, with every state that names it; the error passed on.
@@ -148,7 +162,12 @@ fn bad(r: *Rows, name: Name, ext: []const u8, err: anyerror) anyerror {
             r.wantsOf(r.gpa, s, &wants) catch {};
             for (wants.items) |w| names = names or std.mem.eql(u8, &w.name, &name);
         }
-        if (names) r.remove(i) else i += 1;
+        if (!names) {
+            i += 1;
+            continue;
+        }
+        if (r.fetch) |f| f.forget(s.name); // a state that is gone takes its read ahead with it
+        r.remove(i);
     }
     return err;
 }

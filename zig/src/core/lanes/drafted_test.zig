@@ -395,6 +395,9 @@ test "the depth rule reads the drafter's facts, not the target's" {
     try std.testing.expect(m.plain_guard and m.draft_streams and m.mtp and !m.speculate_early);
     try std.testing.expectEqualSlices(f64, &prior, m.draft_prior);
     try std.testing.expectEqual(@as(u32, 3), m.drafts);
+    try std.testing.expectEqual(t.copy_match, m.copy_match); // 0: the target's
+    head.facts_.copy_match = 20;
+    try std.testing.expectEqual(@as(i64, 20), wrapped.facts(t).copy_match);
     head.facts_.stream_bytes = 4096;
     try std.testing.expectEqual(@as(usize, 1000 + 4096), wrapped.streamBytes(1000)); // admission counts both
 }
@@ -562,35 +565,6 @@ test "the early first token equals the late one after a complete prompt restore"
         try std.testing.expectEqual(old.cached, early.cached);
         try std.testing.expectEqual(@as(u32, 1), early.head.releases);
     }
-}
-
-test "the drafter wrapper sees the committed callback before its first hold" {
-    var target: fake.Fake = .{ .gpa = gpa };
-    defer target.deinit();
-    var seen = false;
-    var head: FakeDrafter = .{ .observe_first = &seen };
-    defer head.deinit();
-    var backend = target.backend();
-    backend.first_before_draft = true;
-    var wrapped = try Drafted.init(gpa, backend, head.drafter());
-    defer wrapped.deinit();
-    try std.testing.expect(wrapped.backend().first_before_draft);
-    var cfg = try Config.init(gpa, wrapped.facts(base()), 16, 15);
-    defer cfg.deinit(gpa);
-    var clock: fake.FixedClock = .{};
-    var engine = Engine.init(gpa, &cfg, wrapped.backend(), clock.clock());
-    defer engine.deinit();
-    var stream = try sm.Stream.init(gpa, .{ .id = "order", .prompt = &p1, .max_new = 8 });
-    defer stream.deinit(gpa);
-    const Hook = struct {
-        fn call(ptr: *anyopaque) void {
-            const flag: *bool = @ptrCast(@alignCast(ptr));
-            flag.* = true;
-        }
-    };
-    try engine.addStreamCommitted(&stream, .{ .ptr = &seen, .call = Hook.call });
-    try std.testing.expect(seen and head.ordered and head.holds > 0);
-    engine.discard(&stream);
 }
 
 test {

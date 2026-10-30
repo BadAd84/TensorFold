@@ -73,7 +73,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
             if (slot == paged_slot) try x.beginOn(null, held) else try x.begin(null);
             first[j] = try x.prefill(ids, null, null);
             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
-            try x.draft(true, &.{first[j]}, 2, &drafts[j]);
+            try x.draft(true, &.{first[j]}, 2, &drafts[j], null);
         }
         if (first[0] != first[1] or !std.mem.eql(u16, mine[0..V], twin[0..V]) or !std.mem.eql(u32, drafts[0][0..2], drafts[1][0..2])) {
             std.debug.print("FAIL paged: a {d}-token prompt's first token {d}, logits or drafts differ from its twin's ({d})\n", .{ len, first[0], first[1] });
@@ -90,7 +90,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
                 try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bd.logits, rows * V * 2), "cuMemcpyDtoH");
                 const keep = 1 + (round + k) % rows;
                 try x.keep(keep);
-                try x.draft(false, outs[j][0..keep], 2, &drafts[j]);
+                try x.draft(false, outs[j][0..keep], 2, &drafts[j], null);
             }
             if (!std.mem.eql(u16, mine[0 .. rows * V], twin[0 .. rows * V]) or !std.mem.eql(u32, outs[0][0..rows], outs[1][0..rows]) or !std.mem.eql(u32, drafts[0][0..2], drafts[1][0..2])) {
                 std.debug.print("FAIL paged: a {d}-token prompt's window {d} ({d} rows) differs from its twin's\n", .{ len, round, rows });
@@ -126,7 +126,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
                 stepped += @intFromBool(j == 0);
             }
             try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bp.logits, V * 2), "cuMemcpyDtoH");
-            try x.draft(true, &.{first[j]}, 2, &drafts[j]);
+            try x.draft(true, &.{first[j]}, 2, &drafts[j], null);
         }
         if (first[0] != first[1] or !std.mem.eql(u16, mine[0..V], twin[0..V]) or !std.mem.eql(u32, drafts[0][0..2], drafts[1][0..2])) {
             std.debug.print("FAIL paged: a {d}-token prompt cut at marks: first token {d}, logits or drafts differ from its twin's ({d})\n", .{ len, first[0], first[1] });
@@ -142,7 +142,7 @@ pub fn pagedCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, i
                 try x.verify(w[0..rows], outs[j][0..rows], 0);
                 try gpu.d.check(gpu.d.api.cuMemcpyDtoH_v2(if (j == 0) mine.ptr else twin.ptr, e.bd.logits, rows * V * 2), "cuMemcpyDtoH");
                 try x.keep(rows);
-                try x.draft(false, outs[j][0..rows], 2, &drafts[j]);
+                try x.draft(false, outs[j][0..rows], 2, &drafts[j], null);
             }
             if (!std.mem.eql(u16, mine[0 .. rows * V], twin[0 .. rows * V]) or !std.mem.eql(u32, outs[0][0..rows], outs[1][0..rows])) {
                 std.debug.print("FAIL paged: a {d}-token prompt cut at marks: window {d} differs from its twin's\n", .{ len, round });

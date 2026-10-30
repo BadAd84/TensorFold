@@ -1,7 +1,7 @@
 // glue._rmsnorm by hand (glm_glue.cu's first group): see glm_triton.cuh for the Triton ops it keeps.
 #pragma once
 
-#include "glm_qmm_frag.cuh"
+#include "common/qmm_frag.cuh"
 #include "glm_triton.cuh"
 
 namespace glm_glue {

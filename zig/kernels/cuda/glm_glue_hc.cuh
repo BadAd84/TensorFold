@@ -2,7 +2,7 @@
 #pragma once
 
 #include "glm_glue_rows.cuh"
-#include "glm_qmm_frag.cuh"
+#include "common/qmm_frag.cuh"
 #include "glm_triton.cuh"
 
 using namespace glm_triton;

@@ -3,7 +3,7 @@
 
 #include "glm_swiglu.cuh"
 #include "glm_triton.cuh"
-#include "glm_qmm_frag.cuh"
+#include "common/qmm_frag.cuh"
 
 using namespace glm_triton;
 

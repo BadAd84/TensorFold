@@ -331,6 +331,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
                 );
                 return null;
             },
+            error.ModeloptNeedsSm80 => {
+                problem.* = try std.fmt.allocPrint(
+                    a,
+                    "{s} is sm_{d}: {s} (the 4-bit checkpoints run on it)",
+                    .{ name, capability, qwen35.modelopt.modeloptRefusal(capability).? },
+                );
+                return null;
+            },
             else => {
                 problem.* = try std.fmt.allocPrint(
                     a,
@@ -342,6 +350,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         }
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
+    if (o.learn_conversations and kv_pages.ownCache(loaded)) {
+        problem.* = "--learn-conversations writes the host prompt cache's states, and TF_QWEN_KV_SHARE keeps prompts as pool pages instead: serve with one of the two";
+        return null;
+    }
     const taps = record.taps(loaded); // --record is refused before the host is made, so a refusal holds nothing
     if (o.record) |dir| if (try record.refusal(a, io, o.model_type, dir, taps)) |why| {
         problem.* = why;
@@ -404,13 +416,15 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const kept = kv_pages.kept(F, loaded, paged, o, room, held, host_budget, host_cache);
     const cache = kept.copied;
     const cache_capacity = kv_pages.capacity(F, loaded, kept, @intCast(window));
-    const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, kv_pages.enginePaged(loaded), @intCast(window), kept, o.kv8);
+    const shown = try kv_pages.text(F, a, served.stream_bytes, layout, paged, kv_pages.enginePaged(loaded), kv_pages.allOnPages(loaded), @intCast(window), kept, o.kv8);
+    // TF_QWEN_KV_SHARE: the family keeps prompts itself, over its pool's pages
+    const cache_text = if (kv_pages.ownCache(loaded)) ", the prompt cache over the pool's pages" else shown[1];
     h.startup = try std.fmt.allocPrint(gpa, @import("cuda_startup.zig").format, .{
         capability, device,                                                                                                       name, if (after.unified) ", memory shared with the host" else "", toGib(model), if (learn_bytes > 0) try std.fmt.allocPrint(a, " and {d:.2} GiB kept for --slide's trainer", .{toGib(learn_bytes)}) else "", streams, if (streams == 1) "" else "s", shown[0], toGib(room), toGib(after.reserve), @import("cuda_startup.zig").rows(F, loaded), if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
-        shown[1],   if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
+        cache_text, if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    if (@hasDecl(F, "snap_save") and cache > 0) {
+    if (@hasDecl(F, "snap_save") and cache > 0 and !kv_pages.ownCache(loaded)) {
         const pc = api.prompt_cache;
         const store = try gpa.create(pc.Store);
         errdefer gpa.destroy(store);

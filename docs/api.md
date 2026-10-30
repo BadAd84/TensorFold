@@ -345,7 +345,8 @@ Drafting stays enabled and uses the same grammar masks as plain decoding.
 
 This requires the loaded backend's structured-output capability and `libtfgrammar`. Nemotron, Qwen3.5-2B,
 Qwen3.8-27B (`qwen27`), Gemma 4 31B, Step-5, LFM2 MoE and Flash Next shared sessions on Metal have that capability; Qwen27 on Intel also has it.
-Flash Next on CUDA has it too.
+Flash Next and Gemma 4 on CUDA have it too. Gemma 4 on CUDA picks a greedy row under a grammar on the host, among the
+allowed tokens of its logits read back; sampled rows are masked on the device before the draw.
 Qwen3.8-27B applies the grammar to its first draw, each verified row and each branch of its draft proposals.
 Structured requests use its shared lane core, including when the ordinary lone-request serial optimization is enabled.
 CUDA determines support from its loaded backend's mask hook. GLM Metal
@@ -606,11 +607,12 @@ one Mac, and Nemotron, the Qwen3.5 hybrids, Flash Next on one rank and GLM-5.3-F
 refuse the flag at startup. GLM-5.3-Flash on CUDA across ranks writes every rank's part to rank 0's disk, so a state is
 read back on every rank or on none; it takes neither `--spill-gib` nor `--checkpoint-slots`.
 
-The engine stages an owned copy between rounds, and an I/O thread writes and fsyncs it. Staging has a 1 GiB byte
-permit and at most eight jobs. A save that finds either full but would fit alone waits in the queue until a write
-finishes; one that cannot fit even then is skipped, as is a save made at an eviction (below) that finds the permit full.
-A block still being written is charged and copied once, however many saves name it. The copy waits for its GPU producers
-before RAM can be reused. A state becomes available for reuse only after all its files have been written and synced.
+The engine stages an owned copy between rounds, and an I/O thread writes and fsyncs it. Staging has a 1 GiB byte permit
+and at most eight jobs. A save that finds either full but would fit alone waits in the queue until a write finishes; one
+that cannot fit even then is skipped. So is a waiting save whose state leaves RAM, unless `--spill-gib` copies it then
+(below); that copy, like any made at an eviction, is skipped when the permit is full. A block still being written is
+charged and copied once, however many saves name it. The copy waits for its GPU producers before RAM can be reused. A
+state becomes available for reuse only after all its files have been written and synced.
 A planned stop (SIGTERM or SIGINT) drains writes for up to 20 seconds, then cancels the remainder; a blocked syscall
 can finish later using only its private temporary files and staged bytes. A killed server loses unfinished saves.
 Rows a stored state already holds for the same tokens are written once, so ten

@@ -1,7 +1,7 @@
 // GLM's element-wise glue by hand: each output value alone, in the Triton kernel's order of fp32 ops.
 #pragma once
 
-#include "glm_qmm_frag.cuh"
+#include "common/qmm_frag.cuh"
 #include "glm_triton.cuh"
 
 namespace glm_glue {
@@ -263,7 +263,8 @@ extern "C" __global__ void tf_glm_conv_shift_seg(const tf_glm_conv_seg* seg, int
 }
 
 // decode.sample_rows' greedy pick, as the host scan: first max of n bf16 logits, NaN never wins; out fp32 bits, lo+id.
-__device__ __forceinline__ void glm_top1_row(const unsigned short* logits, int64_t n, unsigned lo, unsigned* out) {
+template <bool sums>
+__device__ __forceinline__ void glm_top1(const unsigned short* logits, int64_t n, unsigned lo, unsigned* out) {
   __shared__ float sv[1024];
   __shared__ unsigned si[1024];
   const int t = threadIdx.x;
@@ -287,17 +288,36 @@ __device__ __forceinline__ void glm_top1_row(const unsigned short* logits, int64
     out[0] = __float_as_uint(sv[0]);
     out[1] = lo + (si[0] == 0xffffffffu ? 0u : si[0]);
   }
+  if constexpr (sums) {
+    // out[2]: the slice's sum of exp(logit - its max), fp32 bits, from which rank 0 reads the pick's chance
+    const float m = sv[0];
+    float s = 0.0f;
+    for (int64_t i = t; i < n; i += 1024)
+      s += __expf(__int_as_float(static_cast<int>(static_cast<unsigned>(logits[i]) << 16)) - m);
+    __syncthreads();
+    sv[t] = s;
+    __syncthreads();
+    for (int h = 512; h > 0; h >>= 1) {
+      if (t < h) sv[t] += sv[t + h];
+      __syncthreads();
+    }
+    if (t == 0) out[2] = __float_as_uint(sv[0]);
+  }
 }
-
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned short* logits, int64_t n, unsigned lo,
                                                                 unsigned* out) {
-  glm_top1_row(logits, n, lo, out);
+  glm_top1<false>(logits, n, lo, out);
+}
+// The pick with its slice's softmax sum in out[2]: an MTP draft's chance (--mtp-confidence) across the ranks.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_sums(const unsigned short* logits, int64_t n,
+                                                                     unsigned lo, unsigned* out) {
+  glm_top1<true>(logits, n, lo, out);
 }
 
 // TF_GLM_OVN_DRAW1: tf_glm_top1 of row blockIdx.x (rows `stride` logits apart), its pick at out + 4 * row.
 extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n,
                                                                      unsigned lo, int64_t stride, unsigned* out) {
-  glm_top1_row(logits + blockIdx.x * stride, n, lo, out + 4 * blockIdx.x);
+  glm_top1<false>(logits + blockIdx.x * stride, n, lo, out + 4 * blockIdx.x);
 }
 
 // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).
