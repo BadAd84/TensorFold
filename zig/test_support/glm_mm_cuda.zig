@@ -1,5 +1,5 @@
 pub const Dim3 = struct { x: u32 = 1, y: u32 = 1, z: u32 = 1 };
-pub const Config = struct { grid: Dim3 = .{}, block: Dim3 = .{}, shared: u32 = 0, pdl: bool = false };
+pub const Config = struct { grid: Dim3 = .{}, block: Dim3 = .{}, shared: u32 = 0, cluster: ?Dim3 = null, pdl: bool = false };
 pub const Stream = struct {};
 pub const Function = struct {
     id: u32 = 0,

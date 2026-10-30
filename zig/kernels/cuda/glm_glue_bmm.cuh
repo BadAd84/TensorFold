@@ -373,6 +373,77 @@ extern "C" __global__ void __launch_bounds__(128)
       }
 }
 
+// TF_GLM_OVN_ROUTER16 (decode, up to 16 rows): 16 x 32 a block, each warp one 16 x 8 tile, ST stages (glue.py's bm 16).
+// Every output's chain is tf_glm_router_tile's: one mma per 16 inputs from zero, K ascending in its slice.
+namespace glm_bmm {
+template <int ST>
+__device__ __forceinline__ void router16(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows,
+                                         int64_t x_stride, int64_t d, int64_t ne, int ks) {
+  constexpr int BM = 16, BE = 32, KS = 64, LD = KS + 8, A = BM * LD, B = BE * LD, STAGE = (A + B) * 2;
+  __shared__ __align__(16) __nv_bfloat16 sm[ST][A + B];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, q = lane & 3;
+  const int64_t m0 = (int64_t)blockIdx.x * BM, e0 = (int64_t)blockIdx.y * BE, s = blockIdx.z, span = d / ks;
+  const int steps = static_cast<int>(span / KS), lr = tid / 8, lc = (tid % 8) * 8;
+  const bool oka = m0 + lr < rows;                          // one 16-byte piece of x a thread, two of w
+  const __nv_bfloat16* ga = x + (oka ? m0 + lr : 0) * x_stride + s * span + lc;
+  const __nv_bfloat16* gb[2];
+  unsigned okb = 0;
+#pragma unroll
+  for (int i = 0; i < 2; ++i) {
+    const int64_t e = e0 + lr + i * 16;
+    okb |= (e < ne ? 1u : 0u) << i;
+    gb[i] = w + (e < ne ? e : 0) * d + s * span + lc;
+  }
+  const unsigned sbase = static_cast<unsigned>(__cvta_generic_to_shared(sm)), soff = (lr * LD + lc) * 2;
+  auto load = [&](int st, int kt) {
+    const unsigned a = sbase + st * STAGE + soff;
+    cp16s(a, ga + kt * KS, oka);
+#pragma unroll
+    for (int i = 0; i < 2; ++i) cp16s(a + A * 2 + i * 16 * LD * 2, gb[i] + kt * KS, (okb >> i) & 1);
+  };
+  const unsigned fa = sbase + ((lane & 15) * LD + (lane >> 4) * 8) * 2;
+  const unsigned fb = sbase + A * 2 + ((warp * 8 + (lane & 7)) * LD + ((lane >> 3) & 1) * 8) * 2;
+  float c[4] = {};
+#pragma unroll
+  for (int st = 0; st < ST - 1; ++st) {
+    if (st < steps) load(st, st);
+    commit();
+  }
+  for (int kt = 0; kt < steps; ++kt) {
+    if (kt + ST - 1 < steps) load((kt + ST - 1) % ST, kt + ST - 1);
+    commit();
+    wait<ST - 1>();
+    __syncthreads();
+    const unsigned st = (kt % ST) * STAGE;
+#pragma unroll
+    for (int k16 = 0; k16 < KS; k16 += 16) {
+      uint32_t a[4], b[2];
+      ldm4s(a, fa + st + k16 * 2);
+      ldm2s(b, fb + st + k16 * 2);
+      glm_router::mma16816(c, a, b);
+    }
+    __syncthreads();
+  }
+#pragma unroll
+  for (int h = 0; h < 2; ++h)
+#pragma unroll
+    for (int jj = 0; jj < 2; ++jj) {
+      const int64_t r = m0 + g + h * 8, col = e0 + warp * 8 + q * 2 + jj;
+      if (r < rows && col < ne) part[(s * rows + r) * ne + col] = c[h * 2 + jj];
+    }
+}
+}  // namespace glm_bmm
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_router16_s3(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows, int64_t x_stride,
+                       int64_t d, int64_t ne, int ks) {
+  glm_bmm::router16<3>(x, w, part, rows, x_stride, d, ne, ks);
+}
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_router16_s4(const __nv_bfloat16* x, const __nv_bfloat16* w, float* part, int64_t rows, int64_t x_stride,
+                       int64_t d, int64_t ne, int ks) {
+  glm_bmm::router16<4>(x, w, part, rows, x_stride, d, ne, ks);
+}
+
 // Decode windows (under 128 rows): 16 x 64 a block of 4 warps, K 64 at a time, one K slice a block along z.
 extern "C" __global__ void __launch_bounds__(128)
     tf_glm_bmm_decode(const __nv_bfloat16* x, const __nv_bfloat16* w, void* out, float* part, int64_t m,

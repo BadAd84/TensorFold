@@ -1,6 +1,7 @@
 // GLM's MLP and MoE glue by hand: glue._swiglu, glue._topk and qmm._group_sums (the router's dot is glm_glue_router).
 #pragma once
 
+#include "glm_swiglu.cuh"
 #include "glm_triton.cuh"
 
 using namespace glm_triton;
@@ -14,13 +15,6 @@ __device__ __forceinline__ float group64(const float* q) {
   for (int j = 2; j < S; ++j) g = q[j] + g;
   for (int o = 32 / S; o > 0; o >>= 1) g = g + __shfl_xor_sync(0xffffffffu, g, o);
   return g;
-}
-
-__device__ __forceinline__ float swiglu1(float g, float u, float limit) {
-  g = fminf(g, limit);
-  u = fminf(fmaxf(u, 0.0f - limit), limit);
-  const float s = rbf(div_full(g, exp_approx(0.0f - g) + 1.0f));
-  return rbf(__fmul_rn(u, s));
 }
 
 }  // namespace glm_moe

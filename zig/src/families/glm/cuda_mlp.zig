@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
 const b16 = @import("cuda_b16.zig");
 const projection = @import("cuda_proj.zig");
+const mm = @import("cuda_mm.zig");
 
 /// A dense layer's weights: NVFP4 as Fp4Linear holds them, an EXL3 checkpoint's bf16, or FP4-Local's MXFP8.
 pub const Weights = union(enum) {
@@ -53,6 +54,8 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const q = switch (l.w) {
         .nvfp4 => |q| q,
         .bf16 => |b| { // [gate | up] in one matmul, as the shared expert's
+            // TF_GLM_OVN_SWIGLU_REDUCE: the K slices' reduce and SwiGLU in one kernel straight into s.act
+            if (try mm.swigluReduceB16(k.set.mm, k.set.packs, k.set.prompt, stream, x, x_stride, b.gu, 2 * w, l.dims, s.act, s.mm_part, rows, l.limit)) return;
             try b16.matmul(k.set, stream, x, x_stride, b.gu, s.gu, s.mm_part, rows, 2 * w, l.dims, false);
             return glue.swiglu(k.set, stream, s.gu, s.act, s.xs_act, l.limit, rows, w);
         },
