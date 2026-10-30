@@ -5,7 +5,7 @@ pub const prompt_trace = @import("cuda_prompt_trace.zig");
 
 pub const Section = enum { gate, embed, kda, mla, mla_chunks, mla_merge, gather_a, dense, router, routed, shared, gather_b, head, draw, mtp, commit };
 const names = [_][]const u8{ "gate", "embed", "kda", "mla", "mla_chunks", "mla_merge", "gather_a", "dense", "router", "routed", "shared", "gather_b", "head", "draw", "mtp", "commit" };
-const max_marks = 512;
+const max_marks = 1024; // a window of 8 segments: 4 a layer plus the mla split's 3 or 6 per segment and MLA layer
 
 pub const Prof = struct {
     d: *const cuda.Driver,
@@ -142,13 +142,13 @@ test "a profiler whose first, middle or last event fails destroys the events it 
     }
 }
 
-test "a profiler destroys all 513 of its events" {
+test "a profiler destroys all 1,025 of its events" {
     var d: cuda.Driver = undefined;
     d.api.cuEventCreate = Counted.create;
     d.api.cuEventDestroy_v2 = Counted.destroy;
     Counted.live = 0;
     const p = try Prof.init(&d, std.testing.io);
-    try std.testing.expectEqual(@as(usize, 513), Counted.live);
+    try std.testing.expectEqual(@as(usize, max_marks + 1), Counted.live);
     p.deinit();
     try std.testing.expectEqual(@as(usize, 0), Counted.live);
 }

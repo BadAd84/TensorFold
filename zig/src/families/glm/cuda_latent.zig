@@ -3,6 +3,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
+const prof = @import("cuda_prof.zig");
 
 /// latent.CHUNK, KT, HB, HB_WIDE, PROMPT_ROWS, PROMPT_RB.
 pub const chunk = 512;
@@ -113,29 +114,74 @@ pub fn attention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, t: Tab
 }
 
 pub fn attentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
-    if (fuses(set.mla, rows, hb)) return fused(set, stream, qa, cache, scales, t, pos, 0, 0, out, rows, heads, lw, nch, 0, scale, false);
-    try chunks(set, stream, qa, cache, scales, t, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
-    try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
+    return attentionProfile(set, null, stream, qa, cache, scales, t, pos, p, out, dummy, rows, heads, lw, nch, scale, hb);
 }
+
+/// attentionFormat, a decode profile's mla stage split at its chunk pass (mla_chunks) and merge (mla_merge).
+pub fn attentionProfile(set: glue.Set, profile: ?*prof.Prof, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, p: Partials, out: u64, dummy: u64, rows: usize, heads: usize, lw: usize, nch: usize, scale: f32, hb: usize) !void {
+    mark(set, profile, stream, .mla);
+    if (fuses(set.mla, rows, hb)) {
+        try fused(set, stream, qa, cache, scales, t, pos, 0, 0, out, rows, heads, lw, nch, 0, scale, false);
+        return mark(set, profile, stream, .mla_chunks);
+    }
+    try chunks(set, stream, qa, cache, scales, t, pos, 0, 0, p, rows, heads, lw, nch, 0, scale, hb, false);
+    mark(set, profile, stream, .mla_chunks);
+    try merge(set, stream, p, out, dummy, rows, heads, lw, nch, false);
+    mark(set, profile, stream, .mla_merge);
+}
+
+/// TF_GLM_PROF=1 in decode windows: the work queued on `stream` since the last mark is `section`'s (prompts unsplit).
+pub fn mark(set: glue.Set, profile: ?*prof.Prof, stream: cuda.Stream, section: prof.Section) void {
+    if (set.prompt) return;
+    if (profile) |x| x.mark(stream, section);
+}
+
+/// A chunk launch: its kernel, head block, threads and shared memory.
+const Launch = struct { f: cuda.Function, hb: usize, threads: u32, shared: u32 };
 
 /// latent._dense_chunks (sparse false: keys through pos + r) and _sparse_chunks (row r's `counts` tokens of `tokens`).
 fn chunks(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, pos: u64, tokens: u64, counts: u64, p: Partials, rows: usize, heads: usize, lw: usize, nch: usize, w: usize, scale: f32, hb: usize, sparse: bool) !void {
     if (lw != 512) return error.LatentShape;
-    const k = set.glue;
-    const s = set.mla.skip; // TF_GLM_OVN_MLA_FUSEMERGE: the same partials from the tiles up to each chunk's last key
-    const f = switch (hb) {
-        heads_tile => if (scales == 0) (if (s) k.chunks_16_skip else k.chunks_16) else if (s) k.chunks_16_fp8_skip else k.chunks_16_fp8,
-        heads_tile_wide => if (scales == 0) (if (s) k.chunks_32_skip else k.chunks_32) else if (s) k.chunks_32_fp8_skip else k.chunks_32_fp8,
-        else => return error.HeadBlock,
-    };
+    const g = if (segTakes(set, heads, hb)) segLaunch(set.glue, scales != 0, heads) else try wideLaunch(set, scales != 0, hb);
     var a: cuda.Args = .{};
     a.add(qa);
     a.add(cache);
     if (scales != 0) a.add(scales);
     inline for (.{ pos, tokens, counts, p.po, p.pm, p.pl, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, @as(c_int, @intFromBool(sparse)), t.pt, @as(i64, @intCast(t.ps)) }) |v| a.add(v);
-    const shared = if (hb == heads_tile_wide) glue.chunksSmem(heads_tile_wide) else glue.chunksSmem(heads_tile);
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, hb), .z = @intCast(nch) }, .block = .{ .x = 256 }, .shared = shared }, stream, &a);
+    try cuda.launch.launch(g.f, .{ .grid = .{ .x = @intCast(rows), .y = cdiv(heads, g.hb), .z = @intCast(nch) }, .block = .{ .x = g.threads }, .shared = g.shared }, stream, &a);
 }
+
+/// glm_glue_attn.cuh's chunk kernels on `hb`-head blocks of 256 threads.
+fn wideLaunch(set: glue.Set, fp8: bool, hb: usize) !Launch {
+    const k = set.glue;
+    const s = set.mla.skip; // TF_GLM_OVN_MLA_FUSEMERGE: the same partials from the tiles up to each chunk's last key
+    return switch (hb) {
+        heads_tile => .{ .f = if (!fp8) (if (s) k.chunks_16_skip else k.chunks_16) else if (s) k.chunks_16_fp8_skip else k.chunks_16_fp8, .hb = hb, .threads = 256, .shared = glue.chunksSmem(heads_tile) },
+        heads_tile_wide => .{ .f = if (!fp8) (if (s) k.chunks_32_skip else k.chunks_32) else if (s) k.chunks_32_fp8_skip else k.chunks_32_fp8, .hb = hb, .threads = 256, .shared = glue.chunksSmem(heads_tile_wide) },
+        else => error.HeadBlock,
+    };
+}
+
+/// TF_GLM_OVN_SEG_PASS on a decode launch, where its blocks are no more than today's (TP=2's 32-head launches stay)
+fn segTakes(set: glue.Set, heads: usize, hb: usize) bool {
+    if (!set.mla.seg or set.prompt) return false;
+    return cdiv(heads, segLaunchHeads(heads)) <= cdiv(heads, hb);
+}
+
+fn segLaunchHeads(heads: usize) usize {
+    return if (heads > heads_tile and heads <= seg_heads_wide) seg_heads_wide else heads_tile;
+}
+
+/// TF_GLM_OVN_SEG_PASS (decode windows): one 24-head block for 17-24 heads (TP=3's 22 / 21), else 16-head blocks.
+fn segLaunch(k: *const glue.Kernels, fp8: bool, heads: usize) Launch {
+    const wide = segLaunchHeads(heads) == seg_heads_wide;
+    const f = if (wide) (if (fp8) k.chunks_seg24_fp8 else k.chunks_seg24) else if (fp8) k.chunks_seg16_fp8 else k.chunks_seg16;
+    const i = @intFromBool(wide);
+    return .{ .f = f, .hb = if (wide) seg_heads_wide else heads_tile, .threads = glue.seg_threads[i], .shared = glue.seg_smem[i] };
+}
+
+/// The seg pass's wide head block: three QK warps of 8 heads.
+pub const seg_heads_wide = 24;
 
 /// TF_GLM_OVN_MLA_FUSEMERGE: whether a launch of `rows` rows on `hb`-head blocks runs chunks and merge as one kernel.
 fn fuses(m: glue.Mla, rows: usize, hb: usize) bool {
@@ -160,11 +206,22 @@ pub fn sparseAttention(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, 
 }
 
 pub fn sparseAttentionFormat(set: glue.Set, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
+    return sparseAttentionProfile(set, null, stream, qa, cache, scales, t, tokens, counts, w, p, out, rows, heads, lw, scale);
+}
+
+/// sparseAttentionFormat, a decode profile's mla stage split at its chunk pass and merge (attentionProfile's marks).
+pub fn sparseAttentionProfile(set: glue.Set, profile: ?*prof.Prof, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: Table, tokens: u64, counts: u64, w: usize, p: Partials, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = chunksFor(w);
     const hb = headBlock(rows, heads);
-    if (fuses(set.mla, rows, hb)) return fused(set, stream, qa, cache, scales, t, 0, tokens, counts, out, rows, heads, lw, nch, w, scale, true);
+    mark(set, profile, stream, .mla);
+    if (fuses(set.mla, rows, hb)) {
+        try fused(set, stream, qa, cache, scales, t, 0, tokens, counts, out, rows, heads, lw, nch, w, scale, true);
+        return mark(set, profile, stream, .mla_chunks);
+    }
     try chunks(set, stream, qa, cache, scales, t, 0, tokens, counts, p, rows, heads, lw, nch, w, scale, hb, true);
+    mark(set, profile, stream, .mla_chunks);
     try merge(set, stream, p, out, counts, rows, heads, lw, nch, true);
+    mark(set, profile, stream, .mla_merge);
 }
 
 fn merge(set: glue.Set, stream: cuda.Stream, p: Partials, out: u64, counts: u64, rows: usize, heads: usize, lw: usize, nch: usize, sparse: bool) !void {

@@ -1,4 +1,4 @@
-//! TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _KVB8 and _LATENT_MMA launch choices under a recording driver; off is today's.
+//! TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _KVB8, _LATENT_MMA and _SEG_PASS launch choices under a recording driver.
 const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
@@ -8,10 +8,16 @@ const t = std.testing;
 const Rec = struct {
     var n: usize = 0;
     var ids: [8]usize = undefined;
+    var gy: [8]c_uint = undefined;
     var gz: [8]c_uint = undefined;
-    fn run(f: cuda.abi.Function, _: c_uint, _: c_uint, z: c_uint, _: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
+    var bx: [8]c_uint = undefined;
+    var smem: [8]c_uint = undefined;
+    fn run(f: cuda.abi.Function, _: c_uint, y: c_uint, z: c_uint, x: c_uint, _: c_uint, _: c_uint, shared: c_uint, _: cuda.abi.Stream, _: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) c_int {
         ids[n] = @intFromPtr(f);
+        gy[n] = y;
         gz[n] = z;
+        bx[n] = x;
+        smem[n] = shared;
         n += 1;
         return 0;
     }
@@ -108,4 +114,83 @@ test "TF_GLM_OVN_LATENT_MMA: every row of a prompt buffer on the mma forms, deco
     try latent.expandV(off, s, 256, 4096, 0, 512, 4096, 22, 256, 512);
     try t.expectEqualSlices(usize, &.{ id("absorb_q"), id("expand_v") }, Rec.ids[0..Rec.n]);
     try t.expectError(error.LatentShape, latent.absorbQ(prompt, s, 264, 4096, 0, 512, 64, 22, 256, 512)); // q off 16 B
+}
+
+test "TF_GLM_OVN_SEG_PASS: decode chunk launches on the seg pass (24-head blocks for 17-24 heads), prompts as today" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Rec.run;
+    const ks = kernels(&d);
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const on: glue.Set = .{ .glue = &ks, .mla = .{ .seg = true } };
+    try t.expectEqualSlices(usize, &.{ id("chunks_seg24"), id("merge"), id("chunks_seg24"), id("merge") }, try attention(on, s, 0, 2, 16));
+    try t.expectEqualSlices(c_uint, &.{ 1, 22, 1, 22 }, Rec.gy[0..4]); // one block holds every head; merge as today
+    try t.expectEqualSlices(c_uint, &.{ 384, 128, 384, 128 }, Rec.bx[0..4]);
+    try t.expectEqualSlices(c_uint, &.{ 3, 5 }, &.{ Rec.gz[0], Rec.gz[2] }); // nch chunks, sparse.width's five
+    try t.expectEqual(glue.seg_smem[1], Rec.smem[0]);
+    try t.expectEqualSlices(usize, &.{ id("chunks_seg24_fp8"), id("merge"), id("chunks_seg24_fp8"), id("merge") }, try attention(on, s, 64, 70, 32));
+    for ([_][3]usize{ .{ 32, 2, 0 }, .{ 16, 1, 0 }, .{ 64, 4, 64 } }) |x| { // 16-head blocks outside 17-24 heads
+        Rec.n = 0;
+        try latent.attentionFormat(on, s, 256, 512, x[2], .{}, 768, p, 4096, 64, 2, x[0], 512, 3, 0.0625, 16);
+        try t.expectEqual(if (x[2] == 0) id("chunks_seg16") else id("chunks_seg16_fp8"), Rec.ids[0]);
+        try t.expectEqual(@as(c_uint, @intCast(x[1])), Rec.gy[0]);
+        try t.expectEqual(glue.seg_threads[0], Rec.bx[0]);
+        try t.expectEqual(glue.seg_smem[0], Rec.smem[0]);
+    }
+    Rec.n = 0; // TP=2's 32 heads on today's one 32-head block: two seg blocks would double the CTAs, so today's kernel
+    try latent.attentionFormat(on, s, 256, 512, 0, .{}, 768, p, 4096, 64, 8, 32, 512, 3, 0.0625, 32);
+    try t.expectEqual(id("chunks_32"), Rec.ids[0]);
+    try t.expectEqual(@as(c_uint, 1), Rec.gy[0]);
+    const prompt: glue.Set = .{ .glue = &ks, .prompt = true, .mla = .{ .seg = true } }; // prompt buffers: today's kernels
+    try t.expectEqualSlices(usize, &.{ id("chunks_32"), id("merge"), id("chunks_32"), id("merge") }, try attention(prompt, s, 0, 70, 32));
+    try t.expectEqualSlices(c_uint, &.{ 256, 128, 256, 128 }, Rec.bx[0..4]);
+    const fused: glue.Set = .{ .glue = &ks, .mla = .{ .fuse_rows = 64, .skip = true, .seg = true } }; // fused launches first
+    try t.expectEqualSlices(usize, &.{ id("chunks_32_fused"), id("chunks_32_fused") }, try attention(fused, s, 0, 70, 32));
+    try t.expectEqualSlices(usize, &.{ id("chunks_seg24"), id("merge"), id("chunks_seg24"), id("merge") }, try attention(fused, s, 0, 63, 32));
+}
+
+const Ev = struct {
+    var live: usize = 0;
+    fn create(out: *cuda.abi.Event, _: c_uint) callconv(.c) c_int {
+        live += 1;
+        out.* = @ptrFromInt(live);
+        return 0;
+    }
+    fn destroy(_: cuda.abi.Event) callconv(.c) c_int {
+        return 0;
+    }
+    fn record(_: cuda.abi.Event, _: cuda.abi.Stream) callconv(.c) c_int {
+        return 0;
+    }
+};
+
+test "TF_GLM_PROF=1: a decode's mla stage split at its chunk pass and merge; fused launches one part, prompts none" {
+    const prof = @import("cuda_prof.zig");
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Rec.run;
+    d.api.cuEventCreate = Ev.create;
+    d.api.cuEventDestroy_v2 = Ev.destroy;
+    d.api.cuEventRecord = Ev.record;
+    const ks = kernels(&d);
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const pr = try prof.Prof.init(&d, t.io);
+    defer pr.deinit();
+    pr.open = true;
+    for ([_]glue.Set{ .{ .glue = &ks }, .{ .glue = &ks, .mla = .{ .seg = true } } }) |decode| {
+        pr.n = 0;
+        Rec.n = 0;
+        try latent.attentionProfile(decode, pr, s, 256, 512, 0, .{}, 768, p, 4096, 64, 2, 22, 512, 3, 0.0625, 16);
+        try latent.sparseAttentionProfile(decode, pr, s, 256, 512, 0, .{}, 1024, 2048, 2051, p, 4096, 2, 22, 512, 0.0625);
+        try t.expectEqualSlices(prof.Section, &.{ .mla, .mla_chunks, .mla_merge, .mla, .mla_chunks, .mla_merge }, pr.ends[0..pr.n]);
+    }
+    pr.n = 0;
+    Rec.n = 0;
+    const fused: glue.Set = .{ .glue = &ks, .mla = .{ .fuse_rows = 64, .skip = true } };
+    try latent.attentionProfile(fused, pr, s, 256, 512, 0, .{}, 768, p, 4096, 64, 70, 22, 512, 3, 0.0625, 32);
+    try t.expectEqualSlices(prof.Section, &.{ .mla, .mla_chunks }, pr.ends[0..pr.n]);
+    pr.n = 0;
+    Rec.n = 0;
+    const prompt: glue.Set = .{ .glue = &ks, .prompt = true };
+    try latent.attentionProfile(prompt, pr, s, 256, 512, 0, .{}, 768, p, 4096, 64, 70, 22, 512, 3, 0.0625, 32);
+    try t.expectEqual(@as(usize, 0), pr.n);
+    pr.open = false;
 }

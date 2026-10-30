@@ -85,9 +85,10 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
             const seg = if (b.seg.dsa) |x| (if (!b.prefill and x.takes(r.segs.len, f.set(), a, di)) x else null) else null;
-            if (seg) |x| try x.attend(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, di, b.dsa) else for (r.segs) |g| {
+            const split = if (b.prefill) null else f.prof; // TF_GLM_PROF=1: a decode window's mla split (latent.mark)
+            if (seg) |x| try x.attend(.{ .set = f.set(), .ops = f.m.ops(), .prof = split }, f.stream, a, di, b.dsa) else for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
-                try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops(), .shard = dsa_block.index_shard.of(f.m.shard_from, b.prefill, f.exchange, r.w.share.rank, r.w.share.world) }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
+                try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops(), .prof = split, .shard = dsa_block.index_shard.of(f.m.shard_from, b.prefill, f.exchange, r.w.share.rank, r.w.share.world) }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
             }
             try latent.expandV(f.set(), f.stream, b.dsa.ol, a.wv, a.sv, b.dsa.vn, rows, a.heads, a.dv, a.lw);
             if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
