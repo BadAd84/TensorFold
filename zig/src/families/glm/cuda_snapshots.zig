@@ -48,6 +48,7 @@ fn window(e: anytype) ?Window {
     if (comptime !@hasField(@TypeOf(e.*), "drafter")) {
         return null;
     } else {
+        if (!@import("cuda").ovn.on("DRAFT_KEEPWIN")) return null; // knob off: today's code reads no drafter state
         const dr = e.drafter orelse return null;
         const w = dr.window(e.slot, e.cur.st.pos) orelse return null;
         return .{ .ring = w.ring, .from = w.from };
@@ -59,6 +60,7 @@ fn windowBytes(e: anytype) u64 {
     if (comptime !@hasField(@TypeOf(e.*), "drafter")) {
         return 0;
     } else {
+        if (!@import("cuda").ovn.on("DRAFT_KEEPWIN")) return 0;
         const dr = e.drafter orelse return 0;
         return if (dr.knobs.keepwin) ring_bytes else 0;
     }
