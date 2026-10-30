@@ -51,10 +51,12 @@ pub fn addStreams(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {
     };
 }
 
-/// Whether `s` may join a batched prompt pass beside chunked fills: short, text only, nothing kept to resume from.
+/// Whether `s` may join a batched prompt pass beside chunked fills: short, text only, nothing kept to resume from
+/// unless the backend takes resumed prompts there too (many_resumed: then the rows past the kept state count).
 pub fn batchable(e: *const Engine, s: *const Stream) bool {
     const n = e.backend.vtable.many_rows;
-    return n > 0 and s.prompt_len <= n and s.images.len == 0 and s.reuse.saved == null;
+    const rows = if (s.reuse.saved != null) s.prompt_len -| s.reuse.at else s.prompt_len;
+    return n > 0 and rows <= n and s.images.len == 0 and (s.reuse.saved == null or e.backend.vtable.many_resumed);
 }
 
 fn addEach(e: *Engine, ss: []const *Stream, errs: []?anyerror) void {

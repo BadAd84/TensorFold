@@ -12,7 +12,7 @@ const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, costs };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -279,6 +279,26 @@ pub const Leader = struct {
         try x.e.prefillMany(parts, firsts);
     }
 
+    /// TF_GLM_OVN_MULTI_FILL: a pass of prompt pieces on every rank (cuda_prompt_pieces), a `many` step with flag 1.
+    pub fn prefillPieces(x: Leader, pieces: []const @import("cuda_prompt_pieces.zig").Piece, marks: []const ?engine.Marks, firsts: []?u32) !void {
+        const pp = @import("cuda_prompt_pieces.zig");
+        var buf: [pp.words]u32 = undefined;
+        const ids = try pp.encode(pieces, x.e.capacity, &buf);
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.many), .flags = 1, .depth = @intCast(pieces.len) }, ids);
+        try pp.run(x.e, pieces, marks, firsts);
+    }
+
+    /// TF_GLM_OVN_SEG_COMMIT: several streams' commits as one `keep` step with flag 1 (slot, rows pairs).
+    pub fn keepShared(x: Leader, kept: []const @import("cuda_commit_seg.zig").Kept) !void {
+        if (kept.len == 0 or kept.len > engine.max_shared) return error.BadCommit;
+        try x.flush();
+        var buf: [2 * engine.max_shared]u32 = undefined;
+        for (kept, 0..) |k, i| buf[2 * i ..][0..2].* = .{ k.slot, k.n };
+        try x.send(.{ .kind = @backingInt(Kind.keep), .flags = 1 }, buf[0 .. 2 * kept.len]);
+        try x.e.keepShared(kept);
+    }
+
     pub fn keep(x: Leader, n: usize) !void {
         try x.flush();
         try x.send(.{ .kind = @backingInt(Kind.keep), .a = n }, &.{});
@@ -314,6 +334,13 @@ pub const Leader = struct {
         var hh = h;
         hh.kind = @backingInt(Kind.disk);
         try x.send(hh, ids);
+    }
+
+    /// TF_GLM_OVN_COST_TIME: every rank runs the timed passes (cuda_cost_time.run); rank 0's tables.
+    pub fn costs(x: Leader) !@import("cuda_cost_time.zig").Timed {
+        try x.flush();
+        try x.send(.{ .kind = @backingInt(Kind.costs) }, &.{});
+        return @import("cuda_cost_time.zig").run(x.e);
     }
 
     /// The other ranks leave their loops.
@@ -405,12 +432,29 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try e.verifyShared(parts[0..k]);
             },
             .many => {
+                if (h.flags & 1 != 0) { // TF_GLM_OVN_MULTI_FILL's pieces
+                    const pp = @import("cuda_prompt_pieces.zig");
+                    var pieces: [engine.max_together]pp.Piece = undefined;
+                    var firsts: [engine.max_together]?u32 = undefined;
+                    try pp.run(e, try pp.decode(step.ids, h.depth, e.capacity, &pieces), null, &firsts);
+                    continue;
+                }
                 var parts: [engine.max_together]engine.Prompt = undefined;
                 const decoded = try prompt_wire.decode(step.ids, h.depth, e.capacity, &parts);
                 var firsts: [engine.max_together]u32 = undefined;
                 try e.prefillMany(decoded, &firsts);
             },
-            .keep => try e.keep(@intCast(h.a)),
+            .keep => {
+                if (h.flags & 1 == 0) {
+                    try e.keep(@intCast(h.a));
+                    continue;
+                }
+                var kept: [engine.max_shared]@import("cuda_commit_seg.zig").Kept = undefined;
+                const k = step.ids.len / 2;
+                if (k == 0 or k > kept.len or step.ids.len != 2 * k) return error.BadStep;
+                for (kept[0..k], 0..) |*q, i| q.* = .{ .slot = step.ids[2 * i], .n = step.ids[2 * i + 1] };
+                try e.keepShared(kept[0..k]);
+            },
             .draft => {
                 const ids = try e.gpa.dupe(u32, step.ids);
                 defer e.gpa.free(ids);
@@ -430,6 +474,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
             },
             .snapshots => try @import("cuda_snapshots.zig").agree(e, h.a),
             .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, step.ids),
+            .costs => _ = try @import("cuda_cost_time.zig").run(e),
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),
             .idle => cuda.tp_watch.sleep(e.io),

@@ -191,9 +191,28 @@ extern "C" __global__ void tf_glm_conv_shift(__nv_bfloat16* conv, const __nv_bfl
   for (int j = 0; j < 3; ++j) conv[l * conv_layer + j * c + k] = v[j];
 }
 
+// TF_GLM_OVN_SEG_COMMIT: tf_glm_conv_shift for each stream of a shared round, stream blockIdx.z's conv, rows, keep.
+struct tf_glm_conv_seg {
+  __nv_bfloat16* conv;
+  const __nv_bfloat16* proj;
+  int64_t keep;
+};
+extern "C" __global__ void tf_glm_conv_shift_seg(const tf_glm_conv_seg* seg, int64_t conv_layer, int64_t proj_layer,
+                                                 int64_t proj_row, int64_t c) {
+  const int64_t k = glm_glue::col();
+  if (k >= c) return;
+  const tf_glm_conv_seg s = seg[blockIdx.z];
+  const int64_t l = blockIdx.x;
+  __nv_bfloat16 v[3];
+  for (int j = 0; j < 3; ++j) {
+    const int64_t src = s.keep + j;
+    v[j] = src < 3 ? s.conv[l * conv_layer + src * c + k] : s.proj[l * proj_layer + (src - 3) * proj_row + k];
+  }
+  for (int j = 0; j < 3; ++j) s.conv[l * conv_layer + j * c + k] = v[j];
+}
+
 // decode.sample_rows' greedy pick, as the host scan: first max of n bf16 logits, NaN never wins; out fp32 bits, lo+id.
-extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned short* logits, int64_t n, unsigned lo,
-                                                                unsigned* out) {
+__device__ __forceinline__ void glm_top1_row(const unsigned short* logits, int64_t n, unsigned lo, unsigned* out) {
   __shared__ float sv[1024];
   __shared__ unsigned si[1024];
   const int t = threadIdx.x;
@@ -217,6 +236,17 @@ extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned sh
     out[0] = __float_as_uint(sv[0]);
     out[1] = lo + (si[0] == 0xffffffffu ? 0u : si[0]);
   }
+}
+
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1(const unsigned short* logits, int64_t n, unsigned lo,
+                                                                unsigned* out) {
+  glm_top1_row(logits, n, lo, out);
+}
+
+// TF_GLM_OVN_DRAW1: tf_glm_top1 of row blockIdx.x (rows `stride` logits apart), its pick at out + 4 * row.
+extern "C" __global__ void __launch_bounds__(1024) tf_glm_top1_rows(const unsigned short* logits, int64_t n,
+                                                                     unsigned lo, int64_t stride, unsigned* out) {
+  glm_top1_row(logits + blockIdx.x * stride, n, lo, out + 4 * blockIdx.x);
 }
 
 // The leader's step for the other ranks, written to the link's buffer from launch arguments (cuda_follow's Link.send).

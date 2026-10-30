@@ -184,6 +184,7 @@ pub const Buffers = struct {
     mcat: u64, // bf16 [rows][2 dims]: [enorm(me) | hnorm(hin)]
     mx: u64, // bf16 [rows][dims]: its stream
     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
+    seg_kda: ?*@import("cuda_kda_seg.zig").SegKda = null, // TF_GLM_OVN_SEG_KDA: a shared window's chains at once
 
     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
         return make(d, w, rows, prefill, capacity, rows, null);

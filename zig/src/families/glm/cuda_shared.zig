@@ -26,6 +26,7 @@ pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
         g.st.pending = g.rows;
         g.st.prompt = r.b.prefill;
     }
+    if (r.b.seg_kda) |x| if (!r.b.prefill) try x.fill(r.segs, stream);
 }
 
 /// Forward.finish's head on a prompt buffer: each segment's last final-norm row, logits row k for segment k.
@@ -47,6 +48,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             var s = b.kda;
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
+            const seg = if (r.b.seg_kda) |x| (if (!b.prefill and x.segs == r.segs.len) x else null) else null;
             for (r.segs) |g| {
                 const st = g.st;
                 const cur = st.cur[li];
@@ -70,8 +72,9 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
                 v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
-                try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
+                if (seg == null) try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
             }
+            if (seg) |x| try x.chains(&f.m.kda, f.stream, k, s, li, rows, f.kda_wide); // TF_GLM_OVN_SEG_KDA
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
         },
         .mla => |a| {
