@@ -88,6 +88,11 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
 /// The block up to its out_proj (s.vn holds the expanded rows).
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
     try prepareProfile(k.set, stream, l, s, x, x_stride, rows, sparseRows(l, host_pos, rows), k.prof);
+    try rest(k, stream, l, c, s, rows, pos, host_pos, nch, part_rows);
+}
+
+/// body once its prepare ran on every row (prepareRows, TF_GLM_OVN_FRONTS): attention, then the rows in s.vn.
+pub fn rest(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize) !void {
     try attend(k, stream, l, c, s, 0, rows, pos, host_pos, nch, part_rows);
     const stamp = prof.span(k.prof, stream, .projections);
     defer stamp.end();
@@ -105,20 +110,38 @@ pub fn prepare(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64,
 }
 
 pub fn prepareProfile(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, qi: bool, profile: ?*prof.Prof) !void {
-    var stamp = prof.span(profile, stream, .replicated_qakva);
+    return prepareRows(set, stream, l, s, x, x_stride, 0, rows, qi, profile);
+}
+
+/// prepareProfile on rows lo..hi, each output row at its own row; `qi` as the whole chunk's (sparseRows of every row).
+pub fn prepareRows(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, qi: bool, profile: ?*prof.Prof) !void {
+    const ix = l.index;
     const width = l.q_lora + l.lw;
-    try projection.matmul(set, stream, l.proj, x, x_stride, s.dp, s.mm_part, rows, width, l.dims, false);
-    try glue.rmsnorm(set, stream, s.dp, width, l.q_norm, s.qr, l.q_lora, s.xs_qr, l.eps, rows, l.q_lora);
-    try glue.rmsnorm(set, stream, s.dp + l.q_lora * 2, width, l.kv_norm, s.lat, l.lw, s.xs_lat, l.eps, rows, l.lw);
+    const rows = hi - lo;
+    const xr = x + lo * x_stride * 2;
+    var v = s; // the row buffers from row lo (the split-K and router partials hold only this call's rows)
+    v.dp += lo * width * 2;
+    v.qr += lo * l.q_lora * 2;
+    v.xs_qr += lo * (l.q_lora / 64) * 4;
+    v.lat += lo * l.lw * 2;
+    v.xs_lat += lo * (l.lw / 64) * 4;
+    v.q += lo * l.heads * l.qk * 2;
+    v.ikr += lo * (ix.d + ix.heads) * 2;
+    v.igr += lo * ix.d * 4;
+    v.qa += lo * l.heads * l.lw * 2;
+    v.qi += lo * ix.heads * ix.d * 2;
+    var stamp = prof.span(profile, stream, .replicated_qakva);
+    try projection.matmul(set, stream, l.proj, xr, x_stride, v.dp, v.mm_part, rows, width, l.dims, false);
+    try glue.rmsnorm(set, stream, v.dp, width, l.q_norm, v.qr, l.q_lora, v.xs_qr, l.eps, rows, l.q_lora);
+    try glue.rmsnorm(set, stream, v.dp + l.q_lora * 2, width, l.kv_norm, v.lat, l.lw, v.xs_lat, l.eps, rows, l.lw);
     stamp.end();
     stamp = prof.span(profile, stream, .projections);
     defer stamp.end();
-    try projection.matmul(set, stream, l.q_b, s.qr, l.q_lora, s.q, s.mm_part, rows, l.heads * l.qk, l.q_lora, false);
-    const ix = l.index;
-    try projection.matmul(set, stream, ix.kw, x, x_stride, s.ikr, s.mm_part, rows, ix.d + ix.heads, l.dims, false);
-    try glue.router(set, stream, x, x_stride, ix.gate, s.igr, s.router_part, rows, l.dims, ix.d);
-    try latent.absorbQ(set, stream, s.q, l.wk, s.qa, rows, l.heads, l.qk, l.lw);
-    if (qi) try projection.matmul(set, stream, ix.qb, s.qr, l.q_lora, s.qi, s.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
+    try projection.matmul(set, stream, l.q_b, v.qr, l.q_lora, v.q, v.mm_part, rows, l.heads * l.qk, l.q_lora, false);
+    try projection.matmul(set, stream, ix.kw, xr, x_stride, v.ikr, v.mm_part, rows, ix.d + ix.heads, l.dims, false);
+    try glue.router(set, stream, xr, x_stride, ix.gate, v.igr, v.router_part, rows, l.dims, ix.d);
+    try latent.absorbQ(set, stream, v.q, l.wk, v.qa, rows, l.heads, l.qk, l.lw);
+    if (qi) try projection.matmul(set, stream, ix.qb, v.qr, l.q_lora, v.qi, v.mm_part, rows, ix.heads * ix.d, l.q_lora, false);
 }
 
 /// One sequence's rows r0..r0 + rows at pos: latent and index keys written, dense then sparse attention into s.ol.

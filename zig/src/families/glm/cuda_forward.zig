@@ -134,16 +134,28 @@ pub const Pieces = struct {
     glues: [max_pieces]cuda.Event, // split: a piece's own rows glued
     shared: [max_pieces]cuda.Event, // split: every rank's glued rows of a piece in
     owns_side: bool = true, // a paired step's second chunk (initTwin) runs on the first's side stream
+    peer_first: usize = 0, // TF_GLM_OVN_PEER_FIRST: a split piece's peers' rows fill first, from this many rows a share
+    fronts: usize = 0, // TF_GLM_OVN_FRONTS: the next block's front runs in each glue, from this many rows a call
 
-    /// With `pair` (TF_GLM_PROMPT_PAIR) the side stream runs at the highest priority, ahead of the main stream's grids.
+    /// With `pair` (TF_GLM_PROMPT_PAIR) the side stream runs at the highest priority (TF_GLM_OVN_SIDE_PRIO=0: normal).
     pub fn init(d: *const cuda.Driver, count: usize, pair: bool) !Pieces {
         if (count == 0 or count > max_pieces) return error.BadPieces;
-        return make(d, count, if (pair) try cuda.Stream.initPriority(d, .highest) else try cuda.Stream.init(d, false), true);
+        const prio = try cuda.ovn.int("SIDE_PRIO", 1); // 0: a paired side stream at normal priority; unset: the highest
+        const high = pair and prio != 0;
+        const peer_first = try cuda.ovn.int("PEER_FIRST", 0);
+        const fronts = try cuda.ovn.int("FRONTS", 0);
+        var p = try make(d, count, if (high) try cuda.Stream.initPriority(d, .highest) else try cuda.Stream.init(d, false), true);
+        p.peer_first = @intCast(peer_first);
+        p.fronts = @intCast(fronts);
+        return p;
     }
 
     /// A paired step's second chunk on `of`'s side stream: every rank posts both chunks' exchanges in one order.
     pub fn initTwin(d: *const cuda.Driver, of: *const Pieces) !Pieces {
-        return make(d, of.count, of.side, false);
+        var p = try make(d, of.count, of.side, false);
+        p.peer_first = of.peer_first;
+        p.fronts = of.fronts;
+        return p;
     }
 
     fn make(d: *const cuda.Driver, count: usize, side: cuda.Stream, owns_side: bool) !Pieces {
@@ -255,6 +267,11 @@ pub const Forward = struct {
 
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
     pub fn mixer(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64) !void {
+        return f.mixerFrom(r, l, li, di, rows, nch, out, false);
+    }
+
+    /// mixer; `fronted` (a prompt chunk, TF_GLM_OVN_FRONTS): the block's front already ran on every row, its rest runs.
+    pub fn mixerFrom(f: *const Forward, r: Rank, l: weights.Layer, li: usize, di: usize, rows: usize, nch: usize, out: ?u64, fronted: bool) !void {
         const c = &r.w.config;
         const b = r.b;
         const st = r.st;
@@ -272,12 +289,13 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
+                if (fronted) try kda_block.restProfile(f.set(), &f.m.kda, f.stream, k, s, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof) else try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
             .mla => |a| {
-                try dsa_block.body(.{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) }, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
+                const ks: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .prof = f.prof, .split = f.indexSplit(r) };
+                if (fronted) try dsa_block.rest(ks, f.stream, a, st.caches[di], b.dsa, rows, st.pos_dev, st.pos, nch, b.part_rows) else try dsa_block.body(ks, f.stream, a, st.caches[di], b.dsa, b.normed, c.hidden, rows, st.pos_dev, st.pos, nch, b.part_rows);
                 if (out) |o| try dsa_block.fill(f.set(), f.stream, a, b.dsa, 0, rows, o);
             },
         }
@@ -310,11 +328,11 @@ pub const Forward = struct {
         }
     }
 
-    fn mlpKernels(f: *const Forward) mlp.Kernels {
+    pub fn mlpKernels(f: *const Forward) mlp.Kernels {
         return .{ .set = f.set(), .linear = .{ .lane = &f.m.lane, .nvfp4_prompt = &f.m.prompt }, .copy_rows = f.m.copy_rows };
     }
 
-    fn moeKernels(f: *const Forward) moe.Kernels {
+    pub fn moeKernels(f: *const Forward) moe.Kernels {
         return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
     }
 
@@ -357,8 +375,6 @@ pub const Forward = struct {
         try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, stream.handle), "cuMemcpyDtoDAsync");
     }
 
-    const exchangePieces = @import("cuda_forward_pieces.zig").exchangePieces;
-
     /// hc_post of rows lo..hi from partials `g` [world][hi - lo][D] (a gathered room or a split one's own rows).
     fn postRows(f: *const Forward, r: Rank, lo: usize, hi: usize, g: u64) !void {
         const c = &r.w.config;
@@ -390,33 +406,7 @@ pub const Forward = struct {
         try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
     }
 
-    const gluePieces = @import("cuda_forward_pieces.zig").gluePieces;
-    const tapPieces = @import("cuda_forward_pieces.zig").tapPieces;
-    const shareTaps = @import("cuda_forward_pieces.zig").shareTaps;
-
-    /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
-    fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
-        const layers = f.ranks[0].w.layers;
-        for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
-        var li: usize = 0;
-        var di: usize = 0;
-        for (layers, 0..) |_, j| {
-            prof_mod.context(f.prof, j, null, .mixer);
-            for (f.ranks) |r| if (r.segs.len > 0) try shared.mixer(f, r, r.w.layers[j], li, di, R, null) else try f.mixer(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null);
-            try f.exchangePieces(p, j, .mixer, cut);
-            try f.gluePieces(p, j, .mixer, cut);
-            prof_mod.context(f.prof, j, null, .ffn);
-            for (f.ranks) |r| try f.ffn(r, r.w.layers[j], R, null);
-            try f.exchangePieces(p, j, .ffn, cut);
-            try f.gluePieces(p, j, .ffn, cut);
-            if (f.taps) |t| try f.tapPieces(t, j, cut);
-            switch (layers[j].mixer) {
-                .kda => li += 1,
-                .mla => di += 1,
-            }
-        }
-        if (f.taps) |t| try f.shareTaps(t, cut);
-    }
+    const pieced = @import("cuda_forward_pieces.zig").pieced;
 
     pub const pairBody = @import("cuda_forward_pair.zig").pairBody;
 
