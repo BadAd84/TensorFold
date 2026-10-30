@@ -3,6 +3,7 @@ const std = @import("std");
 const pc = @import("prompt_cache.zig");
 const prefix = @import("prompt_prefix.zig");
 
+/// The entry to free first: a superseded one, oldest; else the oldest (none while `spares_only`: a latest state stays).
 pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
     var best: ?usize = null;
     var oldest: ?usize = null;
@@ -20,7 +21,7 @@ pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born
         // gated, the links first (a branch point needs no compare); off, as it always asked
         if (if (prefix.gated()) extended(s, e) or (now and on.get()) else (now and on.get()) or extended(s, e)) best = i;
     }
-    return best orelse oldest;
+    return best orelse if (s.spares_only) null else oldest;
 }
 
 /// Only live continuations make a prefix a branch point or a superseded state.

@@ -157,6 +157,7 @@ pub const Store = struct {
     links_lost: bool = false, // an allocation failure left the extension links incomplete: `extended` scans
     walks: u64 = 0, // TF_GLM_OVN_KEPT_WALK: link walks so far, each marking the entries it proved (Entry.seen)
     hold: bool = false, // memory pressure: lookups plan no marks and keeps refuse, so no new state is kept
+    spares_only: bool = false, // set around a call: it evicts only superseded states, never a conversation's latest
 
     repeat_log: @import("prompt_cache_repeat.zig").Log = .{},
     const SHARED_KEYS = 64;

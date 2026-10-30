@@ -71,7 +71,7 @@ pub const LaneHost = struct {
     admissions: u64 = 0, // jobs admitted so far: each job's `seq`
     memory_lanes: ?usize = null, // lanes the backend had memory for at its last LaneMemory, until a job ends
     warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk (0: none), set by its family
-    warm_alone: bool = false, // the wait ends at any other admitted job too (a filling prompt), set by its family
+    warm_spares: bool = false, // a warm pass's lookups and keeps evict only superseded states, set by its family
     disk: rows_host.Disk = .{}, // the Mac app's questions about kept states, and the disk writer's quiet
     scores: scoring.Queue = .{}, // decisions' label scores waiting for the engine thread (lane_host_score.zig)
     /// Runs first on the engine thread: a backend whose API state is per thread (a CUDA context) binds it there.
@@ -222,12 +222,12 @@ pub const LaneHost = struct {
         return h.queued.items.len > 0 and !h.queued.items[0].request.background;
     }
 
-    /// Waits `warm_quiet` for other work (a request, a decoding stream, a cancel; `warm_alone`: another admitted job).
+    /// Waits `warm_quiet` for other work (a request, a decoding stream, a cancel): true if none came.
     fn quiet(h: *LaneHost, job: *const Job) bool {
         const until: std.Io.Timeout = .{ .deadline = .fromNow(h.io, .{ .raw = .fromNanoseconds(h.warm_quiet), .clock = .awake }) };
         h.lock();
         defer h.unlock();
-        while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and !(h.warm_alone and h.admitted.items.len > 1) and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
+        while (!h.closing and !h.foregroundWaiting() and h.core.activeCount() == 0 and std.mem.indexOfScalar(Id, h.cancels.items, job.id) == null) {
             h.wake.waitTimeout(h.io, &h.mutex, until) catch |e| return e == error.Timeout;
         }
         return false;
@@ -324,7 +324,8 @@ pub const LaneHost = struct {
     /// A taken job's stream, set up to start; null when the job ended instead (dropped or cancelled).
     pub fn setup(h: *LaneHost, job: *Job) ?i96 {
         const r = job.request;
-        if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.ended(h.cancel(job)); // other work came first
+        // another admitted job (a stream, a prompt filling by steps or taken into a batch): the pass would run in it
+        if (r.background and r.max_tokens == 0 and (h.admitted.items.len > 1 or (h.warm_quiet > 0 and !h.quiet(job)))) return h.ended(h.cancel(job));
         if (!lane_stream.open(h, job)) return null; // the job was finished instead
         return job.began;
     }

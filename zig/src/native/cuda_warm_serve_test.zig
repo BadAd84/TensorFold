@@ -1,9 +1,9 @@
-//! A family's warm-turn wait and warm_alone reach the real lane host without a device (Host.serve).
+//! A family's warm-turn wait and warm_spares reach the real lane host without a device (Host.serve).
 const std = @import("std");
 const lanes = @import("lanes");
 
-/// The host's warm_quiet and warm_alone after serving family F with warm turns on or off.
-fn served(comptime Host: type, comptime serve: anytype, comptime F: type, warm: bool) !struct { quiet: u64, alone: bool } {
+/// The host's warm_quiet and warm_spares after serving family F with warm turns on or off.
+fn served(comptime Host: type, comptime serve: anytype, comptime F: type, warm: bool) !struct { quiet: u64, spares: bool } {
     const gpa = std.testing.allocator;
     const Family = struct {
         fn release(_: *anyopaque) void {}
@@ -20,23 +20,23 @@ fn served(comptime Host: type, comptime serve: anytype, comptime F: type, warm: 
         h.core.deinit();
         h.cfg.deinit(gpa);
     }
-    return .{ .quiet = h.host.warm_quiet, .alone = h.host.warm_alone };
+    return .{ .quiet = h.host.warm_quiet, .spares = h.host.warm_spares };
 }
 
 pub fn check(comptime Host: type, comptime serve: anytype) !void {
-    const Glm = struct { // GLM's shape: a knob's wait at load, and its pass waits out every admitted prompt
+    const Glm = struct { // GLM's shape: a knob's wait at load, and its pass evicts no conversation's latest state
         pub fn warmQuietNow() ?u64 {
             return 7;
         }
-        pub const warm_alone = true;
+        pub const warm_spares = true;
     };
     const Fixed = struct { // Nemotron's: a constant wait
         pub const warm_quiet: u64 = 150;
     };
     const on = try served(Host, serve, Glm, true);
-    try std.testing.expect(on.quiet == 7 and on.alone);
+    try std.testing.expect(on.quiet == 7 and on.spares);
     const fixed = try served(Host, serve, Fixed, true);
-    try std.testing.expect(fixed.quiet == 150 and !fixed.alone);
+    try std.testing.expect(fixed.quiet == 150 and !fixed.spares);
     const off = try served(Host, serve, Glm, false);
-    try std.testing.expect(off.quiet == 0 and !off.alone); // no warm turns: no wait, nothing waited out
+    try std.testing.expect(off.quiet == 0 and !off.spares); // no warm turns: no wait, no guard
 }

@@ -39,8 +39,8 @@ pub fn snapGridNow() ?u32 {
 pub fn warmQuietNow() ?u64 {
     return @import("cuda_reply_prefill.zig").quietNs();
 }
-/// That pass also waits out every other admitted job: a stepped or batched prompt fills on the same thread.
-pub const warm_alone = true;
+/// That pass keeps nothing it would evict a conversation's latest state for (production's cap_spares).
+pub const warm_spares = true;
 /// `explain` words this family's open refusals too (where to set the rank and the id).
 pub const explains_open = true;
 

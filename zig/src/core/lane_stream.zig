@@ -24,12 +24,14 @@ pub fn open(h: *LaneHost, job: *Job) bool {
             job.key[0] = 0x8000_0000 | @as(u32, @truncate(std.hash.Wyhash.hash(f, std.mem.asBytes(&job.key[0])) & 0x7fff_ffff));
         }
     };
+    if (h.cache) |store| store.spares_only = job.spares(); // its lookup makes room for its marks: no latest state goes
     if (h.cache) |store| if (r.embedding == null and r.prompt_logprobs == null and !r.untaught) if (store.lookupUser(h.gpa, job.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.user_end, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
         job.entry = l.entry;
         job.kept0 = store.counts.kept;
         job.marks = l.marks;
         reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
     } else |_| {};
+    if (h.cache) |store| store.spares_only = false;
     if (h.proposers) |ps| {
         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
     } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
