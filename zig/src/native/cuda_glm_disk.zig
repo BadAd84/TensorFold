@@ -17,6 +17,8 @@ pub const image: rows.Image = .{ .parts = parts, .gather = gather, .blank = blan
 /// Every rank's prefix bytes, read at attach (one GLM engine a process; rank 0 alone serves).
 var prefix_buf: [8]u64 = undefined;
 var prefixes: []const u64 = &.{};
+/// TF_GLM_OVN_DISK_BCAST, read at attach: a restore's shared bytes go to the other ranks by broadcast from rank 0.
+var bcast = false;
 
 fn engineOf(ptr: *anyopaque) *Engine {
     return @ptrCast(@alignCast(ptr));
@@ -98,6 +100,10 @@ fn scatter(ptr: *anyopaque, saved: api.prompt_cache.Saved, ranges: []const rows.
             const bytes = in[o..][0..n];
             o += n;
             if (p.rank == 0 and p.off < img.Words.bytes) continue; // the words went with the seal
+            if (p.shared and bcast) {
+                try ranks.share(e, k.id, p.off, bytes, prefixes);
+                continue;
+            }
             try ranks.put(e, p.rank, k.id, p.off, bytes);
             if (p.shared) for (prefixes[1..], 1..) |q, r| try ranks.put(e, @intCast(r), k.id, p.off - prefixes[0] + q, bytes);
         }
@@ -163,6 +169,7 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
     if (e.share.world > prefix_buf.len) return error.TooManyRanks;
     try ranks.prefixes(e, prefix_buf[0..e.share.world]);
     prefixes = prefix_buf[0..e.share.world];
+    bcast = cuda.ovn.on("DISK_BCAST");
     const sh = try ranks.shape(e);
     var facts: std.ArrayList(u64) = .empty;
     try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null) });

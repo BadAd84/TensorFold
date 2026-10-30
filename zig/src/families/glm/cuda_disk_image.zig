@@ -210,6 +210,21 @@ pub const Copy = struct {
         }
     }
 
+    /// The device address of image bytes [off, off + n) (n > 0): one lease segment inside one snapshot page.
+    pub fn device(c: Copy, off: u64, n: u64) !u64 {
+        const arena = c.pool.arena orelse return error.NoSnapshotRoom;
+        for (c.segs) |s| {
+            if (off < s.img or off + n > s.img + s.len) continue;
+            const at = switch (s.from) {
+                .lease => |l| l + (off - s.img),
+                else => return error.SnapshotShape,
+            };
+            if (at % pages.page + n > pages.page or at + n > c.lease.ids.items.len * pages.page) return error.SnapshotSize;
+            return arena.ptr + @as(u64, c.lease.ids.items[@intCast(at / pages.page)]) * pages.page + at % pages.page;
+        }
+        return error.SnapshotShape;
+    }
+
     /// Lease bytes from `at`, a page at a time (each page is a run of the snapshot arena).
     fn leased(c: Copy, at: u64, host: []u8, out: bool) !void {
         const arena = c.pool.arena orelse return error.NoSnapshotRoom;

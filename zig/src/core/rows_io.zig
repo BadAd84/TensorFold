@@ -14,6 +14,7 @@ pub const File = struct {
     meta: []const []const u8 = &.{},
     writer: ?file.Writer = null,
     bytes: u64 = 0,
+    ring: bool = false, // TF_GLM_OVN_DISK_PUMP: the payload is a ring slot, given back once written
 };
 
 pub const Job = struct {
@@ -35,6 +36,10 @@ pub const Job = struct {
     done: std.atomic.Value(bool) = .init(false),
     taken: bool = false,
     failure: ?anyerror = null,
+    staged_files: std.atomic.Value(usize) = .init(std.math.maxInt(usize)), // files whose payloads are ready to write
+    abandoned: std.atomic.Value(bool) = .init(false), // the engine stopped staging it: it fails at its next unready file
+    slots: u64 = 0, // ring slots the engine staged into (engine thread only)
+    freed: std.atomic.Value(u64) = .init(0), // of those, the ones the worker gave back
 
     /// The block files it writes: every file but the last, which is the state's own.
     pub fn blocks(j: *const Job) []File {
@@ -51,6 +56,43 @@ pub const Job = struct {
 /// The stems of the blocks jobs in flight are writing.
 pub const Promised = std.AutoHashMapUnmanaged(chain.Stem, void);
 
+/// TF_GLM_OVN_DISK_PUMP: reusable, pre-touched staging slots, taken in order by the engine and given back in order.
+pub const Ring = struct {
+    buf: []u8,
+    slot: usize,
+    count: u64,
+    head: u64 = 0, // slots taken (engine thread only)
+    tail: std.atomic.Value(u64) = .init(0), // slots given back
+
+    /// `count` slots of `slot` bytes, every page written once now so no staging copy faults.
+    pub fn create(slot: usize, count: u64) !*Ring {
+        const g = try allocator.create(Ring);
+        errdefer allocator.destroy(g);
+        const buf = try allocator.alloc(u8, slot * count);
+        @memset(buf, 0);
+        g.* = .{ .buf = buf, .slot = slot, .count = count };
+        return g;
+    }
+
+    fn destroy(g: *Ring) void {
+        allocator.free(g.buf);
+        allocator.destroy(g);
+    }
+
+    /// The next slot, or null while every slot waits to be written.
+    pub fn take(g: *Ring) ?[]u8 {
+        if (g.head - g.tail.load(.acquire) >= g.count) return null;
+        const s = g.buf[@intCast((g.head % g.count) * g.slot)..][0..g.slot];
+        g.head += 1;
+        return s;
+    }
+
+    /// A job done (engine thread, at reap): the slots it took and the worker never gave back are free again.
+    pub fn reclaim(g: *Ring, j: *const Job) void {
+        _ = g.tail.fetchAdd(j.slots - j.freed.load(.acquire), .release);
+    }
+};
+
 pub const Worker = struct {
     dir: [:0]u8,
     io: file.IO,
@@ -63,6 +105,7 @@ pub const Worker = struct {
     exited: std.atomic.Value(bool) = .init(false),
     refs: std.atomic.Value(u32) = .init(2),
     thread: std.Thread,
+    ring: ?*Ring = null, // TF_GLM_OVN_DISK_PUMP's, made by the engine, freed with the worker
 
     pub fn open(dir: []const u8, limit: u64, io: file.IO) !*Worker {
         const w = try allocator.create(Worker);
@@ -241,7 +284,11 @@ pub const Worker = struct {
     }
 
     fn write(w: *Worker, j: *Job) !void {
-        for (j.files) |*f| {
+        for (j.files, 0..) |*f, i| {
+            while (j.staged_files.load(.acquire) <= i) {
+                if (!w.valid(j) or j.abandoned.load(.acquire)) return error.Cancelled;
+                nap();
+            }
             if (!w.valid(j)) return error.Cancelled;
             const ext: []const u8 = if (f.trailer.kind == @backingInt(file.Kind.state)) ".st" else ".blk";
             f.writer = try file.Writer.openUnique(w.dir, &chain.hex(f.trailer.name), ext, j.id);
@@ -257,6 +304,10 @@ pub const Worker = struct {
             if (!w.valid(j)) return error.Cancelled;
             f.bytes = try out.seal(f.trailer, f.meta, true);
             if (j.verify) try verifyFile(f);
+            if (f.ring) {
+                _ = j.freed.fetchAdd(1, .release);
+                _ = w.ring.?.tail.fetchAdd(1, .release);
+            }
         }
         if (!w.valid(j)) return error.Cancelled;
     }
@@ -273,6 +324,7 @@ pub const Worker = struct {
     fn release(w: *Worker) void {
         if (w.refs.fetchSub(1, .acq_rel) != 1) return;
         allocator.free(w.dir);
+        if (w.ring) |g| g.destroy();
         allocator.destroy(w);
     }
 };

@@ -2,15 +2,16 @@
 const std = @import("std");
 const follow = @import("cuda_follow.zig");
 const image = @import("cuda_disk_image.zig");
+const page = @import("cuda_snapshot_pages.zig").page;
 const Engine = @import("cuda_engine.zig").Engine;
 
 /// A disk step's op (Header.flags); its id is `a`, its image offset `seed`, its bytes `depth`, its rank `top_k`.
-pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes };
+pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, bcast };
 const kind = @backingInt(follow.Kind.disk); // each op crosses the follow link as a disk step, its bytes as the ids
 
-/// This rank's image shape (every sequence of the engine has the same).
+/// This rank's image shape (every sequence of the engine has the same; TF_GLM_OVN_DROP_MTP's hold no head caches).
 pub fn shape(e: *const Engine) !image.Shape {
-    return image.Shape.of(&e.cur.st, &e.c, e.capacity, e.mtp);
+    return image.Shape.of(&e.cur.st, &e.c, e.capacity, e.mtp and !@import("cuda_state.zig").drop_mtp);
 }
 
 /// The words of a kept state on this rank: its position, head rows, ring bases and KDA copy bits.
@@ -24,16 +25,22 @@ pub fn wordsOf(e: *const Engine, id: u64) !image.Words {
 
 /// Bytes [off, off + host.len) of this rank's image of `id`, out (lease to host) or in; unsealed: before its head only.
 pub fn copy(e: *Engine, id: u64, off: u64, host: []u8, out: bool) !void {
-    const s = e.snaps.get(id) orelse return error.NoKeptState;
-    const sh = try shape(e);
-    const at: u32 = @intCast(s.pos);
-    if (s.len == 0 and off + host.len > image.Words.bytes + image.front(sh, at)) return error.DiskOrder;
     var segs: std.ArrayList(image.Seg) = .empty;
     defer segs.deinit(e.gpa);
-    try image.segments(sh, at, s.mtp_len, &segs, e.gpa);
-    var w = (try wordsOf(e, id)).encode();
+    var w: [6]u64 = undefined;
+    try (try copier(e, id, off + host.len, &segs, &w)).run(off, host, out);
+}
+
+/// `id`'s image on this rank for bytes up to `end` (unsealed: before its head only); `segs` and `w` hold its parts.
+fn copier(e: *Engine, id: u64, end: u64, segs: *std.ArrayList(image.Seg), w: *[6]u64) !image.Copy {
+    const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
+    const sh = try shape(e);
+    const at: u32 = @intCast(s.pos);
+    if (s.len == 0 and end > image.Words.bytes + image.front(sh, at)) return error.DiskOrder;
+    try image.segments(sh, at, s.mtp_len, segs, e.gpa);
+    w.* = (try wordsOf(e, id)).encode();
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    try (image.Copy{ .d = e.d, .pool = pool, .lease = &s.lease, .segs = segs.items, .words = &w }).run(off, host, out);
+    return .{ .d = e.d, .pool = pool, .lease = &s.lease, .segs = segs.items, .words = w };
 }
 
 /// Rank 0's link at TP, else null (one rank: every op is local).
@@ -100,6 +107,89 @@ pub fn seal(e: *Engine, id: u64, w: image.Words) !void {
     }
 }
 
+/// Most lease runs one bcast step carries (each inside one snapshot page on every rank).
+const bcast_runs = 64;
+
+/// TF_GLM_OVN_DISK_BCAST, rank 0: shared bytes at `off` of its image into its lease, then every rank's by broadcast.
+pub fn share(e: *Engine, id: u64, off: u64, bytes: []const u8, prefixes: []const u64) !void {
+    try copy(e, id, off, @constCast(bytes), false);
+    const x = leader(e) orelse return;
+    try e.d.synchronize(); // the synchronous uploads into rank 0's lease have landed before a broadcast reads them
+    var segs: std.ArrayList(image.Seg) = .empty;
+    defer segs.deinit(e.gpa);
+    var w: [6]u64 = undefined;
+    const c = try copier(e, id, off + bytes.len, &segs, &w);
+    var ids: [2 + 3 * bcast_runs]u32 = undefined;
+    ids[0..2].* = halves(prefixes[0]);
+    var k: usize = 0;
+    const end = off + bytes.len;
+    for (c.segs) |s| {
+        const base = switch (s.from) {
+            .lease => |l| l,
+            else => continue, // the words never are shared bytes; zeros are not in any lease
+        };
+        var at = @max(off, s.img);
+        const hi = @min(end, s.img + s.len);
+        while (at < hi) {
+            const past = base + (at - s.img) - prefixes[0]; // lease bytes past rank 0's prefix: rank r's sit at its own
+            var n = hi - at;
+            for (prefixes) |q| n = @min(n, page - (past + q) % page);
+            ids[2 + 3 * k ..][0..3].* = .{ halves(at)[0], halves(at)[1], @intCast(n) };
+            k += 1;
+            at += n;
+            if (k == bcast_runs) {
+                try bcastStep(x, e, id, ids[0 .. 2 + 3 * k]);
+                k = 0;
+            }
+        }
+    }
+    if (k > 0) try bcastStep(x, e, id, ids[0 .. 2 + 3 * k]);
+}
+
+fn halves(v: u64) [2]u32 {
+    return .{ @truncate(v), @intCast(v >> 32) };
+}
+
+fn bcastStep(x: follow.Leader, e: *Engine, id: u64, ids: []const u32) !void {
+    try x.disk(.{ .kind = kind, .flags = @backingInt(Op.bcast), .a = id }, ids);
+    try runs(x.link, e, id, ids);
+}
+
+/// One broadcast of a bcast step: this rank's lease address and its bytes.
+const Run = struct { ptr: u64, n: usize };
+
+/// Every rank: a bcast step's runs (rank 0's prefix, then offset and length each) from rank 0's lease into this rank's.
+fn runs(l: *follow.Link, e: *Engine, id: u64, ids: []const u32) !void {
+    if (ids.len < 5 or (ids.len - 2) % 3 != 0) return error.BadStep;
+    const k = (ids.len - 2) / 3;
+    if (k > bcast_runs) return error.BadStep;
+    const p0 = @as(u64, ids[0]) | @as(u64, ids[1]) << 32;
+    const mine = (try shape(e)).prefix;
+    var end: u64 = 0;
+    var at: [bcast_runs]Run = undefined;
+    for (0..k) |i| {
+        const t = ids[2 + 3 * i ..][0..3];
+        const off = (@as(u64, t[0]) | @as(u64, t[1]) << 32) - p0 + mine;
+        if (t[2] == 0) return error.BadStep;
+        end = @max(end, off + t[2]);
+        at[i] = .{ .ptr = off, .n = t[2] };
+    }
+    var segs: std.ArrayList(image.Seg) = .empty;
+    defer segs.deinit(e.gpa);
+    var w: [6]u64 = undefined;
+    const c = try copier(e, id, end, &segs, &w);
+    for (at[0..k]) |*r| r.ptr = try c.device(r.ptr, r.n); // every address resolved before the first broadcast
+    const Post = struct {
+        l: *follow.Link,
+        at: []const Run,
+        fn post(q: @This()) anyerror!void {
+            for (q.at) |r| try q.l.lib.check(q.l.lib.api.ncclBroadcast(r.ptr, r.ptr, r.n, .u8, 0, q.l.comm, q.l.stream.handle), "ncclBroadcast");
+        }
+    };
+    try l.lib.group(Post{ .l = l, .at = at[0..k] }, Post.post);
+    try l.stream.synchronize();
+}
+
 /// Rank 0: every rank's prefix bytes in rank order (the part of a state each rank holds alone).
 pub fn prefixes(e: *Engine, out: []u64) !void {
     const mine = (try shape(e)).prefix;
@@ -118,7 +208,7 @@ fn gather(l: *follow.Link, e: *const Engine, mine: u64, out: []u64) !void {
 
 /// A rank other than 0: rank 0's disk step on this rank's copy of its state.
 pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !void {
-    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.prefixes)) return error.BadStep;
+    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.bcast)) return error.BadStep;
     const op: Op = @fromBackingInt(h.flags);
     const rank: u32 = @intCast(e.share.rank);
     switch (op) {
@@ -148,5 +238,6 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
             if (e.share.world > out.len) return error.BadStep;
             try gather(l, e, (try shape(e)).prefix, out[0..e.share.world]);
         },
+        .bcast => try runs(l, e, h.a, ids),
     }
 }

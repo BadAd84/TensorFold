@@ -179,7 +179,7 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     }
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
     try glue.rmsnorm(set(e), e.stream, dr.x, D, dr.norm, dr.hn, D, dr.xs, df.EPS, M, D);
-    const head = e.w.mtp.?.draft;
+    const head = @import("cuda_mtp_load.zig").draftHead(&e.w).?;
     var r0: usize = 0;
     if (dr.knobs.onepass) {
         try many(e, null, dr.hn, dr.xs, head, dr.logits, M);

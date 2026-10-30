@@ -75,7 +75,15 @@ fn latentPageBytes(c: anytype, kv8: bool) usize {
 
 /// A page's bytes: every DSA layer's part, then the MTP layer's (13,056 a row on GLM-5.3-Flash, 6,960 with FP8 KV).
 pub fn pageBytes(w: *const weights.Weights, kv8: bool) u64 {
-    return (mlaLayers(w) + 1) * pageCacheBytes(&w.config, kv8);
+    return (mlaLayers(w) + mtpCaches()) * pageCacheBytes(&w.config, kv8);
+}
+
+/// TF_GLM_OVN_DROP_MTP beside a drafter, set once at engine init (as cuda_kda_block's pad_to): no MTP layer or caches.
+pub var drop_mtp = false;
+
+/// 1 when a sequence holds the MTP layer's caches; 0 when drop_mtp left the draft head alone (none is written).
+pub fn mtpCaches() usize {
+    return @intFromBool(!drop_mtp);
 }
 
 /// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table; FP8 scales follow the codes.
@@ -102,6 +110,28 @@ test "a page part: FP8 codes, then their scales where the kernels read them (512
     try std.testing.expectEqual(x.lc + 512 * 512 * 2, x.pk); // BF16 parts as before
 }
 
+test "TF_GLM_OVN_DROP_MTP: no MTP page part, and a window's MTP fields kept in place at no bytes" {
+    const c = @import("config.zig").Config{};
+    var layers: [@import("config.zig").max_layers]weights.Layer = undefined;
+    var w: weights.Weights = .{ .gpa = std.testing.allocator, .config = c, .share = try @import("cuda_shard.zig").Share.of(&c, 0, 3) };
+    w.layers = layers[0..c.layers];
+    for (w.layers, 0..) |*l, i| l.mixer = switch (c.kind(@intCast(i))) {
+        .mla => .{ .mla = undefined },
+        .kda => .{ .kda = undefined },
+    };
+    defer drop_mtp = false;
+    const nd = mlaLayers(&w);
+    const full = pageBytes(&w, true);
+    const whole = try stateSizes(std.testing.allocator, &w, 4096, true, null);
+    defer std.testing.allocator.free(whole);
+    drop_mtp = true;
+    try std.testing.expectEqual(full * nd, pageBytes(&w, true) * (nd + 1));
+    const dropped = try stateSizes(std.testing.allocator, &w, 4096, true, null);
+    defer std.testing.allocator.free(dropped);
+    try std.testing.expectEqual(whole.len, dropped.len); // every field keeps its index
+    for (whole, dropped, 0..) |a, b, i| try std.testing.expectEqual(if (i >= 8 + 4 * nd and i < 12 + 4 * nd) 0 else a, b);
+}
+
 /// A State's fields in order; on pages (a table of `table` entries) no latent or pooled rows, and the table last.
 fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize, kv8: bool, table: ?usize) ![]usize {
     const c = &w.config;
@@ -118,7 +148,10 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
     try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
     try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
     const lc_bytes = try latent.cacheBytes(capacity, c.kv_lora, kv8);
-    for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ rows * lc_bytes, ring_rows * c.i_dim * 2, ring_rows * c.i_dim * 2, rows * pk_rows * c.i_dim * 2 });
+    for (0..nd + 1) |j| {
+        const z = if (j < nd) 1 else mtpCaches(); // a dropped MTP layer's fields stay in place at no bytes
+        try sizes.appendSlice(gpa, &.{ z * rows * lc_bytes, z * ring_rows * c.i_dim * 2, z * ring_rows * c.i_dim * 2, z * rows * pk_rows * c.i_dim * 2 });
+    }
     try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
     if (table) |t| try sizes.append(gpa, t * 4);
     return sizes.toOwnedSlice(gpa);
@@ -460,7 +493,7 @@ pub const State = struct {
         const rings = try gpa.alloc(u64, 2 * (nd + 1));
         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
         const ring_rows = @min(capacity, index_ring);
-        var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        var st: State = .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = mtpCaches() * pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
         if (paged) |q| {
             st.table = p[14 + 4 * nd];
             st.capacity = 0; // no rows until a stream's pages are mapped
@@ -472,7 +505,7 @@ pub const State = struct {
     /// A paged sequence's caches on the pages of `p` (the engine's own, made before its pool, placed when it is made).
     pub fn place(st: *State, w: *const weights.Weights, p: Paged, kv8: bool) void {
         for (st.caches, 0..) |*x, j| onPages(x, &w.config, p, st.table, j, kv8);
-        onPages(&st.mtp_caches, &w.config, p, st.table, st.caches.len, kv8);
+        if (mtpCaches() == 1) onPages(&st.mtp_caches, &w.config, p, st.table, st.caches.len, kv8); // a dropped one has no part
     }
 
     pub fn deinit(st: *State) void {

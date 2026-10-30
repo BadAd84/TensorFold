@@ -115,6 +115,8 @@ pub const Rows = struct {
     waiting: ?*pc.Entry = null, // the queued save the jobs in flight left no room for (a reap lets it try again)
     failures: write.Failures = .{},
     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
+    pump: ?*@import("rows_pump.zig").Pump = null, // TF_GLM_OVN_DISK_PUMP: the job whose payloads stage a few a round
+    pump_blocks: u32 = 0, // TF_GLM_OVN_DISK_PUMP: pieces staged a round (0: a state staged in one step)
 
     /// The store under `o.root` for `o.identity` (made 0700 when missing); its files are read, unreferenced blocks go.
     pub fn open(gpa: Allocator, family: pc.Snapshots, o: Options) !*Rows {
@@ -128,6 +130,7 @@ pub const Rows = struct {
         r.staging_bytes = stagingBytes(o.staging_bytes, if (platform.c.getenv("TENSORFOLD_ROWS_STAGING_GIB")) |v| std.mem.span(v) else null);
         r.next_job = @truncate(@as(u128, @intCast(write.nowNs())));
         r.verify = if (platform.c.getenv("TF_IMPRINT_VERIFY")) |v| v[0] == '1' else false;
+        r.pump_blocks = try @import("rows_pump.zig").knob();
         return r;
     }
 
@@ -595,6 +598,7 @@ test {
     _ = @import("rows_pool_select_test.zig");
     _ = @import("rows_prefetch.zig");
     _ = @import("rows_prefetch_stack_test.zig");
+    _ = @import("rows_pump_test.zig");
 }
 
 /// TENSORFOLD_ROWS_STAGING_GIB: the host bytes the write worker stages at once (a save larger than that is skipped, so a

@@ -7,6 +7,7 @@ const file = @import("rows_file.zig");
 const chain = @import("rows_chain.zig");
 const sync = @import("rows_write_sync.zig");
 pub const io = @import("rows_io.zig");
+const pump = @import("rows_pump.zig");
 const Rows = store.Rows;
 pub const Want = sync.Want;
 pub const Queued = sync.Queued;
@@ -34,6 +35,7 @@ pub fn queued(r: *Rows, e: *pc.Entry, starts: []const u32) void {
 /// Staged work owns no entry pointer; eviction only removes an entry still waiting to be staged.
 pub fn dropped(r: *Rows, e: *pc.Entry) void {
     if (r.waiting == e) forget(r, e);
+    pump.dropped(r, e);
     sync.dropped(r, e);
 }
 
@@ -46,12 +48,12 @@ fn forget(r: *Rows, e: *pc.Entry) void {
 
 pub fn pending(r: *const Rows) bool {
     if (r.sync_writes) return sync.pending(r);
-    return (if (r.worker) |w| w.pending() > 0 else false) or (!r.stopped and (r.spill != .evicted or r.flush_clock != null) and r.queue.items.len > 0);
+    return (if (r.worker) |w| w.pending() > 0 else false) or pump.active(r) or (!r.stopped and (r.spill != .evicted or r.flush_clock != null) and r.queue.items.len > 0);
 }
 
 pub fn ready(r: *const Rows) bool {
     if (r.sync_writes) return sync.pending(r);
-    return (if (r.worker) |w| w.ready() else false) or (!r.stopped and r.spill != .evicted and r.queue.items.len > 0 and !blocked(r));
+    return (if (r.worker) |w| w.ready() else false) or pump.ready(r) or (!r.stopped and r.spill != .evicted and r.queue.items.len > 0 and !blocked(r) and !pump.active(r));
 }
 
 /// Whether the newest queued save was refused room by the jobs in flight and none has been taken since.
@@ -65,6 +67,14 @@ pub fn evicted(r: *Rows, e: *pc.Entry) void {
     if (r.sync_writes) return sync.evicted(r, e);
     if (r.spill == .off or r.stopped) return;
     reap(r);
+    if (r.pump) |p| if (p.entry == e) {
+        // the entry leaves RAM now: its staging finishes first, waiting on the worker for ring slots
+        while (r.pump != null) {
+            if (!pump.step(r)) io.nap();
+            reap(r);
+        }
+        return;
+    };
     for (r.queue.items, 0..) |q, i| if (q.entry == e) {
         // The entry leaves RAM now, so a full permit skips it rather than hold it.
         _ = stage(r, r.queue.orderedRemove(i), false);
@@ -81,6 +91,7 @@ pub fn wanted(r: *const Rows, n: chain.Stem) bool {
 pub fn step(r: *Rows) bool {
     if (r.sync_writes) return sync.step(r);
     reap(r);
+    if (pump.active(r)) return pump.step(r);
     if (r.stopped or blocked(r) or (r.spill == .evicted and r.flush_clock == null)) return false;
     const q = r.queue.pop() orelse return false;
     return stage(r, q, true);
@@ -99,6 +110,7 @@ pub fn fence(r: *Rows) void {
 pub fn stop(r: *Rows, deadline: i128) void {
     if (r.fetch) |f| f.stopAt(deadline);
     if (r.stopped) return;
+    pump.abandon(r);
     r.stopped = true;
     fence(r);
     if (r.worker) |w| {
@@ -124,7 +136,7 @@ pub fn drain(r: *Rows, deadline: i128) usize {
         } else while (r.worker) |w| {
             reap(r);
             if (w.pending() == 0 or nowNs() >= deadline) break;
-            io.nap();
+            if (!pump.step(r)) io.nap();
         }
         r.flush_clock = r.clock;
     }
@@ -133,7 +145,7 @@ pub fn drain(r: *Rows, deadline: i128) usize {
         if (r.flush_clock != null) {
             reap(r);
             if (nowNs() >= deadline) break;
-            if (r.worker) |w| if (w.pending() > 0) {
+            if (r.worker) |w| if (w.pending() > 0 and !pump.active(r)) {
                 io.nap();
                 continue;
             };
@@ -159,6 +171,7 @@ pub fn reap(r: *Rows) void {
     const w = r.worker orelse return;
     while (w.take()) |j| {
         defer j.destroy();
+        pump.reaped(r, j);
         r.waiting = null;
         const err: ?anyerror = j.failure orelse if (j.generation != w.generation.load(.acquire)) error.Cancelled else null;
         if (err) |e| {
@@ -268,8 +281,10 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     try w.promised(r.gpa, &promised);
     var bytes = newBytes(r, &promised, prepared, metadata, &count);
     var charge: u64 = 0;
+    const stream = r.pump_blocks > 0 and may_wait; // TF_GLM_OVN_DISK_PUMP: RAM holds the own file, blocks go by the ring
     while (true) {
-        charge = bytes + @sizeOf(io.Job) + count * @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
+        const held = if (stream) image.total(prepared.own) + metadata + @sizeOf(file.Trailer) else bytes;
+        charge = held + @sizeOf(io.Job) + count * @sizeOf(io.File) + prepared.wants.len * @sizeOf(Want) + 4 * @sizeOf([]const u8);
         if (!w.fits(charge)) return if (may_wait and w.busy(charge)) error.StagingBusy else error.StagingFull;
         const reserved = w.reserved();
         if (!r.budget(bytes + reserved)) return error.DailyBudgetSpent;
@@ -285,6 +300,8 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     errdefer r.admission.finish(r.dir, bytes, true);
     const j = try io.allocator.create(io.Job);
     errdefer io.allocator.destroy(j);
+    const p: ?*pump.Pump = if (stream) try pump.make(r, w, prepared, count) else null;
+    errdefer if (p) |x| pump.free(r, x);
     var arena = std.heap.ArenaAllocator.init(io.allocator);
     errdefer arena.deinit();
     const a = arena.allocator();
@@ -294,13 +311,13 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
         var ranges: std.ArrayList(image.Range) = .empty;
         defer ranges.deinit(r.gpa);
         try image.blockRanges(prepared.parts, r.keying.block, want.window, want.k, &ranges, r.gpa);
-        files[built] = .{ .trailer = .{ .kind = @backingInt(file.Kind.block), .payload = 0, .payload_hash = 0, .name = want.name, .block = r.keying.block }, .payload = try a.alloc(u8, @intCast(image.total(ranges.items))) };
-        try r.img.gather(r.family.ptr, e.saved, ranges.items, files[built].payload);
+        files[built] = .{ .trailer = .{ .kind = @backingInt(file.Kind.block), .payload = 0, .payload_hash = 0, .name = want.name, .block = r.keying.block }, .payload = if (p != null) &.{} else try a.alloc(u8, @intCast(image.total(ranges.items))) };
+        if (p) |x| x.blocks[built] = .{ .window = want.window, .k = want.k } else try r.img.gather(r.family.ptr, e.saved, ranges.items, files[built].payload);
         built += 1;
     };
     const own = &files[built];
     own.* = .{ .trailer = .{ .kind = @backingInt(file.Kind.state), .payload = 0, .payload_hash = 0, .name = prepared.name, .at = e.at, .block = r.keying.block, .flags = @intFromBool(e.shared) }, .payload = try a.alloc(u8, @intCast(image.total(prepared.own))) };
-    if (own.payload.len > 0) try r.img.gather(r.family.ptr, e.saved, prepared.own, own.payload);
+    if (own.payload.len > 0 and p == null) try r.img.gather(r.family.ptr, e.saved, prepared.own, own.payload);
     const tokens = try a.dupe(u32, e.tokens);
     const spans = try a.dupe(@import("cache_modes.zig").Span, e.decode_spans);
     const starts = try a.dupe(u32, prepared.starts);
@@ -309,7 +326,13 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
     own.meta = try a.dupe([]const u8, &.{ std.mem.asBytes(counts), std.mem.sliceAsBytes(tokens), std.mem.sliceAsBytes(spans), std.mem.sliceAsBytes(starts) });
     const wants = try a.dupe(Want, prepared.wants);
     j.* = .{ .arena = arena, .id = r.next_job, .generation = w.generation.load(.acquire), .name = prepared.name, .at = e.at, .shared = e.shared, .tokens = tokens, .spans = spans, .starts = starts, .wants = wants, .files = files, .bytes = bytes, .staged = charge, .verify = r.verify, .began = prepared.began };
+    if (p) |x| {
+        j.staged_files = .init(0);
+        x.job = j;
+        r.pump = x;
+    }
     w.submit(j);
+    if (p != null) _ = pump.step(r);
 }
 
 /// Whether the state's block is for this job to write: the disk lacks it and no job in flight is writing it.
