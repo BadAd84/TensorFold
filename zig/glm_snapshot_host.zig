@@ -5,6 +5,7 @@ const cuda = @import("cuda");
 const t = std.testing;
 test {
     _ = @import("glm_one_chunk_host.zig"); // TF_GLM_OVN_ONE_CHUNK's step planning
+    _ = @import("glm_lineage_host.zig"); // TF_GLM_OVN_LINEAGE's copies against the knob-off path
 }
 
 const Sizing = struct {

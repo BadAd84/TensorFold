@@ -55,7 +55,7 @@ pub const Gather = struct {
     }
 
     /// The list uploaded from pageable memory (staged before the call returns, so the next batch may refill it).
-    fn flush(g: *const Gather, stream: cuda.Stream, n: usize) !void {
+    pub fn flush(g: *const Gather, stream: cuda.Stream, n: usize) !void {
         try g.dev.uploadAsync(0, std.mem.sliceAsBytes(g.host[0..n]), stream.handle);
         var a: cuda.Args = .{};
         a.add(g.dev.ptr);

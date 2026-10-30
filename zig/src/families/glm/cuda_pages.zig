@@ -5,6 +5,7 @@ const kv = @import("core").kv_pool;
 const fw = @import("cuda_forward.zig");
 const state = @import("cuda_state.zig");
 const types = @import("cuda_engine_types.zig");
+const lineage = @import("cuda_lineage.zig");
 const Engine = @import("cuda_engine.zig").Engine;
 
 /// Table entries a sequence of `capacity` rows takes.
@@ -52,6 +53,8 @@ pub const Pages = struct {
     used: []bool,
     leader: bool,
     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
+    tags: []lineage.PageTag = &.{}, // TF_GLM_OVN_LINEAGE: what each page's rows hold (none without the knob)
+    want: u64 = 0, // TF_GLM_OVN_LINEAGE, rank 0: the kept state the next `open`'s restore takes (0: none)
 
     /// `streams` sequences from slot 0 on `pages` pages: the engine's own (`ownSequence`) placed, the others made now.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, streams: usize, pages: usize, leader: bool) !*Pages {
@@ -70,6 +73,9 @@ pub const Pages = struct {
         p.used = try gpa.alloc(bool, streams);
         errdefer gpa.free(p.used);
         @memset(p.used, false);
+        if (lineage.on) p.tags = try gpa.alloc(lineage.PageTag, pages);
+        errdefer gpa.free(p.tags);
+        @memset(p.tags, .{});
         if (e.seqs.items.len < streams) try e.seqs.appendNTimes(e.gpa, null, streams - e.seqs.items.len);
         const seqs = e.seqs.items[1..@max(streams, 1)];
         var made: usize = 0;
@@ -116,6 +122,7 @@ pub const Pages = struct {
         }
         p.gpa.free(p.leases);
         p.gpa.free(p.used);
+        p.gpa.free(p.tags);
         if (p.arena) |*a| a.free();
         p.pool.deinit();
         p.gpa.destroy(p);
@@ -141,7 +148,12 @@ pub const Pages = struct {
         try p.pool.promise(l, n);
         errdefer p.pool.finish(l);
         var up: Upload = .{ .p = p, .slot = slot };
-        try p.pool.cover(l, n, .{ .ctx = &up, .write = Upload.write });
+        if (p.tagging() and p.want != 0) {
+            const k = wanted(p);
+            try lineage.takeFor(&p.pool, l, n, p.tags, k.segs, k.at); // the pages that hold its rows, in row order
+            try Upload.write(&up, l.ids.items, 0);
+        } else try p.pool.cover(l, n, .{ .ctx = &up, .write = Upload.write });
+        p.want = 0;
         try p.mapped(slot, l.ids.items);
         return l.ids.items;
     }
@@ -166,6 +178,7 @@ pub const Pages = struct {
         const page = p.layout.pageBytes();
         if (p.poison) for (ids) |id| try p.e.d.check(p.e.d.api.cuMemsetD32Async(p.arena.?.ptr + id * page, 0xFFFF_FFFF, page / 4, p.e.stream.handle), "cuMemsetD32Async");
         st.pages = ids;
+        if (p.tagging()) lineage.mapping(p.tags, &st.lin, st.pos, ids, p.poison);
         st.capacity = @min(ids.len * state.page_rows, p.e.capacity);
         p.used[slot] = true;
     }
@@ -174,6 +187,7 @@ pub const Pages = struct {
     pub fn close(p: *Pages, slot: u32) void {
         if (!p.paged(slot) or !p.used[slot]) return;
         const st = &p.e.seqs.items[slot].?.st;
+        if (p.tagging()) lineage.closing(p.tags, &st.lin, st.pos, st.pages);
         st.pages = &.{};
         st.capacity = 0;
         p.used[slot] = false;
@@ -191,6 +205,11 @@ pub const Pages = struct {
         std.log.info("kv pool idle{s}: promised {d}, free {d} + store {d} == total {d}", .{ if (ok) "" else " (UNEVEN)", c.promised, c.free, c.kept, c.total });
     }
 
+    /// TF_GLM_OVN_LINEAGE is on and the pool tags its pages.
+    fn tagging(p: *const Pages) bool {
+        return lineage.on and p.tags.len > 0;
+    }
+
     /// A stream's table entries written to its sequence's device table (blocking: the stream waits for the copy).
     const Upload = struct {
         p: *Pages,
@@ -205,3 +224,9 @@ pub const Pages = struct {
         }
     };
 };
+
+/// TF_GLM_OVN_LINEAGE: the rows of the kept state `p.want` names and its position (none when it is gone).
+fn wanted(p: *const Pages) struct { segs: []const lineage.Seg, at: usize } {
+    const s = p.e.snaps.get(p.want) orelse return .{ .segs = &.{}, .at = 0 };
+    return .{ .segs = if (s.lin) |k| k.segs else &.{}, .at = s.pos };
+}

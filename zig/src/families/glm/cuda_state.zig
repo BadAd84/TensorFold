@@ -1,5 +1,4 @@
 //! GLM-5.3-Flash's per-rank CUDA memory: forward Buffers (shared by sequences) and a sequence's State, an arena each.
-
 const std = @import("std");
 const cuda = @import("cuda");
 const exl3 = @import("cuda_exl3.zig");
@@ -14,7 +13,6 @@ const moe = @import("cuda_moe.zig");
 const glue = @import("cuda_glue.zig");
 const mlp = @import("cuda_mlp.zig");
 const kda_block = @import("cuda_kda_block.zig");
-
 /// A prompt chunk's rows (decode.PREFILL_ROWS): every size that follows the chunk derives from this one constant.
 pub const prefill_rows = 4096;
 /// A decode window's rows (Engine's max_rows).
@@ -447,6 +445,7 @@ pub const State = struct {
     prompt_hidden: u64, // first-draft row owned and charged by this sequence arena
     table: u64 = 0, // on pages: its page table (i32, `pages` entries), else 0
     pages: []const u32 = &.{}, // on pages: the page ids its table holds, in row order (none while no stream holds it)
+    lin: @import("cuda_lineage.zig").Live = .{}, // TF_GLM_OVN_LINEAGE: what its rows hold (untouched without the knob)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, capacity: usize) !State {
         return initFormat(gpa, d, w, capacity, false);
@@ -556,6 +555,7 @@ pub const State = struct {
         if (st.pos + rows > st.capacity) return error.PastCapacity;
         if (st.pos + rows > st.base + st.ring_rows) try st.rebase(stream, false);
         if (st.pos + rows > st.base + st.ring_rows) return error.PastRing; // rows past the ring overwrite its neighbour
+        if (@import("cuda_lineage.zig").on) st.lin.wrote(st.pos, rows); // the pass writes from pos
     }
 
     /// Before the MTP head's pass of `n` rows at mtp_len, likewise for its caches.
