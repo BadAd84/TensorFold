@@ -45,11 +45,17 @@ pub const Scratch = struct {
 pub const Ovn = struct {
     combine_sy: bool = false, // TF_GLM_OVN_COMBINE_SY: combine reads the shared slot from `sy`, no put_slot
     topk_sum: bool = false, // TF_GLM_OVN_TOPK_SUM: topk adds the router's K slices itself, no slice_sum
+    shared_first: bool = false, // TF_GLM_OVN_SHARED_FIRST: a decode window's shared expert before its routed ones
 
     pub fn read() Ovn {
-        return .{ .combine_sy = cuda.ovn.on("COMBINE_SY"), .topk_sum = cuda.ovn.on("TOPK_SUM") };
+        return .{ .combine_sy = cuda.ovn.on("COMBINE_SY"), .topk_sum = cuda.ovn.on("TOPK_SUM"), .shared_first = cuda.ovn.on("SHARED_FIRST") };
     }
 };
+
+/// TF_GLM_OVN_SHARED_FIRST on this block: decode windows only (forward.py:871); SHARED_SIDE's fork takes them first.
+pub fn sharedFirst(o: Ovn, prompt: bool) bool {
+    return o.shared_first and !prompt;
+}
 
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
 pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null, ovn: Ovn = .{} };
@@ -60,12 +66,31 @@ pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_st
     try fill(k, stream, l, s, x, x_stride, 0, rows, prompt, out);
 }
 
+/// Forward.ffn's MoE: the block (its shared expert first under sharedFirst), or its body when `out` is null.
+pub fn run(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: ?u64) !void {
+    const o = out orelse return body(k, stream, l, s, x, x_stride, rows, prompt);
+    if (!sharedFirst(k.ovn, prompt)) return block(k, stream, l, s, x, x_stride, rows, prompt, o);
+    // forward.py:863-877: route, shared expert, routed experts; each reads only x and writes its own scratch
+    try route(k, stream, l, s, x, x_stride, rows);
+    {
+        const stamp = prof_mod.span(k.prof, stream, .shared_expert);
+        defer stamp.end();
+        try sharedFront(k, stream, l, s, x, x_stride, 0, rows);
+    }
+    try routed(k, stream, l, s, x, x_stride, rows, false);
+    try fillTail(k, stream, l, s, 0, rows, false, o); // the same slot sum, on the same `ey`, `sy` and `wts` bytes
+}
+
 /// The block up to its fill: the router, the top-k pick, the plan and the routed experts into the slot rows.
 pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
+    try route(k, stream, l, s, x, x_stride, rows);
+    try routed(k, stream, l, s, x, x_stride, rows, prompt);
+}
+
+/// The router and the top-k pick into `pick` and `wts`.
+pub fn route(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize) !void {
     const d = l.routed.dims;
-    const slots = l.top_k + 1;
-    const shared_id: i32 = @intCast(l.count);
-    var stamp = prof_mod.span(k.prof, stream, .router);
+    const stamp = prof_mod.span(k.prof, stream, .router);
     if (k.ovn.topk_sum) {
         try glue.routerSlices(k.set, stream, x, x_stride, l.router, s.router_part, rows, d, l.count);
         try glue.selectSum(k.set, stream, s.router_part, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
@@ -74,8 +99,15 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
         try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
     }
     stamp.end();
-    if (k.prof) |p| try p.routeLayer(stream, s.pick, rows, slots, l.top_k); // TF_GLM_PROF_ROUTE=1 only
-    stamp = prof_mod.span(k.prof, stream, .experts);
+    if (k.prof) |p| try p.routeLayer(stream, s.pick, rows, l.top_k + 1, l.top_k); // TF_GLM_PROF_ROUTE=1 only
+}
+
+/// The plan and the routed experts into `ey`'s routed slots, reading x, `pick` and the plan's own scratch.
+pub fn routed(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool) !void {
+    const d = l.routed.dims;
+    const slots = l.top_k + 1;
+    const shared_id: i32 = @intCast(l.count);
+    const stamp = prof_mod.span(k.prof, stream, .experts);
     defer stamp.end();
     if (k.prof) |p| p.mark(stream, .router);
     defer if (k.prof) |p| p.mark(stream, .routed);

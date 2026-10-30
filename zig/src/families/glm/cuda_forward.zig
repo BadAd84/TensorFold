@@ -62,7 +62,7 @@ pub const Modules = struct {
     quant: quant.Kernels,
     q4: q4.Kernels,
     side: ?moe_side.Side, // TF_GLM_OVN_SHARED_SIDE: the stream a decode window's shared experts fork onto
-    moe_ovn: moe.Ovn, // TF_GLM_OVN_COMBINE_SY, _TOPK_SUM: the MoE block's knobs, read once here
+    moe_ovn: moe.Ovn, // TF_GLM_OVN_COMBINE_SY, _TOPK_SUM, _SHARED_FIRST: the MoE block's knobs, read once here
     glue_row: u64, // TF_GLM_OVN_GLUE_ROW=N: a prompt piece's glue of N rows or more in one kernel (0: off)
     pdl_early: u64, // TF_GLM_OVN_PDL_EARLY: 1 the decode windows' glue launches dependent-ready, 2 prompt chunks too
     mla: glue.Mla, // TF_GLM_OVN_MLA_FUSEMERGE, TF_GLM_OVN_ABSORB_VEC: the MLA launch choices, read at load
@@ -368,8 +368,7 @@ pub const Forward = struct {
             },
             .moe => |m| {
                 if (f.side) |sd| if (out) |o| return moe_side.block(f.moeKernels(), f.stream, sd, m, b.moe, b.normed, c.hidden, rows, o);
-                try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
-                if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
+                try moe.run(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill, out);
             },
         }
     }
