@@ -55,8 +55,8 @@ const Sources = struct {
     }
 };
 
-/// The buffers site `site` of layer `l` reads first, in its matmuls' order: a lane weight's scales, then its codes.
-fn sources(l: weights.Layer, site: Site) Sources {
+/// What site `site` of layer `l` reads first, lane scales before codes; SHARED_FIRST: site f adds the shared expert.
+fn sources(l: weights.Layer, site: Site, shared_first: bool) Sources {
     var s: Sources = .{};
     switch (site) {
         .n => switch (l.mixer) {
@@ -73,7 +73,13 @@ fn sources(l: weights.Layer, site: Site) Sources {
             },
         },
         .f => switch (l.ffn) {
-            .moe => |m| s.add(m.router),
+            .moe => |m| {
+                s.add(m.router);
+                if (shared_first) { // l2pf.py:252-254's site a, read now before the routed experts evict it
+                    s.proj(m.shared_gu);
+                    s.proj(m.shared_down);
+                }
+            },
             .dense => |m| switch (m.w) {
                 .nvfp4 => |x| {
                     s.lane(x.gate);
@@ -107,13 +113,13 @@ fn extent(bufs: []const cuda.DeviceBuffer, p: u64) ?u64 {
 }
 
 /// Every site's rows of (address, bytes) from `bufs`, the weights' allocations; false when a source lies in none.
-pub fn table(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, budget: u64, rows: *std.ArrayList([2]i64), spans: []Span) !bool {
+pub fn table(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, budget: u64, shared_first: bool, rows: *std.ArrayList([2]i64), spans: []Span) !bool {
     std.debug.assert(spans.len == layers.len * 3);
     for (layers, 0..) |_, j| for ([_]Site{ .n, .f, .o }) |site| {
         const sp = &spans[j * 3 + @backingInt(site)];
         sp.* = .{ .at = @intCast(rows.items.len) };
         if (site == .n and j + 1 == layers.len) continue; // the last layer's next is the head
-        const src = sources(layers[if (site == .n) j + 1 else j], site);
+        const src = sources(layers[if (site == .n) j + 1 else j], site, shared_first);
         var sizes: [max_sources]u64 = undefined;
         for (src.ptrs[0..src.len], sizes[0..src.len]) |p, *n| n.* = extent(bufs, p) orelse {
             std.log.warn("TF_GLM_OVN_L2PF_PACED: layer {d}'s site {t} reads 0x{x}, in no weight buffer; prefetch off", .{ j, site, p });
@@ -161,7 +167,8 @@ pub const Paced = struct {
         errdefer gpa.free(spans);
         var host: std.ArrayList([2]i64) = .empty;
         defer host.deinit(gpa);
-        if (!try table(gpa, w.buffers.items, w.layers, @as(u64, o.mb) << 20, &host, spans)) {
+        const first = @import("cuda_moe.zig").Ovn.read().shared_first; // the MoE's knob, read its way
+        if (!try table(gpa, w.buffers.items, w.layers, @as(u64, o.mb) << 20, first, &host, spans)) {
             gpa.free(spans);
             return null;
         }
@@ -283,7 +290,7 @@ test "the table: each site's sources in its matmuls' order, site n from the next
     var rows: std.ArrayList([2]i64) = .empty;
     defer rows.deinit(t.allocator);
     var spans: [6]Span = undefined;
-    try t.expect(try table(t.allocator, &bufs, &.{ d, e }, 12 * MiB, &rows, &spans));
+    try t.expect(try table(t.allocator, &bufs, &.{ d, e }, 12 * MiB, false, &rows, &spans));
     const want = [_][2]i64{
         .{ 0x1000_0000, 1 * MiB }, // layer 0's n: layer 1's qkv scales whole, then its codes' head
         .{ 0x2000_0000, 11 * MiB },
@@ -301,7 +308,42 @@ test "the table: each site's sources in its matmuls' order, site n from the next
         .{ .at = 4, .rows = 1, .bytes = 12 * MiB },
     }, &spans);
     rows.clearRetainingCapacity();
-    try t.expect(!try table(t.allocator, bufs[1..], &.{ d, e }, 12 * MiB, &rows, &spans));
+    try t.expect(!try table(t.allocator, bufs[1..], &.{ d, e }, 12 * MiB, false, &rows, &spans));
+}
+
+test "TF_GLM_OVN_SHARED_FIRST: site f takes the router, then the shared expert's gate/up and down within the budget" {
+    const t = std.testing;
+    const MiB = 1 << 20;
+    var e: weights.Layer = undefined; // one KDA layer with a MoE: site n is the head's, site o KDA's o
+    e.mixer = .{ .kda = undefined };
+    e.mixer.kda.o = .{ .bf16 = 0x4000_0000 };
+    e.ffn = .{ .moe = undefined };
+    e.ffn.moe.router = 0x5000_0000;
+    e.ffn.moe.shared_gu = .{ .mxfp8 = .{ .mode = .mxfp8, .codes = 0xc000_0000, .scales = 0xb000_0000, .n = 64, .k = 64, .npad = 64 } };
+    e.ffn.moe.shared_down = .{ .bf16 = 0xd000_0000 };
+    const bufs = [_]cuda.DeviceBuffer{
+        .{ .d = undefined, .ptr = 0x4000_0000, .len = 23 * MiB },
+        .{ .d = undefined, .ptr = 0x5000_0000, .len = 2 * MiB },
+        .{ .d = undefined, .ptr = 0xb000_0000, .len = MiB / 2 },
+        .{ .d = undefined, .ptr = 0xc000_0000, .len = 6 * MiB },
+        .{ .d = undefined, .ptr = 0xd000_0000, .len = 6 * MiB },
+    };
+    var rows: std.ArrayList([2]i64) = .empty;
+    defer rows.deinit(t.allocator);
+    var spans: [3]Span = undefined;
+    try t.expect(try table(t.allocator, &bufs, &.{e}, 12 * MiB, true, &rows, &spans));
+    const want = [_][2]i64{
+        .{ 0x5000_0000, 2 * MiB }, // site f: the router whole
+        .{ 0xb000_0000, MiB / 2 }, // the shared gate/up's scales, then its codes, whole
+        .{ 0xc000_0000, 6 * MiB },
+        .{ 0xd000_0000, 7 * MiB / 2 }, // the shared down's head: what the budget leaves
+        .{ 0x4000_0000, 12 * MiB }, // site o: KDA's o
+    };
+    try t.expectEqualSlices([2]i64, &want, rows.items);
+    try t.expectEqualSlices(Span, &.{ .{ .at = 0 }, .{ .at = 0, .rows = 4, .bytes = 12 * MiB }, .{ .at = 4, .rows = 1, .bytes = 12 * MiB } }, &spans);
+    rows.clearRetainingCapacity(); // knob off: the router alone, as before
+    try t.expect(try table(t.allocator, &bufs, &.{e}, 12 * MiB, false, &rows, &spans));
+    try t.expectEqualSlices([2]i64, &.{ .{ 0x5000_0000, 2 * MiB }, .{ 0x4000_0000, 12 * MiB } }, rows.items);
 }
 
 test "a source inside an allocation reads to its end (#1580 matched starts only)" {
