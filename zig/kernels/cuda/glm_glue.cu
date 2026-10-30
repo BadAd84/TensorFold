@@ -2,6 +2,7 @@
 #include "glm_glue_norm.cuh"
 #include "glm_glue_rows.cuh"
 #include "glm_glue_hc.cuh"
+#include "glm_glue_hc_rows.cuh"
 #include "glm_glue_moe.cuh"
 #include "glm_glue_router.cuh"
 #include "glm_glue_latent.cuh"
