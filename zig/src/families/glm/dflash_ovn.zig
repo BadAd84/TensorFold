@@ -48,10 +48,11 @@ pub const Knobs = struct {
     noise: f32 = 0, // NOISE: the target's keyed Gumbel draw's weight in a sampled stream's pick (0: off)
     keepwin: bool = false, // KEEPWIN: kept prompt states carry the drafter's window rows and its start
     cuts: ?Cuts = null, // CUTS: the chain cut by streams in the pass (null: TF_GLM_DRAFT_CONFIDENCE, today's)
+    fixed: bool = false, // FIXED: verify every draft the cut keeps (production's fnc7:cut), not a cost-sized window
 
     /// The knobs from the environment (every rank's is the same); `beta` the chances' temperature (1.0 unset).
     pub fn read(beta: *f64) !Knobs {
-        var k: Knobs = .{ .onepass = cuda.ovn.on("DRAFT_ONEPASS"), .down4 = cuda.ovn.on("DRAFT_DOWN4"), .keepwin = cuda.ovn.on("DRAFT_KEEPWIN") };
+        var k: Knobs = .{ .onepass = cuda.ovn.on("DRAFT_ONEPASS"), .down4 = cuda.ovn.on("DRAFT_DOWN4"), .keepwin = cuda.ovn.on("DRAFT_KEEPWIN"), .fixed = cuda.ovn.on("DRAFT_FIXED") };
         k.mlpsplit = @intCast(try cuda.ovn.int("DRAFT_MLPSPLIT", 0));
         if (try float("DRAFT_EDGE")) |v| k.edge = @floatCast(v);
         if (try float("DRAFT_BETA")) |v| {
