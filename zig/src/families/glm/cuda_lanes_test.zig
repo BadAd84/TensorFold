@@ -81,6 +81,30 @@ test "TF_GLM_OVN_SHARED_ROWS: the round loop's batch rows and shared costs reach
     }
 }
 
+test "TF_GLM_OVN_DEPTH_FULL and SHARED_COPY: each knob reaches the round loop's config, off by default" {
+    const gpa = std.testing.allocator;
+    const cuda = @import("cuda");
+    const cl = @import("cuda_lanes.zig");
+    defer cuda.ovn.fake("DEPTH_FULL", null);
+    defer cuda.ovn.fake("SHARED_COPY", null);
+    var e: engine.Engine = undefined;
+    e.gpa = gpa;
+    e.mtp = true;
+    var dr: @import("dflash.zig").Drafter = undefined;
+    e.drafter = &dr;
+    e.settings = .{ .shared_rows = 32 };
+    for ([_][2]?[]const u8{ .{ null, null }, .{ "1", null }, .{ null, "1" }, .{ "1", "1" }, .{ "0", "0" } }) |v| {
+        cuda.ovn.fake("DEPTH_FULL", v[0]);
+        cuda.ovn.fake("SHARED_COPY", v[1]);
+        var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+        defer self.lanes.deinit(gpa);
+        var cfg = try lanes.Config.init(gpa, self.facts(), cl.max_rows, cl.max_rows - 1);
+        defer cfg.deinit(gpa);
+        try std.testing.expectEqual(v[0] != null and v[0].?[0] == '1', cfg.shared_depth_full);
+        try std.testing.expectEqual(v[1] != null and v[1].?[0] == '1', cfg.shared_copy_width);
+    }
+}
+
 test "structured output's grammar rows: a window past the load's shared rows is refused before the words are made" {
     var e: engine.Engine = undefined; // no device: a refusal allocates nothing
     e.c.vocab = 64; // two words a row

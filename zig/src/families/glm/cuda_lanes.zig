@@ -141,6 +141,8 @@ pub const Lanes = struct {
             .hidden_rows = sharing,
             .batch_rows = if (sharing) self.x.e.settings.shared_rows else 0, // TF_GLM_OVN_SHARED_ROWS: the allocator's cap
             .max_streams = if (sharing) engine.max_shared else 1,
+            .shared_depth_full = cuda.ovn.on("DEPTH_FULL"), // TF_GLM_OVN_DEPTH_FULL: no grant + 2 ratchet when shared
+            .shared_copy_width = cuda.ovn.on("SHARED_COPY"), // TF_GLM_OVN_SHARED_COPY: shared copies grow as lone ones
         };
     }
 

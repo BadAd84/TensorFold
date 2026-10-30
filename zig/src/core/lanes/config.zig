@@ -48,6 +48,8 @@ pub const Model = struct {
     copy_match: i64 = 8, // matching history tokens a copy needs
     lone_copies: bool = true, // a lone stream proposes copies (false: only streams in shared rounds do)
     first_tree: bool = true, // the first window after a prompt reads the head's chain back as a tree (false: a count of drafts)
+    shared_depth_full: bool = false, // TF_GLM_OVN_DEPTH_FULL: shared rounds ask each head for most_drafts
+    shared_copy_width: bool = false, // TF_GLM_OVN_SHARED_COPY: shared copies take and grow the stream's width
 };
 
 pub const Config = struct {
@@ -96,6 +98,8 @@ pub const Config = struct {
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
     lone_copies: bool = true, // Model.lone_copies
     first_tree: bool = true, // Model.first_tree
+    shared_depth_full: bool = false, // Model.shared_depth_full
+    shared_copy_width: bool = false, // Model.shared_copy_width
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
@@ -165,6 +169,8 @@ pub const Config = struct {
             .mtp_step_ms = m.mtp_step_ms,
             .k = .{ .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate },
             .draft_step_ms = m.draft_step_ms,
+            .shared_depth_full = m.shared_depth_full,
+            .shared_copy_width = m.shared_copy_width,
         };
     }
 
