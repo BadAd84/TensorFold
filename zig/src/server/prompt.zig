@@ -214,13 +214,15 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     const at = history.diff(prompt);
     var history_len: usize = 0;
     if (history.len() > 0 and at == history.len()) history_len = history.len(); // a strict prefix of the prompt
-    if (history_len == 0 and prompt.len > 1 and at == null) history_len = prompt.len - 1; // a template with no generation suffix
+    // a template with no generation suffix
+    if (history_len == 0 and prompt.len > 1 and at == null) history_len = prompt.len - 1;
     // either way the history's ids are the prompt's first `history.len()`
     if (history_len > 0) history_len = continuedLen(&once, cx, input.messages, prompt[0..history.len()], history_len);
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
     if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, input.messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
     const count = if (input.messages == .array) input.messages.array.len else 0;
-    const rewind_len = if (srv.info.prompt_cache) rewindWith(&once, cx, input.messages, count, prompt) else 0; // one more render
+    // one more render
+    const rewind_len = if (srv.info.prompt_cache) rewindWith(&once, cx, input.messages, count, prompt) else 0;
     return .{ .ids = prompt, .history_len = history_len, .rewind_len = rewind_len, .user_end = userEnd(input.messages, history_len) };
 }
 
@@ -263,7 +265,8 @@ test "interior prompt: user end excludes later tool and assistant text" {
 
 /// Where the latest user message's text starts (of the first `real_count`): the prompt and a probe there agree to it.
 pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tools: []const Value, prompt: []const u32, thinking: bool, effort: ?[]const u8) usize {
-    var once: Once = .{ .srv = srv, .tools = tools, .thinking = thinking, .effort = effort }; // nothing kept: the probe encodes whole
+    // nothing kept: the probe encodes whole
+    var once: Once = .{ .srv = srv, .tools = tools, .thinking = thinking, .effort = effort };
     return rewindWith(&once, cx, messages, real_count, prompt);
 }
 
