@@ -12,7 +12,7 @@ const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const Engine = engine.Engine;
 
-pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, costs };
+pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, costs, chunk_part };
 
 /// One step as it crosses: 64 bytes, then `n` u32 ids.
 pub const Header = extern struct {
@@ -150,8 +150,10 @@ pub const Link = struct {
     }
 };
 
-/// A prompt step's outcome (Leader.chunk): the first token once it ends the prompt, and the rows it took.
-pub const Chunk = struct { first: ?u32, rows: usize };
+/// A prompt step's outcome (Leader.chunk): the first token once it ends the prompt, and the rows it took; `sliced`:
+/// its chunk waits part-way through its layers (TF_GLM_OVN_FILL_SLICE_MS), Leader.slicePart runs the rest.
+pub const Chunk = struct { first: ?u32, rows: usize, sliced: bool = false };
+const slices = @import("cuda_prompt_slices.zig");
 
 /// Rank 0's engine: every step goes to the other ranks first.
 pub const Leader = struct {
@@ -162,6 +164,8 @@ pub const Leader = struct {
     fn send(x: Leader, h: Header, ids: []const u32) !void {
         var hh = h;
         hh.slot = x.e.slot;
+        const kind: Kind = @fromBackingInt(@intCast(hh.kind));
+        if (kind == .prefill or kind == .chunk or kind == .many) try slices.idle(x.e); // none over a sliced chunk
         if (x.link.asleep) { // the other ranks wait on their lines, not in NCCL: wake them for this step
             cuda.tp_watch.wake();
             x.link.asleep = false;
@@ -255,6 +259,12 @@ pub const Leader = struct {
     /// One prompt step on every rank (Engine.prefillChunk): a chunk to Engine.chunkEnd, or two when `pair` and
     /// Engine.pairedAt allow; its rows travel in the step, so every rank cuts where this one does.
     pub fn chunk(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks) !Chunk {
+        return x.chunkOf(ids, start, pair, from, cancel, marks, false);
+    }
+
+    /// `chunk`; with `slice` (TF_GLM_OVN_FILL_SLICE_MS beside decoders) an unpaired chunk's layers may run in slices:
+    /// the first here, the rest by `slicePart` (`sliced` while some are left).
+    pub fn chunkOf(x: Leader, ids: []const u32, start: usize, pair: bool, from: ?engine.Resume, cancel: ?engine.Cancel, marks: ?engine.Marks, slice: bool) !Chunk {
         if (start >= ids.len) return error.BadChunk;
         try x.flush();
         const at: []const u32 = if (marks) |m| m.at else &.{};
@@ -263,10 +273,23 @@ pub const Leader = struct {
         const n = (if (two) engine.chunkEnd(a_end, ids.len, at) else a_end) - start; // this step's rows
         const part = ids[start..@min(ids.len, start + n + 1)];
         const split = sparse.splitAt(start, x.e.settings.index_split, x.e.share.world); // a paired step's chunks share it
-        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intCast(n)) << 16, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
+        const hi: usize = if (slice and !two and x.e.prompt_logprobs == null) slices.first(x.e, n, start + n == ids.len) else 0;
+        try x.send(.{ .kind = @backingInt(Kind.chunk), .flags = x.rows() | @as(u32, @intFromBool(split)) << 1 | @as(u32, @intCast(hi)) << 8 | @as(u32, @intCast(n)) << 16, .a = if (from) |r| r.id else 0, .seed = if (from) |r| r.at else 0, .depth = @intCast(start), .top_k = @intCast(ids.len) }, part);
         x.e.index_split = split;
+        if (@import("cuda_prompt_slices.zig").of(x.e)) |s| s.hi = hi;
         const first = try x.e.prefillChunk(part, start, n, ids.len, from, cancel, marks);
-        return .{ .first = first, .rows = n };
+        return .{ .first = first, .rows = n, .sliced = slices.pending(x.e) };
+    }
+
+    /// TF_GLM_OVN_FILL_SLICE_MS: the bound stream's pending chunk's next slice on every rank (a chunk_part step), to
+    /// every layer left unless `busy` (another stream decodes); its rows and first token once the chunk is done.
+    pub fn slicePart(x: Leader, busy: bool) !Chunk {
+        const lo = slices.nextLayer(x.e) orelse return error.NoPendingChunk;
+        const hi = slices.next(x.e, busy);
+        try x.send(.{ .kind = @backingInt(Kind.chunk_part), .depth = @intCast(lo), .a = hi }, &.{});
+        const n = slices.pendingRows(x.e);
+        const first = try slices.slice(x.e, lo, hi);
+        return .{ .first = first, .rows = n, .sliced = slices.pending(x.e) };
     }
 
     /// `bits`: the rows' grammar words (structured output, with Engine.structured), else 0.
@@ -383,6 +406,12 @@ fn indexSplit(h: Header) bool {
     return kind == .chunk and h.flags & 2 != 0;
 }
 
+/// A chunk step's first slice end (TF_GLM_OVN_FILL_SLICE_MS, flags bits 8 to 15): 0, the chunk runs whole.
+fn sliceEnd(h: Header) usize {
+    comptime std.debug.assert(@import("config.zig").max_layers < 1 << 8); // a layer index fits bits 8 to 15
+    return (h.flags >> 8) & 0xFF;
+}
+
 /// A prompt step's rows (Leader.chunk): rank 0's cut, which may end at a mark, so no rank re-derives it.
 fn chunkRows(h: Header) usize {
     comptime std.debug.assert(2 * engine.prompt_rows < 1 << 16); // a pair's rows fit flags' 16 bits from bit 16
@@ -430,6 +459,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 defer e.gpa.free(ids);
                 const from: ?engine.Resume = if (h.a != 0) .{ .id = h.a, .at = h.seed } else null;
                 e.index_split = indexSplit(h);
+                if (@import("cuda_prompt_slices.zig").of(e)) |s| s.hi = sliceEnd(h); // TF_GLM_OVN_FILL_SLICE_MS: rank 0's first slice end (0: whole)
                 _ = e.prefillChunk(ids, h.depth, chunkRows(h), h.top_k, from, null, null) catch |err| switch (err) {
                     error.Cancelled => {},
                     else => return err,
@@ -497,6 +527,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
             .snapshots => try @import("cuda_snapshots.zig").agree(e, h.a),
             .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, step.ids),
             .costs => _ = try @import("cuda_cost_time.zig").run(e),
+            .chunk_part => _ = try @import("cuda_prompt_slices.zig").slice(e, h.depth, @intCast(h.a)),
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),
             .idle => cuda.tp_watch.sleep(e.io),
@@ -522,54 +553,8 @@ pub fn spanWords(a: std.mem.Allocator, spans: []const images_mod.Span, max_words
     for (spans, 0..) |sp, i| words[3 * i ..][0..3].* = .{ sp.at, sp.n, sp.row };
     return words;
 }
-test "128 video pairs cross the span serializer and a follower's receiver; one word short is refused" {
-    const a = std.testing.allocator;
-    var spans: [128]images_mod.Span = undefined;
-    for (&spans, 0..) |*sp, i| sp.* = .{ .at = @intCast(i * 2), .n = 1, .row = @intCast(i) };
-    const words = try spanWords(a, &spans, 3 * spans.len);
-    defer a.free(words);
-    var v: images_mod.Images = undefined;
-    v.gpa = a;
-    v.spans = .empty;
-    v.slot = 9;
-    defer v.spans.deinit(a);
-    v.limits = .{ .image_tokens = 64, .max_images = 8, .video_tokens = 128, .max_frames = 256 };
-    v.video_ids = .{ 1, 2, 3 };
-    try v.take(9, words);
-    try std.testing.expectEqualSlices(images_mod.Span, &spans, v.spans.items);
-    try std.testing.expectEqual(@as(u32, 9), v.slot);
-    try std.testing.expectEqual(@as(usize, 128), v.rowCount());
-    try std.testing.expectError(error.TooManyIds, spanWords(a, &spans, 3 * spans.len - 1));
-}
-
-test "a link whose host allocation fails frees its device buffer" {
-    const Mock = struct {
-        var frees: usize = 0;
-        fn alloc(ptr: *cuda.abi.DevicePtr, _: usize) callconv(.c) cuda.abi.Result {
-            ptr.* = 4096;
-            return 0;
-        }
-        fn free(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
-            frees += 1;
-            return 0;
-        }
-    };
-    Mock.frees = 0;
-    var d: cuda.Driver = undefined;
-    d.api.cuMemAlloc_v2 = Mock.alloc;
-    d.api.cuMemFree_v2 = Mock.free;
-    var lib: cuda.nccl.Library = undefined;
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    const before = cuda.usage(false).device;
-    defer {
-        if (Mock.frees == 0) {
-            var leaked: cuda.DeviceBuffer = .{ .d = &d, .ptr = 4096, .len = 64 + 128 * 4 };
-            leaked.free();
-        }
-    }
-    try std.testing.expectError(error.OutOfMemory, Link.init(failing.allocator(), &d, &lib, null, .{ .d = &d, .handle = null }, 128));
-    try std.testing.expectEqual(@as(usize, 1), Mock.frees);
-    try std.testing.expectEqual(before, cuda.usage(false).device);
+test {
+    _ = @import("cuda_follow_test.zig");
 }
 test "flag 1 asks for prompt rows on prefill and chunk steps only (begin's is sampling, draft's from the prompt)" {
     try std.testing.expect(promptRows(.{ .kind = @backingInt(Kind.chunk), .flags = 1, .depth = 2048, .top_k = 4000 }));
@@ -578,9 +563,10 @@ test "flag 1 asks for prompt rows on prefill and chunk steps only (begin's is sa
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.begin), .flags = 1, .seed = 7 }));
     try std.testing.expect(!promptRows(.{ .kind = @backingInt(Kind.draft), .flags = 1, .depth = 3 }));
 }
-test "a chunk step carries its rows above the prompt-rows and split flags, up to a pair's" {
-    const h: Header = .{ .kind = @backingInt(Kind.chunk), .flags = 1 | 2 | 2953 << 16, .depth = 4096, .top_k = 9000 };
+test "a chunk step carries its rows above the prompt-rows and split flags, up to a pair's; a slice end below them" {
+    const h: Header = .{ .kind = @backingInt(Kind.chunk), .flags = 1 | 2 | 45 << 8 | 2953 << 16, .depth = 4096, .top_k = 9000 };
     try std.testing.expectEqual(@as(usize, 2953), chunkRows(h));
+    try std.testing.expectEqual(@as(usize, 45), sliceEnd(h));
     try std.testing.expect(promptRows(h) and indexSplit(h));
     try std.testing.expectEqual(@as(usize, 2 * engine.prompt_rows), chunkRows(.{ .kind = @backingInt(Kind.chunk), .flags = @as(u32, 2 * engine.prompt_rows) << 16 }));
 }

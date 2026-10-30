@@ -14,12 +14,22 @@ const share = fw.Forward.share;
 
 /// forward.pieced_layers: a prompt chunk's layers with exchanges in row pieces; same kernels and bits as unpieced.
 pub fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize) !void {
+    return piecedLayers(f, p, R, cut, 0, f.ranks[0].w.layers.len);
+}
+
+/// pieced's layers lo..hi (TF_GLM_OVN_FILL_SLICE_MS's slices): layer 0's hc_pre first, the taps' share after the last.
+pub fn piecedLayers(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usize, lo: usize, hi: usize) !void {
     const layers = f.ranks[0].w.layers;
+    if (lo >= hi or hi > layers.len) return error.BadSlice;
     const ahead = fronts.wanted(f, p, cut); // TF_GLM_OVN_FRONTS: each block's front runs in the glue before it
-    for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
+    if (lo == 0) for (f.ranks) |r| try f.pre(r, r.w.layers[0].attn_hc, r.w.layers[0].in_norm, R);
     var li: usize = 0;
     var di: usize = 0;
-    for (layers, 0..) |_, j| {
+    for (layers[0..lo]) |l| switch (l.mixer) { // the KDA and DSA layers before lo: their state indexes
+        .kda => li += 1,
+        .mla => di += 1,
+    };
+    for (layers[lo..hi], lo..) |_, j| {
         prof.context(f.prof, j, null, .mixer);
         for (f.ranks) |r| if (r.segs.len > 0) try shared.mixer(f, r, r.w.layers[j], li, di, R, null) else try f.mixerFrom(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null, ahead and j > 0);
         try exchangePieces(f, p, j, .mixer, cut, false);
@@ -34,7 +44,7 @@ pub fn pieced(f: *const Forward, p: *const Pieces, R: usize, cut: []const [2]usi
             .mla => di += 1,
         }
     }
-    if (f.taps) |t| try shareTaps(f, t, cut);
+    if (hi == layers.len) if (f.taps) |t| try shareTaps(f, t, cut);
 }
 
 /// overlap.Overlap.partials: pieces filled on the main stream, exchanged on the second; `fronted`: see fronts.fill.

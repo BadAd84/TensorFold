@@ -99,12 +99,17 @@ pub const Share = struct {
 pub fn run(h: *LaneHost) void {
     if (h.filling.items.len == 0 or runnable(h) == 0) h.share.debt_ns = 0; // owed to streams that ended or paused: no one's
     if (h.filling.items.len == 0) return;
+    if (sliced(h)) |at| { // a chunk part-way through its layers: its next slice alone, then the decoders' round
+        _ = step(h, at);
+        return;
+    }
     const budget = h.share.rows;
     var used: u64 = 0; // rows filled while a stream could decode: the budget counts no others
     // an aged long prompt's step first, when due: under a budget, short arrivals could spend every visit's rows
     const first = if (budget > 0 and runnable(h) > 0 and due(h)) agedLong(h) else null;
     if (first) |at| {
         used = longStep(h, at);
+        if (sliced(h) != null) return; // its chunk's next slice waits for the decoders' round
         between(h);
     }
     // short prompts back to back, as a whole pass at admission went: a burst of them waits on no decode round
@@ -119,12 +124,19 @@ pub fn run(h: *LaneHost) void {
         const counted = budget > 0 and runnable(h) > 0; // a stream that opened earlier in this visit waits from here
         const rows = step(h, at);
         if (counted) used +|= rows;
+        if (sliced(h) != null) return; // its chunk's next slice waits for the decoders' round
         between(h);
     }
     if (first != null or (budget > 0 and used >= budget)) return; // one long step a visit at most, as before
     const at = pick(h, .long) orelse return;
     if (!due(h)) return;
     _ = longStep(h, at);
+}
+
+/// TF_GLM_OVN_FILL_SLICE_MS: the fill whose chunk waits part-way through its layers (Stream.slice_pending), if any.
+fn sliced(h: *const LaneHost) ?usize {
+    for (h.filling.items, 0..) |j, i| if (j.stream.slice_pending) return i;
+    return null;
 }
 
 /// The long prompt `pick` takes, once it has waited `preference_rounds` choices; null otherwise.

@@ -20,6 +20,7 @@ const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
 const pages_mod = @import("cuda_pages.zig");
 const prompt_pair = @import("cuda_prompt_pair.zig");
+const prompt_slices = @import("cuda_prompt_slices.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -89,6 +90,7 @@ pub const Engine = struct {
     seg_commit: ?@import("cuda_commit_seg.zig").SegCommit = null, // TF_GLM_OVN_SEG_COMMIT: a round's commits at once
     seg_dsa: ?@import("cuda_dsa_seg.zig").SegDsa = null, // TF_GLM_OVN_SEG_DSA: e.bs's DSA segment table
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024 and prompt_rows rows
+    slices: ?*prompt_slices.Slices = null, // TF_GLM_OVN_FILL_SLICE_MS: a prompt chunk's layer slices (cuda_engine_ovn)
     checkpoint_digest: [32]u8,
     l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream
     settings: ranks.Settings,
@@ -334,6 +336,7 @@ pub const Engine = struct {
     pub fn release(e: *Engine, slot: u32) void {
         if (e.images) |v| v.release(slot);
         const paged = if (e.pages) |p| p.paged(slot) else false;
+        prompt_slices.forget(e, slot);
         if (paged) e.pages.?.close(slot) else if (slot != 0) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
@@ -398,6 +401,9 @@ pub const Engine = struct {
     pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, rows: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
         const split = e.index_split; // this step's alone
         e.index_split = false;
+        const hi = if (prompt_slices.of(e)) |s| s.take() else 0; // TF_GLM_OVN_FILL_SLICE_MS: the step's first slice end (0: whole)
+        try prompt_slices.idle(e);
+        if (hi != 0 and rows > fw.prefill_rows) return error.BadChunk; // a pair never slices
         if ((from != null or start == 0) and try e.prefillStart(len, from) != start) return error.BadChunk;
         if (start >= len or rows == 0 or rows > len - start) return error.BadChunk;
         if (rows > fw.prefill_rows) return prompt_pair.prefill(e, part, start, rows, len, cancel, marks, split);
@@ -408,7 +414,7 @@ pub const Engine = struct {
         if (dflash.ingestsNone(start, rows, len)) f.taps = null; // the drafter reads none of these rows' taps
         const as_i32: []const i32 = @ptrCast(part);
         if (marks) |m| if (start > 0 and std.mem.indexOfScalar(u32, m.at, @intCast(start)) != null) m.call(m.ctx, @intCast(start));
-        f.prof = e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
+        f.prof = if (hi != 0) null else e.prompt_profs[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3];
         const labels = [_][]const u8{ "prompt chunk to 64 rows", "prompt chunk to 256 rows", "prompt chunk to 1024 rows", std.fmt.comptimePrint("prompt chunk to {d} rows", .{prompt_rows}) };
         if (f.prof) |p| try p.beginPrompt(e.stream, labels[if (rows <= 64) 0 else if (rows <= 256) 1 else if (rows <= 1024) 2 else 3], .{ .rank = e.share.rank, .slot = e.slot, .start = start, .rows = rows }, e.c.run, e.pieces.count);
         if (f.prof) |p| e.profiling_prompt = p;
@@ -426,44 +432,9 @@ pub const Engine = struct {
         };
         stamp.end();
         if (f.prof) |p| p.mark(e.stream, .gate);
+        if (hi != 0) return prompt_slices.begin(e, &f, part, start, rows, len, split, hi); // TF_GLM_OVN_FILL_SLICE_MS
         try f.run(as_i32[0..rows]);
-        e.index_splits += @intFromBool(split);
-        stamp = prof_mod.span(f.prof, e.stream, .prompt_score);
-        if (e.prompt_logprobs) |p| if (part.len > 1) try prompt_lp.run(e, p, part[1..]);
-        stamp.end();
-        stamp = prof_mod.span(f.prof, e.stream, .drafter);
-        if (e.drafter) |dr| try dr.prompt(e, e.slot, start, rows, len);
-        stamp.end();
-        stamp = prof_mod.span(f.prof, e.stream, .draw);
-        const last = start + rows == len;
-        var first: ?u32 = null;
-        if (last) {
-            var t: [1]u32 = undefined;
-            try e.draw(e.bp.logits, 1, len, 0, &t);
-            first = t[0];
-        }
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .draw);
-        if (last) try e.holdPrompt(e.bp.fnormed + (rows - 1) * e.c.hidden * 2);
-        stamp = prof_mod.span(f.prof, e.stream, .mtp);
-        if (e.head) {
-            const nxt = as_i32[1..];
-            if (nxt.len > 0) { // decode._absorb_rows
-                const mp = f.prof;
-                defer f.prof = mp;
-                f.prof = null; // the head's pass as one section
-                try f.mtp(nxt, &.{e.bp.fnormed});
-                f.prof = mp;
-                try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + nxt.len);
-            }
-        }
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .mtp);
-        stamp = prof_mod.span(f.prof, e.stream, .commit);
-        try f.commit(rows);
-        stamp.end();
-        if (f.prof) |p| p.mark(e.stream, .commit);
-        return first;
+        return prompt_slices.tail(e, &f, part, start, rows, len, split);
     }
 
     /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
