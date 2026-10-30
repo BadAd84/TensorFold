@@ -8,23 +8,24 @@ const index_mod = @import("cuda_index.zig");
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
 pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{}, onepass: ?cuda.Function = null };
 
-/// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _LATENT_MMA); the defaults launch today's kernels.
+/// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _LATENT_MMA, _SEG_PASS); the defaults launch today's.
 pub const Mla = struct {
     fuse_rows: usize = 0, // attention launches of this many rows or more, 32-head blocks: chunks and merge in one
     skip: bool = false, // chunk launches stop at the chunk's last live key tile
     vec: bool = false, // absorb_q and expand_v read bf16 kv_b by 16-byte loads
     mma: bool = false, // a prompt buffer's absorb and expand on the tensor cores (latent.py's PROMPT_MMA, a trade)
+    seg: bool = false, // decode chunk launches on glm_glue_attn_seg.cuh's warp-specialised pass (same partials)
 
     /// MLA_FUSEMERGE: unset or 0 off; 1 fuses from latent.prompt_rows rows (prompt chunks); N > 1 from N rows.
     pub fn read() error{BadOvnKnob}!Mla {
         const fuse: usize = @intCast(try cuda.ovn.int("MLA_FUSEMERGE", 0));
-        return .{ .fuse_rows = if (fuse == 1) @import("cuda_latent.zig").prompt_rows else fuse, .skip = fuse != 0, .vec = cuda.ovn.on("ABSORB_VEC"), .mma = cuda.ovn.on("LATENT_MMA") };
+        return .{ .fuse_rows = if (fuse == 1) @import("cuda_latent.zig").prompt_rows else fuse, .skip = fuse != 0, .vec = cuda.ovn.on("ABSORB_VEC"), .mma = cuda.ovn.on("LATENT_MMA"), .seg = cuda.ovn.on("SEG_PASS") };
     }
 
     /// Whether a TF_GLM_OVN knob whose kernels sit in glm_glue is set (MLA_FUSEMERGE, ABSORB_VEC, KVB8, DECODE_SHARD,
-    /// LATENT_MMA, PK8).
+    /// LATENT_MMA, PK8, SEG_PASS).
     pub fn wanted() bool {
-        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD") or cuda.ovn.on("LATENT_MMA") or cuda.ovn.on("PK8");
+        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD") or cuda.ovn.on("LATENT_MMA") or cuda.ovn.on("PK8") or cuda.ovn.on("SEG_PASS");
     }
 };
 
@@ -120,6 +121,10 @@ pub const Kernels = struct {
     expand_mma8: cuda.Function,
     pool_keys_pk8: cuda.Function, // TF_GLM_OVN_PK8 (glm_glue_pk8.cuh): pooled keys as kv8 rows, and their scores
     scores_pk8: cuda.Function,
+    chunks_seg16: cuda.Function, // TF_GLM_OVN_SEG_PASS (glm_glue_attn_seg.cuh): 16-head blocks, and 24 for 17-24 heads
+    chunks_seg24: cuda.Function,
+    chunks_seg16_fp8: cuda.Function,
+    chunks_seg24_fp8: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         return loadOvn(m, Mla.wanted());
@@ -148,6 +153,10 @@ pub const Kernels = struct {
         try k.chunks_32_fused.allowDynamicShared(chunksSmem(32));
         try k.chunks_32_fp8_fused.allowDynamicShared(chunksSmem(32));
         inline for (.{ k.absorb_mma, k.expand_mma, k.absorb_mma8, k.expand_mma8 }) |f| try f.allowDynamicShared(latent_mma_smem);
+        inline for (.{ k.chunks_seg16, k.chunks_seg16_fp8 }, .{ k.chunks_seg24, k.chunks_seg24_fp8 }) |a, b| {
+            try a.allowDynamicShared(seg_smem[0]);
+            try b.allowDynamicShared(seg_smem[1]);
+        }
         return k;
     }
 };
@@ -244,6 +253,11 @@ pub fn chunksSmem(comptime hb: u32) u32 {
 
 /// glm_glue_latent_mma.cuh's SMEM: 3 stages of a 64 x 64 q / o tile and a 128 x 64 kv_b tile, bf16.
 pub const latent_mma_smem: u32 = 3 * (64 * 64 + 128 * 64) * 2;
+
+/// glm_glue_attn_seg.cuh's Smem<2> and Smem<3>: three 32-key bf16 tiles, P (8 NQ heads x 32) bf16, 8 NQ alphas.
+pub const seg_smem = [2]u32{ 3 * 32 * 1024 + 16 * 32 * 2 + 16 * 4, 3 * 32 * 1024 + 24 * 32 * 2 + 24 * 4 };
+/// Its threads: 5 PV, NQ QK and 4 producer warps (NQ 2 for 16-head blocks, 3 for 24).
+pub const seg_threads = [2]u32{ (5 + 2 + 4) * 32, (5 + 3 + 4) * 32 };
 
 /// K slices of the router's dot (glue.ROUTER_KS): fixed by the shape, as the sliced and the single pass differ in bits.
 pub const router_ks = 8;

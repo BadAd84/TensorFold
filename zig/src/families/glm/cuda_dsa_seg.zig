@@ -188,10 +188,10 @@ pub const SegDsa = struct {
     }
 
     /// Whether DSA layer `di` of a window of `n` segments takes the table: this forward's, the table's layer shapes,
-    /// a decode window, and TF_GLM_OVN_MLA_FUSEMERGE off (its skip and fused chunk forms keep the per-segment loop).
+    /// a decode window, and TF_GLM_OVN_MLA_FUSEMERGE and _SEG_PASS off (their chunk forms keep the per-segment loop).
     pub fn takes(x: *const SegDsa, n: usize, set: glue.Set, l: dsa_block.Layer, di: usize) bool {
         const same = l.heads == x.l0.heads and l.lw == x.l0.lw and l.dense_limit == x.l0.dense_limit;
-        return x.segs > 1 and x.segs == n and di < x.layers and same and l.lw == 512 and l.index.d == 128 and l.index.heads <= 32 and !set.prompt and set.mla.fuse_rows == 0 and !set.mla.skip;
+        return x.segs > 1 and x.segs == n and di < x.layers and same and l.lw == 512 and l.index.d == 128 and l.index.heads <= 32 and !set.prompt and set.mla.fuse_rows == 0 and !set.mla.skip and !set.mla.seg;
     }
 
     /// dsa_block.attend for every segment of layer `di` (s: the window's scratch, every row prepared): each step's
@@ -208,14 +208,20 @@ pub const SegDsa = struct {
         try go(x.f.pool_keys, stream, .{ window_rows / 4 + 2, n, 1 }, 32, 0, .{ segs, cache, ix.ape });
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(l.qk), -0.5));
         if (x.counts[@backingInt(List.dense)] > 0) {
+            latent.mark(k.set, k.prof, stream, .mla);
             try x.chunks(stream, l, cache, s.qa, 0, 0, 0, scale, fp8, false, x.dense_nch);
+            latent.mark(k.set, k.prof, stream, .mla_chunks);
             try x.merge(stream, l, .dense, s.ol, s.dummy, 0, false);
+            latent.mark(k.set, k.prof, stream, .mla_merge);
         }
         if (x.counts[@backingInt(List.sparse)] == 0) return;
         try x.selectTokens(k, stream, l, di, cache, s);
         const nch = latent.chunksFor(sparse.width);
+        latent.mark(k.set, k.prof, stream, .mla);
         try x.chunks(stream, l, cache, s.qa, s.tokens, s.counts, sparse.width, scale, fp8, true, nch);
+        latent.mark(k.set, k.prof, stream, .mla_chunks);
         try x.merge(stream, l, .sparse, s.ol, s.counts, nch, true);
+        latent.mark(k.set, k.prof, stream, .mla_merge);
     }
 
     /// latent's chunk launches for the dense or sparse segments, one a head block size, `nch` chunks a segment.

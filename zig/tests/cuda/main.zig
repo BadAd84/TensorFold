@@ -45,6 +45,7 @@ const glm_draw1_check = @import("glm_draw1_check.zig");
 const glm_kda_seg_check = @import("glm_kda_seg_check.zig");
 const glm_dsa_seg_check = @import("glm_dsa_seg_check.zig");
 const glm_mla_ovn_check = @import("glm_mla_ovn_check.zig");
+const glm_seg_pass_check = @import("glm_seg_pass_check.zig");
 const glm_latent_mma_check = @import("glm_latent_mma_check.zig");
 const glm_index_ovn_check = @import("glm_index_ovn_check.zig");
 const glm_shard_check = @import("glm_shard_check.zig");
@@ -267,6 +268,7 @@ const usage =
     \\  glm-kda-seg               TF_GLM_OVN_SEG_KDA's chains and _SEG_COMMIT's commits against the per-segment kernels, byte for byte (one GPU)
     \\  glm-dsa-seg               TF_GLM_OVN_SEG_DSA's segmented DSA steps against dsa_block.attend a segment at a time, byte for byte (one GPU)
     \\  glm-mla-ovn-check         GLM's TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _KVB8 kernels against today's, byte for byte (one GPU)
+    \\  glm-seg-pass              TF_GLM_OVN_SEG_PASS's chunk partials and merged rows against today's, byte for byte (one GPU)
     \\  glm-latent-mma-check      TF_GLM_OVN_LATENT_MMA's tensor-core absorb/expand against float64, deterministic, rows apart (one GPU)
     \\  glm-index-ovn-check       TF_GLM_OVN_DECODE_INDEX, _INDEX_SCHED and _POOLS32 against today's kernels, byte for byte (one GPU)
     \\  glm-shard-check           TF_GLM_OVN_DECODE_SHARD's ranks emulated, merged tokens against selectTokens, byte for byte (one GPU)
@@ -430,6 +432,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-kda-seg")) return glm_kda_seg_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-dsa-seg")) return glm_dsa_seg_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mla-ovn-check")) return glm_mla_ovn_check.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-seg-pass")) return glm_seg_pass_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-latent-mma-check")) return glm_latent_mma_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-index-ovn-check")) return glm_index_ovn_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-shard-check")) return glm_shard_check.run(gpu);
