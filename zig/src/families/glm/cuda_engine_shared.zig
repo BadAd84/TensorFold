@@ -22,7 +22,7 @@ pub fn verifyShared(e: *Engine, parts: []const Part) !void {
     }
     var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
     const prof = if (e.shared_prof) |sp| try sp.round(e.stream, parts.len, rows) else null;
-    const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .taps = if (e.drafter) |dr| dr.taps(false) else null, .prof = prof };
+    const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .taps = if (e.drafter) |dr| dr.taps(false) else null, .prof = prof, .side = @import("cuda_moe_side.zig").pick(e, b) };
     try f.run(@ptrCast(ids[0..rows]));
     if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
     if (e.draw1 != null and !e.structured) try drawPacked(e, b, parts, segs[0..parts.len]) else for (parts, segs[0..parts.len]) |p, g| {

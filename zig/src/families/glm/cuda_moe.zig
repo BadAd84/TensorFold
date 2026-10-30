@@ -40,8 +40,18 @@ pub const Scratch = struct {
     x3: exl3.Scratch = .{ .picks = 0, .xg = 0, .xu = 0, .z = 0 }, // EXL3 experts (eact holds their down inputs)
 };
 
+/// The speed-hunt knobs of the block (TF_GLM_OVN_*), read when the modules load; all off by default.
+pub const Ovn = struct {
+    combine_sy: bool = false, // TF_GLM_OVN_COMBINE_SY: combine reads the shared slot from `sy`, no put_slot
+    topk_sum: bool = false, // TF_GLM_OVN_TOPK_SUM: topk adds the router's K slices itself, no slice_sum
+
+    pub fn read() Ovn {
+        return .{ .combine_sy = cuda.ovn.on("COMBINE_SY"), .topk_sum = cuda.ovn.on("TOPK_SUM") };
+    }
+};
+
 /// The kernels the block runs: the captured Triton set, the grouped NVFP4 experts, the plan, and glm_ops.
-pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null };
+pub const Kernels = struct { set: glue.Set, experts: *const experts.Kernels, exl3: *const exl3.Kernels, put_slot: cuda.Function, prof: ?*prof_mod.Prof = null, ovn: Ovn = .{} };
 
 /// forward.moe_block: out [rows][dims] fp32 partial; `prompt`: 64-pair items, the prompt kernels, bf16 slot rows.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, prompt: bool, out: u64) !void {
@@ -55,8 +65,13 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const slots = l.top_k + 1;
     const shared_id: i32 = @intCast(l.count);
     var stamp = prof_mod.span(k.prof, stream, .router);
-    try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
-    try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
+    if (k.ovn.topk_sum) {
+        try glue.routerSlices(k.set, stream, x, x_stride, l.router, s.router_part, rows, d, l.count);
+        try glue.selectSum(k.set, stream, s.router_part, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
+    } else {
+        try glue.router(k.set, stream, x, x_stride, l.router, s.mlog, s.router_part, rows, d, l.count);
+        try glue.select(k.set, stream, s.mlog, l.bias, s.pick, s.wts, rows, l.top_k, l.count, l.scale, l.norm);
+    }
     stamp.end();
     stamp = prof_mod.span(k.prof, stream, .experts);
     defer stamp.end();
@@ -73,15 +88,28 @@ pub fn body(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
 pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize, prompt: bool, out: u64) !void {
     const stamp = prof_mod.span(k.prof, stream, .shared_expert);
     defer stamp.end();
+    try sharedFront(k, stream, l, s, x, x_stride, lo, hi);
+    try fillTail(k, stream, l, s, lo, hi, prompt, out);
+}
+
+/// The shared expert of rows lo..hi into `sy` fp32: gate/up, SwiGLU and down, reading only `x`.
+pub fn sharedFront(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, lo: usize, hi: usize) !void {
+    const d = l.routed.dims;
+    const n = hi - lo;
+    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
+    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
+    try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+}
+
+/// The fill after the shared expert: `sy` into the last slot, then the slot sum of rows lo..hi into out fp32.
+pub fn fillTail(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize, hi: usize, prompt: bool, out: u64) !void {
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const n = hi - lo;
     // the slot rows: bf16 in an NVFP4 prompt chunk (an EXL3 one under TF_GLM_OVN_X3_YBF16), else fp32
     const bf16_slots = prompt and (l.exl3 == null or exl3.bf16Slots(k.exl3, d, l.routed.width));
     const eb: usize = if (bf16_slots) 2 else 4;
-    try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
-    try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
-    try projection.matmul(k.set, stream, l.shared_down, s.sact + lo * l.shared * 2, l.shared, s.sy + lo * d * 4, s.mm_part, n, d, l.shared, true);
+    if (k.ovn.combine_sy) return glue.combineSy(k.set, stream, s.ey + lo * slots * d * eb, !bf16_slots, s.sy + lo * d * 4, s.wts + lo * slots * 4, out, n, d, slots);
     var a: cuda.Args = .{};
     a.add(s.sy + lo * d * 4);
     a.add(s.ey + lo * slots * d * eb);
