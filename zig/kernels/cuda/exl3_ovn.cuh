@@ -60,33 +60,6 @@ __device__ __forceinline__ void words_of(uint32_t word, int lane, uint32_t (&w)[
     w[1] = word;
 }
 
-// warp_tiles<CB, 8, NT> with one 32-bit load a lane a tile (TF_GLM_OVN_X3_NC=w): the same words reach decode_lane.
-template <int CB, int NT>
-__device__ __forceinline__ void warp_tiles_w(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
-                                             const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
-    constexpr int TW = tile_words<8>();
-    const size_t kstride = (size_t)ntiles * TW;
-    for (int i = 0; i < nkt; ++i) {
-        const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
-        uint32_t w[NT];
-#pragma unroll
-        for (int j = 0; j < NT; ++j) w[j] = ldg_stream_u32(t0 + j * TW + lane);
-        const int k = (kt0 + i) * 16;
-        const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
-                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
-                               ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k + 8) : 0u,
-                               ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k + 8) : 0u};
-#pragma unroll
-        for (int j = 0; j < NT; ++j) {
-            uint32_t ww[2], b0[2], b1[2];
-            words_of(w[j], lane, ww);
-            decode_lane<8, CB>(ww, lane, b0, b1);
-            mma16816(acc[j][0], a, b0);
-            mma16816(acc[j][1], a, b1);
-        }
-    }
-}
-
 // tf_exl3_down_combine's per-slot arithmetic on a block's warp sums (sk 1): 0 + sum, rotated, * svh, into y's slot row.
 template <int NT, int W>
 __device__ __forceinline__ void fused_down(const float (&red)[W][16][NT * 16], const int* rows_sh, int e, int nt0,
