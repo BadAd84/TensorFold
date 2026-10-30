@@ -78,10 +78,10 @@ fn agent(a: Allocator, corpus: []const u8, bytes: usize) !struct { prior: []cons
 }
 
 const sites = [_][]const u8{
-    "parse body",                     "plan (openai.chatInput)",        "chat.prepare",                 "  prompt.prepare",
-    "  systemPrefixLen (chat 154)",   "  replySpans (chat 177)",        "  render prompt",              "  keep prompt",
-    "  render history probe",         "  pieces history probe",         "  render continued probe",     "  pieces continued probe",
-    "  render rewind probe",          "  pieces rewind probe",          "old: renderIds prompt",        "old: renderIds history",
+    "parse body",                     "plan (openai.chatInput)",      "chat.prepare",             "  prompt.prepare",
+    "  systemPrefixLen (chat 154)",   "  replySpans (chat 177)",      "  render prompt",          "  keep prompt",
+    "  render history probe",         "  pieces history probe",       "  render continued probe", "  pieces continued probe",
+    "  render rewind probe",          "  pieces rewind probe",        "old: renderIds prompt",    "old: renderIds history",
     "old: renderIds continued probe", "old: rewindLen (full encode)",
 };
 
