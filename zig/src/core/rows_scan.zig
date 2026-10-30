@@ -38,6 +38,15 @@ pub fn scan(r: *Rows) !void {
 
 /// A state file's metadata checked against its name, kept for lookups (its payload is checked when read).
 fn readState(r: *Rows, p: [:0]const u8) !void {
+    var s = try stateOf(r, p);
+    errdefer Rows.freeState(r.gpa, &s);
+    r.clock += 1;
+    s.used = r.clock;
+    try r.states.append(r.gpa, s);
+}
+
+/// State file `p`'s metadata checked against its name under `r`'s keying (r.gpa's memory); nothing on disk changes.
+pub fn stateOf(r: *const Rows, p: [:0]const u8) !State {
     var o = try file.open(p, .state, null);
     defer o.close();
     const m = try file.meta(&o, r.gpa);
@@ -56,9 +65,7 @@ fn readState(r: *Rows, p: [:0]const u8) !void {
     if (s.at == 0 or s.tokens.len != s.at + r.keying.lookahead or o.trailer.block != r.keying.block) return error.RowsRead;
     if (!std.mem.eql(u8, &chain.state(r.keying, s.tokens, s.spans, s.starts, s.at), &s.name)) return error.RowsRead;
     modes.validate(s.spans) catch return error.RowsRead;
-    r.clock += 1;
-    s.used = r.clock;
-    try r.states.append(r.gpa, s);
+    return s;
 }
 
 /// Each state's blocks counted; a state missing one, or that its family cannot lay out, goes; then idle blocks.
@@ -85,10 +92,34 @@ pub fn settle(r: *Rows) void {
     r.collect();
 }
 
-/// A file's stem: the first 16 bytes of its name in hex (32 digits), then `.blk` or `.st`.
-fn parseName(name: []const u8) ?chain.Stem {
+/// A file's stem: the first 16 bytes of its name in hex (32 digits), then `.blk` or `.st` (rows_carry reads it too).
+pub fn parseName(name: []const u8) ?chain.Stem {
     if (name.len < 33 or name[32] != '.') return null;
     var n: chain.Stem = undefined;
     _ = std.fmt.hexToBytes(&n, name[0..32]) catch return null;
     return n;
+}
+
+/// A directory entry's name if it is a state file of rank 0's store (`<stem>.st`), else null (rows_carry, rows_replay).
+pub fn stateName(ent: anytype) ?[]const u8 {
+    const name = std.mem.sliceTo(&ent.name, 0);
+    if (ent.type != platform.c.DT.REG or !std.mem.endsWith(u8, name, ".st") or parseName(name) == null) return null;
+    return name;
+}
+
+/// File `p`'s modify time in nanoseconds (0 when unknown: the oldest), as the platform's own stat reads it.
+pub fn mtimeOf(p: [:0]const u8) i128 {
+    const fd = platform.c.open(p, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
+    if (fd < 0) return 0;
+    defer _ = platform.c.close(fd);
+    if (@import("builtin").os.tag == .linux) { // glibc's fstat is a macro: statx, as prompt_imprint reads a size
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        if (platform.c.statx(fd, "", linux.AT.EMPTY_PATH, .{ .MTIME = true }, &sx) != 0 or !sx.mask.MTIME) return 0;
+        return @as(i128, sx.mtime.sec) * std.time.ns_per_s + sx.mtime.nsec;
+    }
+    var st: platform.c.Stat = undefined;
+    if (platform.c.fstat(fd, &st) != 0) return 0;
+    const t = st.mtime();
+    return @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
 }

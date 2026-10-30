@@ -6,6 +6,7 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const glm = @import("glm_cuda");
 const cuda_disk = @import("cuda_disk.zig");
+const carry = @import("cuda_glm_disk_carry.zig"); // TF_GLM_OVN_DISK_CARRY
 const img = glm.disk_image;
 const ranks = glm.disk_ranks;
 const rows = api.prompt_cache.rows;
@@ -208,16 +209,20 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
     const p = try probe(a, io, loaded.backend, e); // every rank's prefix still: it checks the ranks' shared bytes agree
     if (keep_local) store_pre = prefixes[0..1];
     const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
+    // TF_GLM_OVN_DISK_CARRY: this start's carry key and proof; an older directory proving them is read instead
+    const carried = if (cuda.ovn.on("DISK_CARRY")) try carry.start(a, io, ctx, o, root, loaded.backend, e, facts.items, p.hash, id, store, keep_local) else null;
+    const adopted: ?u64 = if (carried) |c| (if (c.choice.adopted) c.choice.id else null) else null;
     const gibs = struct {
         fn bytes(g: f64) u64 {
             return @intFromFloat(g * (1 << 30));
         }
     }.bytes;
     // spill stays off: an eviction would gather on rank 0 mid-pass while the other ranks wait in the gate's all-reduce
-    const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid });
+    const r = try rows.Rows.open(store.gpa, store.family, .{ .root = root, .identity = id, .cap = gibs(o.learn_gib), .floor = gibs(o.learn_min_free_gib), .daily = gibs(o.learn_daily_gib), .lookahead = store.rules.lookahead, .planned = store.rules.planned, .grid = store.rules.grid, .adopted = adopted });
     r.prefill_rate = p.rate;
     store.disk = r;
     if (keep_local) try @import("cuda_glm_disk_local.zig").open(e, r, gibs(o.learn_min_free_gib));
+    if (carried) |c| try carry.records(e, r, c, keep_local);
     std.log.info("glm: conversation states on disk in {s} ({d} states, {d} MiB of {d} MiB; {d} ranks' parts{s})", .{ r.dir, r.states.items.len, r.held() >> 20, r.cap >> 20, prefixes.len, if (local) ", each on its own disk" else "" });
 }
 

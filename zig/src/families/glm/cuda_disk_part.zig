@@ -179,9 +179,7 @@ pub const Part = struct {
 
     /// Rank `rank`'s path of a file of this store.
     pub fn path(p: *const Part, buf: []u8, k: Key, part: bool) ![:0]const u8 {
-        var eb: [24]u8 = undefined;
-        const ext = try file.rankExt(&eb, if (k.kind == .block) ".blk" else ".st", p.rank);
-        return file.path(buf, p.dir, &std.fmt.bytesToHex(k.stem, .lower), ext, part);
+        return pathIn(buf, p.dir, p.rank, k, part);
     }
 
     fn exec(p: *Part, j: Job) void {
@@ -308,6 +306,13 @@ pub const Part = struct {
         p.ok = true;
     }
 };
+
+/// Rank `rank`'s path of the file keyed `k` in store directory `dir` (`part`: while it is written).
+pub fn pathIn(buf: []u8, dir: []const u8, rank: u32, k: Key, part: bool) ![:0]const u8 {
+    var eb: [24]u8 = undefined;
+    const ext = try file.rankExt(&eb, if (k.kind == .block) ".blk" else ".st", rank);
+    return file.path(buf, dir, &std.fmt.bytesToHex(k.stem, .lower), ext, part);
+}
 
 /// One restore's files as the reader pool takes them: read and checked on reader threads, copied in on this one.
 const Reader = struct {

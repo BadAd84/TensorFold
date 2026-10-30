@@ -16,17 +16,17 @@ const kind = @backingInt(follow.Kind.disk);
 /// This process's own part: a rank other than 0, from rank 0's open step on.
 var mine: ?*part.Part = null;
 
-/// A file in a step: its kind, group and index, then its name's eight words.
-const file_words = 3 + 8;
+/// A file in a step: its kind, group and index, then its name's eight words (TF_GLM_OVN_DISK_CARRY's replay too).
+pub const file_words = 3 + 8;
 /// A key in a step: its kind, then its stem's four words.
 const key_words = 1 + 4;
 
-fn putFile(f: File, out: []u32) void {
+pub fn putFile(f: File, out: []u32) void {
     out[0..3].* = .{ @backingInt(f.kind), f.window, f.k };
     @memcpy(std.mem.sliceAsBytes(out[3..file_words]), &f.name);
 }
 
-fn getFile(in: []const u32) !File {
+pub fn getFile(in: []const u32) !File {
     if (in[0] != @backingInt(Kind.block) and in[0] != @backingInt(Kind.state)) return error.BadStep;
     var f: File = .{ .name = undefined, .kind = @fromBackingInt(in[0]), .window = in[1], .k = in[2] };
     @memcpy(&f.name, std.mem.sliceAsBytes(in[3..file_words]));
@@ -49,13 +49,29 @@ fn gather(l: *follow.Link, e: *const Engine, v: u64, out: []u64) !void {
     try @import("cuda_ranks.zig").gather(u64, l.d, l.lib, l.comm, l.stream, e.share.rank, v, out);
 }
 
+/// A directory's path as a disk step's ids, `depth` bytes of them (DISK_LOCAL's open, TF_GLM_OVN_DISK_CARRY's steps).
+pub const Path = struct {
+    ids: [300]u32 = @splat(0),
+
+    /// `dir`'s bytes in `p`'s words, as many as they take.
+    pub fn of(p: *Path, dir: []const u8) ![]const u32 {
+        if (dir.len > p.ids.len * 4) return error.NameTooLong;
+        @memcpy(std.mem.sliceAsBytes(&p.ids)[0..dir.len], dir);
+        return p.ids[0 .. (dir.len + 3) / 4];
+    }
+
+    /// The path a step carries: `h.depth` bytes of its ids.
+    pub fn read(h: follow.Header, ids: []const u32) ![]const u8 {
+        if (h.depth > ids.len * 4) return error.BadStep;
+        return std.mem.sliceAsBytes(ids)[0..h.depth];
+    }
+};
+
 /// Rank 0: every other rank opens its own part of the store in `dir` (the same path on its own disk).
 pub fn open(e: *Engine, dir: []const u8, floor: u64, block: u32, threads: u32) !void {
     const x = ranks.leader(e) orelse return;
-    var ids: [300]u32 = @splat(0);
-    if (dir.len > ids.len * 4) return error.NameTooLong;
-    @memcpy(std.mem.sliceAsBytes(&ids)[0..dir.len], dir);
-    try x.disk(.{ .kind = kind, .flags = @backingInt(Op.local_open), .a = floor, .seed = block, .depth = @intCast(dir.len), .top_k = threads }, ids[0 .. (dir.len + 3) / 4]);
+    var p: Path = .{};
+    try x.disk(.{ .kind = kind, .flags = @backingInt(Op.local_open), .a = floor, .seed = block, .depth = @intCast(dir.len), .top_k = threads }, try p.of(dir));
 }
 
 /// Rank 0 staged file `f` of kept state `id` at `at`: every other rank stages its own part of it.
@@ -152,9 +168,9 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32, op:
     const rank: u32 = @intCast(e.share.rank);
     switch (op) {
         .local_open => {
-            if (h.depth > ids.len * 4) return error.BadStep;
+            const dir = try Path.read(h, ids);
             close();
-            mine = part.Part.open(e.gpa, std.mem.sliceAsBytes(ids)[0..h.depth], rank, h.a, @intCast(h.seed), @max(h.top_k, 1)) catch |err| blk: {
+            mine = part.Part.open(e.gpa, dir, rank, h.a, @intCast(h.seed), @max(h.top_k, 1)) catch |err| blk: {
                 std.log.warn("glm rank {d}: its part of the disk store did not open ({s}); its restores fail", .{ rank, @errorName(err) });
                 break :blk null;
             };
