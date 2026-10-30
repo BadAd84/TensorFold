@@ -251,6 +251,7 @@ pub const Engine = struct {
         errdefer e.freeProfs();
         if (prof_mod.Prof.wanted()) for (&e.profs) |*p| {
             p.* = try prof_mod.Prof.init(d, io);
+            if (rank == 0 and prof_mod.route.Route.wanted()) p.*.?.route = .{}; // TF_GLM_PROF_ROUTE=1
         };
         if (prof_mod.Prof.wanted()) for (&e.prompt_profs) |*p| {
             p.* = try prof_mod.Prof.init(d, io);
