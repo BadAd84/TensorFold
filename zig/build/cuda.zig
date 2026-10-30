@@ -200,7 +200,7 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     if (host.result.os.tag != .windows) @import("h3_host.zig").targets(b, cuda, step);
     b.step("test-gradient-host", "Gradient bounds through real wrappers with recorded CUDA launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"train launch bounds:"} })).step);
     b.step("test-tp-id-host", "Bounded NCCL-ID TP fanout and independent wire controls without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{"tp id coverage:"} })).step);
-    const prx_run = b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "PRX plan:", "PRX emulation:", "PRX channel:", "RoCE gather:" } }));
+    const prx_run = b.addRunArtifact(b.addTest(.{ .root_module = cuda, .filters = &.{ "PRX plan:", "PRX emulation:", "PRX schedule:", "PRX channel:", "RoCE gather:" } }));
     b.step("test-prx-host", "TF_GLM_OVN_PRX's plan and proxy on emulated ranks and NICs, and the RoCE gather's layout").dependOn(&prx_run.step);
     step.dependOn(&prx_run.step);
     const runtime_host = b.step("test-runtime-host", "Shared CUDA runtime and graph host regressions");

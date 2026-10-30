@@ -113,6 +113,8 @@ test {
     _ = @import("prx_plan.zig");
     _ = @import("prx_proxy.zig");
     _ = @import("prx_emu_test.zig");
+    _ = @import("prx_emu.zig");
+    _ = @import("prx_emu_sched_test.zig");
     _ = @import("rank_scatter.zig");
     _ = @import("relay_plan.zig");
     _ = launch;

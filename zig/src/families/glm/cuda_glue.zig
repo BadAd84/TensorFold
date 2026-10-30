@@ -347,9 +347,14 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
 /// glue.hc_post: branch = bf16(`g`, rank 0 first); xout[s] = bf16(post[s] branch + sum_t comb[t][s] x[t]); x may alias.
 /// `world` here and in hcGlue, hcRow: the ranks, or rotlayer.word's (a rotated MoE layer's partials from its owner).
 pub fn hcPost(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, rows: usize, d: usize, s: usize, world: usize) !void {
+    return hcPostAt(set, stream, x, xout, g, rows * d, post, comb, rows, d, s, world);
+}
+
+/// hcPost with rank r's partial rows at g + r * rs floats (hcPost's: rows * d; TF_GLM_OVN_PRX_ZC's: a block apart).
+pub fn hcPostAt(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, rs: usize, post: u64, comb: u64, rows: usize, d: usize, s: usize, world: usize) !void {
     if (s != 4) return error.StreamsNotFour;
     var a: cuda.Args = .{};
-    inline for (.{ x, xout, g, post, comb, i64of(rows * d), i64of(d), cint(world) }) |v| a.add(v);
+    inline for (.{ x, xout, g, post, comb, i64of(rs), i64of(d), cint(world) }) |v| a.add(v);
     try rows8Launch(if (set.pdl_early) set.glue.hc_post_pdl else set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
 }
 
@@ -371,6 +376,11 @@ pub fn hcGlue(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, fn_w: u6
 
 /// TF_GLM_OVN_GLUE_ROW: hcPost in place then hcPre of `rows` rows, one kernel of 4 rows a block, their bytes.
 pub fn hcRow(set: Set, stream: cuda.Stream, x: u64, g: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize, world: usize) !void {
+    return hcRowAt(set, stream, x, g, rows * d, fn_w, base, scale, norm, out, xs, post, comb, eps, hc_eps, iters, rows, d, s, world);
+}
+
+/// hcRow with rank r's partial rows at g + r * rs floats (as hcPostAt).
+pub fn hcRowAt(set: Set, stream: cuda.Stream, x: u64, g: u64, rs: usize, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize, world: usize) !void {
     if (d != 4096 or s != 4) return error.HcShape;
     inline for (.{ x, g }) |p| if (p % 16 != 0) return error.RowsUnaligned;
     const f, const w = switch (norm) {
@@ -378,7 +388,7 @@ pub fn hcRow(set: Set, stream: cuda.Stream, x: u64, g: u64, fn_w: u64, base: u64
         .f32 => |p| .{ set.glue.hc_row_f32w, p },
     };
     var a: cuda.Args = .{};
-    inline for (.{ x, g, i64of(rows * d), cint(world), fn_w, base, scale, w, out, xs, post, comb, eps, hc_eps, cint(iters), i64of(rows) }) |v| a.add(v);
+    inline for (.{ x, g, i64of(rs), cint(world), fn_w, base, scale, w, out, xs, post, comb, eps, hc_eps, cint(iters), i64of(rows) }) |v| a.add(v);
     try cuda.launch.launch(f, .{ .grid = .{ .x = cdiv(rows, 4) }, .block = .{ .x = 256 } }, stream, &a);
 }
 
