@@ -131,8 +131,11 @@ pub const Lanes = struct {
             .draft_streams = block, // one block pass drafts every stream of the round
             .mtp_step_ms = if (block) 1.6 / @as(f64, max_held) else 0, // a block's 7 drafts in one pass (about 1.6 ms)
             .draft_probabilities = block, // the selector's chances size each window against the costs below
-            // TF_GLM_OVN_DRAFT_FIXED: a floor under every kept chance, so each window verifies all the cut kept
-            .draft_confidence = if (block and self.x.e.drafter.?.knobs.fixed) std.math.floatMin(f64) else null,
+            // TF_GLM_OVN_DRAFT_FIXED: verify every draft the cut kept (knob first: a host fake's drafter is undefined)
+            .draft_confidence = if (cuda.ovn.on("DRAFT_FIXED") and block and self.x.e.drafter.?.knobs.fixed)
+                std.math.floatMin(f64)
+            else
+                null,
             .window_costs = if (block) (if (self.timed) |*t| &t.window else &gb10_window_costs) else &.{},
             .shared_costs = if (block) (if (self.timed) |*t| &t.shared else &gb10_shared_costs) else &.{},
             .hidden_rows = sharing,
