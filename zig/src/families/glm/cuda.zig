@@ -47,6 +47,7 @@ pub const disk_image = @import("cuda_disk_image.zig");
 pub const disk_ranks = @import("cuda_disk_ranks.zig");
 pub const one_chunk = @import("cuda_one_chunk.zig");
 pub const disk_local = @import("cuda_disk_local.zig"); // TF_GLM_OVN_DISK_LOCAL: each rank's part on its own disk
+pub const rotlayer = @import("cuda_rotlayer.zig"); // TF_GLM_OVN_EXPERT_ROTATE: each MoE layer's first shares rotated
 
 test {
     _ = @import("cuda_tile.zig");
@@ -84,6 +85,7 @@ test {
     _ = dsa_block;
     _ = mlp;
     _ = shard;
+    _ = rotlayer;
     _ = weights;
     _ = forward;
     _ = relay;

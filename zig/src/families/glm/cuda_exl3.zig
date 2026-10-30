@@ -4,6 +4,7 @@ const std = @import("std");
 const modelopt = @import("core").modelopt;
 const shard = @import("cuda_shard.zig");
 const Span = shard.Span;
+const Config = @import("config.zig").Config;
 const cuda = @import("cuda");
 const experts = @import("cuda_experts.zig");
 
@@ -96,10 +97,11 @@ pub fn expertCut(inter: usize, rank: usize, world: usize, e: usize, rot: common.
     return shard.span(inter, 128, if (rot.on()) (rank + world - e % world) % world else rank, world);
 }
 
-/// The routed width a rank's kernels and buffers take: its share, or the wide share under TF_GLM_OVN_X3_ROTEXPERT.
-pub fn routedWidth(share: shard.Share, inter: usize) !usize {
-    const rot = try rotation(inter, share.rank, share.world);
-    return if (rot.on()) rot.wn + rot.wx else share.moe.len();
+/// The routed width a rank's kernels and buffers take: its widest share (TF_GLM_OVN_EXPERT_ROTATE: over the layers,
+/// a layer's own on that layer's Share.at), or the wide share under TF_GLM_OVN_X3_ROTEXPERT.
+pub fn routedWidth(share: shard.Share, c: *const Config) !usize {
+    const rot = try rotation(c.moe_inter, share.rank, share.world);
+    return if (rot.on()) rot.wn + rot.wx else share.widest(c)[0];
 }
 
 fn cutOf(inter: usize, share: shard.Share, e: usize, rot: common.Rot) !Span {
@@ -221,6 +223,16 @@ pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: 
     l.shared_input = shx;
     if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k, o) catch unreachable), 4, 4, 4 };
     return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
+}
+/// scratchBytes for every routed width `share` holds (TF_GLM_OVN_EXPERT_ROTATE: per layer), each size the largest.
+pub fn heldScratch(rows: usize, dims: usize, share: shard.Share, c: *const Config, prefill: bool, shx: bool, o: Ovn) ![4]usize {
+    var out = scratchBytes(rows, dims, try routedWidth(share, c), prefill, shx, o);
+    if (!share.rot.on) return out;
+    for (0..c.layers) |i| {
+        const got = scratchBytes(rows, dims, (try share.at(c, i)).moe.len(), prefill, shx, o);
+        for (&out, got) |*x, y| x.* = @max(x.*, y);
+    }
+    return out;
 }
 /// TF_GLM_OVN_X3_YBF16 (a numerics trade): a fused EXL3 prompt chunk's slot rows in bf16, as an NVFP4 chunk's.
 pub fn bf16Slots(k: *const Kernels, dims: usize, width: usize) bool {

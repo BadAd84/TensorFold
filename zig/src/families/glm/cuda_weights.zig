@@ -365,7 +365,7 @@ const Loader = struct {
         const qk = L.tools.quant orelse return error.NoQuantizer;
         const c = &L.w.config;
         const d: usize = c.hidden;
-        const cut = L.w.share.moe;
+        const cut = (try L.w.share.at(c, i)).moe; // TF_GLM_OVN_EXPERT_ROTATE: the layer's share
         const ni = cut.len();
         const up_len = X.bytes(1, ni, d, 2) / 4;
         const down_len = X.bytes(1, d, ni, 1) / 4;
@@ -425,20 +425,21 @@ const Loader = struct {
     pub fn moeLayer(L: *Loader, i: u32) !moe.Layer {
         const c = &L.w.config;
         const d: usize = c.hidden;
-        const cut = L.w.share.moe;
+        const share = try L.w.share.at(c, i); // TF_GLM_OVN_EXPERT_ROTATE: the layer's expert shares
+        const cut = share.moe;
         const ni = cut.len();
         try L.whole(try L.get("layers.{d}.mlp.gate.weight", .{i}), .bf16);
         const router = try L.put("layers.{d}.moe.router", .{i});
         try L.whole(try L.get("layers.{d}.mlp.gate.e_score_correction_bias", .{i}), .f32);
         const bias = try L.put("layers.{d}.moe.bias", .{i});
         const count: usize = c.experts;
-        var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = if (c.exl3) try exl3.routedWidth(L.w.share, c.moe_inter) else ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
+        var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = if (c.exl3) try exl3.routedWidth(share, c) else ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
         var x3: ?exl3.Experts = null;
         if (c.exl3) { // the MTP layer's experts too
-            x3 = try exl3.load(L, i, count, d, c.moe_inter, L.w.share);
+            x3 = try exl3.load(L, i, count, d, c.moe_inter, share);
             if (!x3.?.shx) L.w.exl3_shx = false;
         } else routed = try L.nvfp4Experts(i);
-        const sh = L.w.share.shared;
+        const sh = share.shared;
         const sw: []const formats.Format = if (i == c.layers) &.{ .bf16, .fp8_pb, .mxfp8 } else &.{ .bf16, .fp8_pb }; // MTP's MXFP8
         const gu_parts = [_]formats.Part{ .{ .rel = "mlp.shared_experts.gate_proj", .rows = .{ sh.lo, sh.hi } }, .{ .rel = "mlp.shared_experts.up_proj", .rows = .{ sh.lo, sh.hi } } };
         const gu = try formats.cutProj(L, prefix, i, &gu_parts, sw, "layers.{d}.moe.shared.gu");
@@ -462,7 +463,7 @@ const Loader = struct {
     fn nvfp4Experts(L: *Loader, i: u32) !cuda.experts.Layer {
         const c = &L.w.config;
         const d: usize = c.hidden;
-        const cut = L.w.share.moe;
+        const cut = (try L.w.share.at(c, i)).moe; // TF_GLM_OVN_EXPERT_ROTATE: the layer's share
         const ni = cut.len();
         const count: usize = c.experts;
         const up_len = X.bytes(1, ni, d, 2) / 4;

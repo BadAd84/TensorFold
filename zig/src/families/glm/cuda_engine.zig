@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const lanes = @import("lanes");
 const config = @import("config.zig");
 const shard = @import("cuda_shard.zig");
+const rotlayer = @import("cuda_rotlayer.zig");
 const weights = @import("cuda_weights.zig");
 const fw = @import("cuda_forward.zig");
 const ranks = @import("cuda_ranks.zig");
@@ -164,9 +165,14 @@ pub const Engine = struct {
         );
         if (o.vision) |lim| ranks.mediaFingerprint(&fp, lim);
         fp.mtp += @intFromBool(o.drafter);
+        const owners = rotlayer.read(&c, world); // TF_GLM_OVN_EXPERT_ROTATE: a refused value stops after the agreement
+        fp.moe_owners = if (owners) |x| x.digest() else |_| rotlayer.refused;
         try ranks.agree(d, lib, comm, stream, fp, try a.alloc(ranks.Fingerprint, world));
         try ranks.probeStart(d, lib, comm, stream, o.settings, rank, world);
-        const share = try shard.Share.of(&c, rank, world);
+        var share = try shard.Share.of(&c, rank, world);
+        share.rot = try owners;
+        rotlayer.active = share.rot.on; // read once: the forward reads Share.rot only when set
+        if (rank == 0) rotlayer.note(&share.rot, &c, world);
         const kb = @import("cuda_kda_block.zig");
         kb.pad_to = if (o.settings.kda_pad) kb.padWidth(c.kda_heads, world) else 0; // read once: rowWidth reads only this
         @import("cuda_state.zig").drop_mtp = o.mtp and o.drafter and cuda.ovn.on("DROP_MTP"); // read once, as pad_to

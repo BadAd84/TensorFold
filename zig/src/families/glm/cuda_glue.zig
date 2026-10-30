@@ -344,6 +344,7 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
 }
 
 /// glue.hc_post: branch = bf16(`g`, rank 0 first); xout[s] = bf16(post[s] branch + sum_t comb[t][s] x[t]); x may alias.
+/// `world` here and in hcGlue, hcRow: the ranks, or rotlayer.word's (a rotated MoE layer's partials from its owner).
 pub fn hcPost(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u64, comb: u64, rows: usize, d: usize, s: usize, world: usize) !void {
     if (s != 4) return error.StreamsNotFour;
     var a: cuda.Args = .{};

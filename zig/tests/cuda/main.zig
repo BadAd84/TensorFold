@@ -85,6 +85,7 @@ const glm_paged_tests = @import("glm_paged_tests.zig");
 const glm_resume_tests = @import("glm_resume_tests.zig");
 const glm_slice_tests = @import("glm_slice_tests.zig");
 const glm_onechunk_tests = @import("glm_onechunk_tests.zig");
+const glm_rotlayer_check = @import("glm_rotlayer_check.zig");
 const glm_snap_gather_tests = @import("glm_snap_gather_tests.zig");
 const glm_synth = @import("glm_synth.zig");
 const tree_round_tests = @import("tree_round_tests.zig");
@@ -286,6 +287,7 @@ const usage =
     \\  glm-resume-check <ckpt> <rank> <world> <idfile>  states kept and resumed at rows off the 2,048 grid against fresh passes, bit for bit, with red controls
     \\  glm-slice-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_FILL_SLICE_MS=1: prompt chunks in layer slices with decode windows between, against whole chunks, bit for bit
     \\  glm-onechunk-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_ONE_CHUNK=1: marks kept inside one chunk against chunks cut at each mark, bit for bit
+    \\  glm-rotlayer-check <ckpt> <rank> <world> <idfile>  TF_GLM_OVN_EXPERT_ROTATE (mod or counts, TP=3): every layer's glued rows and the logits against the standard split, byte for byte
     \\  dory MODEL LOOPS N TEXT     Dory (NVFP4): N greedy tokens from TEXT, then verify windows of 2 to 16 rows bit-equal
     \\  dory-serve MODEL LOOPS TEXT N   Dory served: eager == graphs, copy drafts == plain, 2/4/8 streams == solo
     \\  dory-states MODEL LOOPS TEXT N  Dory kept prompt states at 8k and 32k resumed into wiped caches == fresh
@@ -528,6 +530,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-resume-check")) return glm_resume_tests.resumeCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-slice-check")) return glm_slice_tests.sliceCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-onechunk-check")) return glm_onechunk_tests.oneChunkCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
+    if (std.mem.eql(u8, cmd, "glm-rotlayer-check")) return glm_rotlayer_check.rotLayerCheck(gpu, try arg(rest, 0), try std.fmt.parseInt(c_int, try arg(rest, 1), 10), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "glm-shared-check")) return glm_lanes_tests.sharedCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-pair-check")) return glm_pair_tests.pairCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));
     if (std.mem.eql(u8, cmd, "glm-split-check")) return glm_split_tests.splitCheck(gpu, try arg(rest, 0), try arg(rest, 1), try std.fmt.parseInt(c_int, try arg(rest, 2), 10), try std.fmt.parseInt(c_int, try arg(rest, 3), 10), try arg(rest, 4));

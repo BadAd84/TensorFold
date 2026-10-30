@@ -145,7 +145,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 15, // this struct's version
+    layout: u32 = 16, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -166,7 +166,7 @@ pub const Fingerprint = extern struct {
     max_frames: u32 = 0,
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     ovn_comms: u32 = 0, // Settings.ovn_comms: the RoCE gather's blob and stripes and the step link's transport
-    _pad: u32 = 0, // keeps capacity 8-aligned with no implicit padding (the bytes cross the communicator)
+    moe_owners: u32 = 0, // TF_GLM_OVN_EXPERT_ROTATE's owners (cuda_rotlayer digest): every rank sums a layer alike
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -196,6 +196,7 @@ pub const Fingerprint = extern struct {
         max_frames,
         bits,
         ovn_comms,
+        moe_owners,
         capacity,
         heat_high,
         heat_low,
@@ -268,6 +269,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_frames",
             "bits",
             "ovn_comms",
+            "moe_owners",
             "capacity",
             "heat_high",
             "heat_low",
@@ -379,6 +381,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .ovn_comms => "TF_GLM_OVN_ROCE_RAILS, TF_GLM_OVN_ROCE_RAILS_KB, TF_GLM_OVN_LINK1 or TF_GLM_OVN_LINK_ROCE",
+        .moe_owners => "TF_GLM_OVN_EXPERT_ROTATE (each MoE layer's expert share owners)",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",
