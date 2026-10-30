@@ -124,6 +124,8 @@ pub const Server = struct {
     keys: ?*auth.Store,
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
+    /// TF_GLM_OVN_HOST_ONCE=1: the rewind probe's render stops a few KiB past where it leaves the prompt (prompt.zig).
+    host_once: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
     close_id: ?u32 = null, // the close marker's own token, when the marker is one token
     chunks: chunk_plan.Plan = .{},
@@ -199,6 +201,7 @@ pub const Server = struct {
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
+        srv.host_once = if (std.c.getenv("TF_GLM_OVN_HOST_ONCE")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
         if (srv.info.vision != null) {
             const template_images = templateImages(srv);
             if (!template_images) log.line("warning: --vision: the chat template writes no image placeholder for an image part, so image requests will fail; serve with --chat-template naming a template that has an image path", .{});

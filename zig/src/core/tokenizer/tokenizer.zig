@@ -6,6 +6,7 @@ const models = @import("model.zig");
 const Allocator = std.mem.Allocator;
 pub const Memo = @import("memo.zig").Memo;
 pub const eos = @import("eos.zig");
+pub const kept = @import("kept.zig");
 /// A digest of what ids mean as loaded (identity.zig): what Recall keys its record by.
 pub const identity = @import("identity.zig").identity;
 
@@ -93,7 +94,7 @@ const Trie = struct {
 };
 
 /// Lossy UTF-8 replacement keeps unchanged byte offsets and marks replacements that consume request bytes.
-fn validMasked(a: Allocator, text: []const u8, spans: []const Span) Allocator.Error!struct { text: []const u8, spans: []const Span } {
+pub fn validMasked(a: Allocator, text: []const u8, spans: []const Span) Allocator.Error!struct { text: []const u8, spans: []const Span } {
     if (std.unicode.utf8ValidateSlice(text)) return .{ .text = text, .spans = spans };
     var out: std.ArrayList(u8) = .empty;
     var mapped: std.ArrayList(Span) = .empty;
@@ -118,7 +119,18 @@ fn validMasked(a: Allocator, text: []const u8, spans: []const Span) Allocator.Er
     return .{ .text = out.items, .spans = mapped.items };
 }
 
-const Segment = struct { start: usize, end: usize, id: ?u32 };
+/// Request spans in order, non-empty and inside the text, as encodeMasked requires them.
+pub fn checkSpans(text: []const u8, spans: []const Span, work: ?*MaskWork) error{BadRequestSpans}!void {
+    var previous: usize = 0;
+    for (spans) |p| {
+        if (work) |w| w.spans += 1;
+        if (p[0] < previous or p[0] >= p[1] or p[1] > text.len) return error.BadRequestSpans;
+        previous = p[1];
+    }
+}
+
+/// A run of text between added tokens (id null), or one added token; offsets into the encoded text.
+pub const Segment = struct { start: usize, end: usize, id: ?u32 };
 
 pub const Tokenizer = struct {
     /// Owns the loaded tables and backs each call's scratch, so concurrent calls need it thread-safe.
@@ -190,12 +202,7 @@ pub const Tokenizer = struct {
     /// The optional work receipt counts span visits and trie transitions, independent of timing.
     pub fn encodeMaskedCounted(t: *const Tokenizer, a: Allocator, text: []const u8, spans: []const Span, work: ?*MaskWork) Error![]u32 {
         if (spans.len == 0) return t.encode(a, text);
-        var previous: usize = 0;
-        for (spans) |p| {
-            if (work) |w| w.spans += 1;
-            if (p[0] < previous or p[0] >= p[1] or p[1] > text.len) return error.BadRequestSpans;
-            previous = p[1];
-        }
+        try checkSpans(text, spans, work);
         var stack: [scratch_stack_bytes]u8 = undefined;
         var fallback = std.heap.BufferFirstAllocator.init(&stack, t.allocator);
         var arena = std.heap.ArenaAllocator.init(fallback.allocator());
@@ -203,36 +210,48 @@ pub const Tokenizer = struct {
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
         const valid = try validMasked(ctx.a, text, spans);
         var ids: std.ArrayList(u32) = .empty;
+        try t.encodeSegments(&ctx, valid.text, valid.spans, try t.splitAddedMasked(&ctx, &t.raw, valid.text, valid.spans, work), &ids, null, work);
+        return a.dupe(u32, ids.items);
+    }
+
+    /// Each segment's ids in order, its first id's index in `starts` when given; a segment's ids depend on it alone.
+    pub fn encodeSegments(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, spans: []const Span, segs: []const Segment, ids: *std.ArrayList(u32), starts: ?[]usize, work: ?*MaskWork) Error!void {
         var cursor: usize = 0;
-        for (try t.splitAddedMasked(&ctx, &t.raw, valid.text, valid.spans, work)) |seg| {
+        for (segs, 0..) |seg, n| {
+            if (starts) |s| s[n] = ids.items.len;
             if (seg.id) |id| {
                 try ids.append(ctx.a, id);
                 continue;
             }
             if (seg.start == seg.end) continue;
-            while (cursor < valid.spans.len and valid.spans[cursor][1] <= seg.start) {
+            while (cursor < spans.len and spans[cursor][1] <= seg.start) {
                 cursor += 1;
                 if (work) |w| w.spans += 1;
             }
-            const request = cursor < valid.spans.len and valid.spans[cursor][0] < seg.end;
-            const gap = valid.text[seg.start..seg.end];
+            const request = cursor < spans.len and spans[cursor][0] < seg.end;
+            const gap = text[seg.start..seg.end];
             if (!request or t.normalized.ends.items.len == 0) {
                 const from = ids.items.len;
-                try t.encodeSegment(&ctx, gap, seg.start == 0, &ids);
+                try t.encodeSegment(ctx, gap, seg.start == 0, ids);
                 if (request) try t.refuseAdded(ids.items[from..]);
             } else {
                 // A cached gap with this text may have been encoded using a different mask.
                 var clipped: std.ArrayList(Span) = .empty;
                 var j = cursor;
-                while (j < valid.spans.len and valid.spans[j][0] < seg.end) : (j += 1) {
-                    const p = valid.spans[j];
+                while (j < spans.len and spans[j][0] < seg.end) : (j += 1) {
+                    const p = spans[j];
                     try clipped.append(ctx.a, .{ @max(seg.start, p[0]) - seg.start, @min(seg.end, p[1]) - seg.start });
                     if (work) |w| w.spans += 1;
                 }
-                try t.encodeTextMasked(&ctx, gap, seg.start == 0, &ids, true, clipped.items);
+                try t.encodeTextMasked(ctx, gap, seg.start == 0, ids, true, clipped.items);
             }
         }
-        return a.dupe(u32, ids.items);
+        if (starts) |s| s[segs.len] = ids.items.len;
+    }
+
+    /// encodeMasked's split of a valid text at its template-written added tokens, the request spans masked.
+    pub fn segments(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, spans: []const Span) Error![]const Segment {
+        return t.splitAddedMasked(ctx, &t.raw, text, spans, null);
     }
 
     fn refuseAdded(t: *const Tokenizer, ids: []const u32) error{UnsafeAddedTokenMask}!void {
@@ -540,4 +559,5 @@ fn addTokens(t: *Tokenizer, keep: Allocator, scratch: Allocator, list: std.json.
 test {
     _ = @import("tokenizer_test.zig");
     _ = @import("masked_test.zig");
+    _ = @import("kept.zig");
 }

@@ -24,6 +24,8 @@ pub const Compiled = struct {
     /// Its child allocator also backs each render's scratch, so concurrent renders need it thread-safe.
     arena: std.heap.ArenaAllocator,
     tree: ast.Template,
+    /// The final generation block's index in the body, when one ends the template (generation.zig).
+    split: ?usize = null,
 
     pub fn deinit(t: *Compiled) void {
         t.arena.deinit();
@@ -99,7 +101,7 @@ pub fn compile(gpa: Allocator, source: []const u8, diag: ?*Diag) Error!Compiled 
     var bad: ?[]const u8 = null;
     checkNames(body, &bad);
     if (bad) |name| return report(gpa, diag, "template uses unsupported filter or test '{s}'", .{name});
-    return .{ .arena = arena, .tree = .{ .body = body, .frame = frame } };
+    return .{ .arena = arena, .tree = .{ .body = body, .frame = frame }, .split = @import("generation.zig").split(body) };
 }
 
 /// Renders with Hugging Face's variables: messages, tools (none when absent), documents, add_generation_prompt, then `context`.
@@ -116,24 +118,48 @@ pub fn renderProvenance(gpa: Allocator, t: *const Compiled, messages: std.json.V
 
 /// Checkpoint-owned globals are template data; request context overrides them and retains its provenance.
 pub fn renderProvenanceGlobals(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, template_globals: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error!Str {
+    var more: More = .{};
+    return renderMore(gpa, t, messages, tools, context, template_globals, add_generation_prompt, diag, &more);
+}
+
+pub const Watch = @import("watch.zig").Watch;
+
+/// A render's extras: `watch` stops it early (then `cut`); with the generation prompt on, `history` is where it starts.
+pub const More = struct {
+    watch: ?*Watch = null,
+    /// The length of the text the flag off renders, when a final generation block shows it is a prefix.
+    history: ?usize = null,
+    /// The watch stopped the render: text and spans are a prefix of the full render's.
+    cut: bool = false,
+};
+
+/// `renderProvenanceGlobals` with `more`'s extras.
+pub fn renderMore(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, template_globals: std.json.Value, add_generation_prompt: bool, diag: ?*Diag, more: *More) Error!Str {
     // not on `gpa`: an arena there, such as a server request's, would keep the freed scratch until it is reset
     var arena = std.heap.ArenaAllocator.init(t.arena.child_allocator);
     defer arena.deinit();
     const a = arena.allocator();
     var out: v.Buffer = .{};
     var vars: v.Map = .empty;
-    var c = eval.Ctx{ .rt = .{ .a = a }, .vars = &vars, .out = &out };
-    run(&c, &vars, t, messages, tools, context, template_globals, add_generation_prompt) catch |err| {
+    var c = eval.Ctx{ .rt = .{ .a = a }, .vars = &vars, .out = &out, .watch = more.watch };
+    if (more.watch) |w| w.out = &out;
+    var mark: ?usize = null;
+    more.cut = false;
+    run(&c, &vars, t, messages, tools, context, template_globals, add_generation_prompt, &mark) catch |err| {
         if (err == error.OutOfMemory) return error.OutOfMemory;
-        if (diag) |d| d.raised = c.rt.raised;
-        return report(gpa, diag, "{s}", .{c.rt.msg});
+        more.cut = if (more.watch) |w| w.stopped else false;
+        if (!more.cut) {
+            if (diag) |d| d.raised = c.rt.raised;
+            return report(gpa, diag, "{s}", .{c.rt.msg});
+        }
     };
+    more.history = if (add_generation_prompt and !more.cut) mark else null;
     const text = try gpa.dupe(u8, out.text.items);
     errdefer gpa.free(text);
     return .{ .s = text, .spans = try gpa.dupe(Span, out.spans.items) };
 }
 
-fn run(c: *eval.Ctx, vars: *v.Map, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, template_globals: std.json.Value, add_generation_prompt: bool) v.Error!void {
+fn run(c: *eval.Ctx, vars: *v.Map, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, template_globals: std.json.Value, add_generation_prompt: bool, mark: *?usize) v.Error!void {
     const a = c.rt.a;
     if (template_globals == .object) {
         var it = template_globals.object.iterator();
@@ -151,7 +177,7 @@ fn run(c: *eval.Ctx, vars: *v.Map, t: *const Compiled, messages: std.json.Value,
             try vars.put(a, key, try pyjson.fromJson(&c.rt, e.value_ptr.*));
         }
     }
-    try eval.root(c, t.tree);
+    if (t.split) |s| try eval.rootMarked(c, t.tree, s, mark) else try eval.root(c, t.tree);
 }
 
 /// One-shot compile and render, the call the engine's chat prompts make.
@@ -166,4 +192,6 @@ test {
     _ = @import("unicode.zig");
     _ = @import("value.zig");
     _ = @import("provenance_test.zig");
+    _ = @import("generation_test.zig");
+    _ = @import("access.zig");
 }

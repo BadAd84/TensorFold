@@ -209,6 +209,7 @@ pub fn build(b: *std.Build) void {
     contract_build.hostTests(b, gemma4_contract_host);
     // the CPU-only fake server and engine-less CLI (zig build server-cpu), behind zig/tests/server/build.sh
     @import("zig/build/server.zig").cpuArtefacts(b, b.graph.host, optimize, build_options);
+    @import("zig/build/server.zig").promptBench(b);
     sys_build.wire(b);
     @import("zig/build/checkpoint_config.zig").wire(b);
     @import("zig/build/save_guard.zig").wire(b);

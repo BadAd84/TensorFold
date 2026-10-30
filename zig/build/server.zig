@@ -124,3 +124,26 @@ pub fn cpuArtefacts(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     step.dependOn(&server_install.step);
     step.dependOn(&cli_install.step);
 }
+
+/// ``zig build prompt-bench``, then ``zig-out/bin/prompt_bench MODEL PROMPTS [rounds]``: request preparation per site.
+pub fn promptBench(b: *std.Build) void {
+    const host = b.graph.host;
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .ReleaseFast, .link_libc = true });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = host, .optimize = .ReleaseFast });
+    const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .ReleaseFast });
+    const server_mod = b.createModule(.{ .root_source_file = b.path("zig/src/server/root.zig"), .target = host, .optimize = .ReleaseFast, .link_libc = true, .imports = &.{
+        .{ .name = "engine_api", .module = api },
+        .{ .name = "tokenizer", .module = tokenizer },
+        .{ .name = "template", .module = template },
+    } });
+    _ = addTo(b, server_mod, host, .ReleaseFast);
+    const exe = b.addExecutable(.{ .name = "prompt_bench", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/server/prompt_bench.zig"),
+        .target = host,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "server", .module = server_mod }, .{ .name = "engine_api", .module = api } },
+    }) });
+    b.step("prompt-bench", "The server's request preparation on the parity probe's r2, ms per site (no GPU)").dependOn(&b.addInstallArtifact(exe, .{}).step);
+}

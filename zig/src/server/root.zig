@@ -15,6 +15,10 @@ pub const hub = @import("hub.zig");
 pub const tool_specs = @import("tool_specs.zig");
 pub const Server = server.Server;
 pub const Config = server.Config;
+pub const prompt = @import("prompt.zig");
+pub const chat = @import("chat.zig");
+pub const messages = @import("messages.zig");
+pub const openai = @import("openai.zig");
 
 test {
     _ = @import("auth_scope_test.zig");
@@ -195,4 +199,5 @@ test {
     _ = @import("request_provenance_test.zig");
     _ = @import("request_cost_test.zig");
     _ = @import("prompt_tool_turn_test.zig");
+    _ = @import("prompt_once_test.zig");
 }

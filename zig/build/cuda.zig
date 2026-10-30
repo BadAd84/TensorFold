@@ -413,6 +413,9 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     b.step("test-http-limits-host", "Total HTTP read deadlines and connection admission without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"HTTP limits:"} })).step);
     b.step("test-server-recovery-host", "Incomplete replies, token allocation and bounded SSE storage without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"Server recovery:"} })).step);
     b.step("test-prompt-interior-host", "Last-user metadata excludes later messages without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"interior prompt:"} })).step);
+    const once = b.step("test-prompt-once-host", "A request rendered once: kept ids, the generation split and every probe against full renders");
+    for ([_]struct { *std.Build.Module, []const u8 }{ .{ server_tests, "prompt once:" }, .{ mods.tokenizer, "kept pieces:" }, .{ template, "generation split:" } }) |t|
+        once.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = t[0], .filters = &.{t[1]} })).step);
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
     b.step("test-done-times-host", "Request-local done line times and lane admission on the CPU").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"done times:"} })).step);
     b.step("test-request-seeds-host", "Fresh and explicit request seeds and completion logs without shaders").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"request seed:"} })).step);
@@ -433,8 +436,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
         golden_build.step(b, host, server_tests, native_modules.api, mods.tokenizer, template, native_modules.engines);
         @import("cortheon_fuzz.zig").add(b, host, native_modules.api, mods.tokenizer, template);
     }
-    // the tokenizer's own tests (memo, steps, regex, unicode) run here: no other test binary reaches them
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // the tokenizer's and the chat template's own tests (memo, regex, provenance): no other test binary reaches them
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.qwen35, mods.qwen_vision, flashnextModule(b, host, .debug, cuda, mods.core, mods.lanes, mods.qwen_vision, mods.api), lfm2Module(b, host, .debug, cuda, mods.core), mods.radio, mods.heat, mods.tokenizer, template, native_modules.api, native, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const selected = b.option([]const u8, "modelopt-host-filter", "One portable ModelOpt regression") orelse "modelopt host:";
     const run = b.addRunArtifact(b.addTest(.{ .root_module = mods.nemotron, .filters = &.{selected} }));
     run.has_side_effects = true;
