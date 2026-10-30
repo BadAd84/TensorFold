@@ -26,6 +26,7 @@ const exl3 = @import("cuda_exl3.zig");
 const l2pf_mod = @import("cuda_l2pf.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
+const hc_glue = @import("cuda_forward_glue.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -50,6 +51,8 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    glue_row: u64, // TF_GLM_OVN_GLUE_ROW=N: a prompt piece's glue of N rows or more in one kernel (0: off)
+    pdl_early: u64, // TF_GLM_OVN_PDL_EARLY: 1 the decode windows' glue launches dependent-ready, 2 prompt chunks too
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -85,6 +88,8 @@ pub const Modules = struct {
         };
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.glue_row = try cuda.ovn.int("GLUE_ROW", 0);
+        m.pdl_early = try cuda.ovn.int("PDL_EARLY", 0);
         return m;
     }
 
@@ -209,7 +214,8 @@ pub const Forward = struct {
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
 
     pub fn set(f: *const Forward) glue.Set {
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
+        const pdl = f.m.pdl_early >= @as(u64, if (f.ranks[0].b.prefill) 2 else 1);
+        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .pdl_early = pdl };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.
@@ -246,11 +252,11 @@ pub const Forward = struct {
         try glue.hcPre(f.set(), f.stream, b.x, hc.fn_w, hc.base, hc.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, rows, c.hidden, c.hc);
     }
 
-    fn post(f: *const Forward, r: Rank, rows: usize) !void {
+    fn post(f: *const Forward, r: Rank, x: u64, rows: usize) !void {
         const stamp = prof_mod.span(f.prof, f.stream, .glue);
         defer stamp.end();
         const c = &r.w.config;
-        try glue.hcPost(f.set(), f.stream, r.b.x, r.b.x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, r.w.share.world);
+        try glue.hcPost(f.set(), f.stream, x, x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, r.w.share.world);
     }
 
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
@@ -359,36 +365,7 @@ pub const Forward = struct {
 
     const exchangePieces = @import("cuda_forward_pieces.zig").exchangePieces;
 
-    /// hc_post of rows lo..hi from partials `g` [world][hi - lo][D] (a gathered room or a split one's own rows).
-    fn postRows(f: *const Forward, r: Rank, lo: usize, hi: usize, g: u64) !void {
-        const c = &r.w.config;
-        const b = r.b;
-        const S: usize = c.hc;
-        const D: usize = c.hidden;
-        const x = b.x + lo * S * D * 2;
-        try glue.hcPost(f.set(), f.stream, x, x, g, b.post + lo * S * 4, b.comb + lo * S * S * 4, hi - lo, D, S, r.w.share.world);
-    }
-
-    /// forward._pre of rows lo..hi.
-    fn preRows(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, lo: usize, hi: usize) !void {
-        const c = &r.w.config;
-        const b = r.b;
-        const S: usize = c.hc;
-        const D: usize = c.hidden;
-        try glue.hcPre(f.set(), f.stream, b.x + lo * S * D * 2, hc.fn_w, hc.base, hc.scale, norm, b.normed + lo * D * 2, b.xs + lo * (D / 64) * 4, b.post + lo * S * 4, b.comb + lo * S * S * 4, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, hi - lo, D, S);
-    }
-
-    /// One piece's glue after a site: hc_post, then the next layer's hc_pre or (after the last layer) the stream mean.
-    pub fn glueRows(f: *const Forward, r: Rank, j: usize, site: Site, lo: usize, hi: usize, g: u64) !void {
-        const stamp = prof_mod.span(f.prof, f.stream, .glue);
-        defer stamp.end();
-        const c = &r.w.config;
-        const layers = r.w.layers;
-        try f.postRows(r, lo, hi, g);
-        if (site == .mixer) return f.preRows(r, layers[j].ffn_hc, layers[j].post_norm, lo, hi);
-        if (j + 1 < layers.len) return f.preRows(r, layers[j + 1].attn_hc, layers[j + 1].in_norm, lo, hi);
-        try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
-    }
+    pub const glueRows = hc_glue.glueRows;
 
     const gluePieces = @import("cuda_forward_pieces.zig").gluePieces;
     const tapPieces = @import("cuda_forward_pieces.zig").tapPieces;
@@ -449,6 +426,8 @@ pub const Forward = struct {
     /// The unpieced loop over the layers (and the stream mean): each site's partials whole, then the glue.
     fn whole(f: *const Forward, R: usize) !void {
         const c = &f.ranks[0].w.config;
+        const fuse = hc_glue.fuses(f, R); // TF_GLM_OVN_GLUE_FUSE: each hc_post with the next site's hc_pre, one kernel
+        var alt = false; // the residual in b.x_alt (each fused glue writes the other buffer)
         var li: usize = 0;
         var di: usize = 0;
         for (f.ranks[0].w.layers, 0..) |_, j| {
@@ -456,7 +435,7 @@ pub const Forward = struct {
             try f.prefetch(j, 2); // L2PF site `o`: the mixer's output projection while it runs
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
-                try f.pre(r, l.attn_hc, l.in_norm, R);
+                if (!fuse or j == 0) try f.pre(r, l.attn_hc, l.in_norm, R);
                 if (r.segs.len > 0) try shared.mixer(f, r, l, li, di, R, slot(r, R)) else try f.mixer(r, l, li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), slot(r, R));
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
@@ -466,15 +445,22 @@ pub const Forward = struct {
             prof_mod.context(f.prof, j, null, .ffn);
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
-                try f.post(r, R);
-                try f.pre(r, l.ffn_hc, l.post_norm, R);
+                if (fuse) {
+                    try hc_glue.fused(f, r, alt, l.ffn_hc, l.post_norm, R);
+                } else {
+                    try f.post(r, r.b.x, R);
+                    try f.pre(r, l.ffn_hc, l.post_norm, R);
+                }
                 try f.ffn(r, l, R, slot(r, R));
             }
+            alt = alt != fuse;
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
             try f.prefetch(j, 1); // L2PF site `f`: the next layer's mixer across the FFN's all-gather
             try f.gather(R);
-            for (f.ranks) |r| try f.post(r, R);
-            if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
+            const next = fuse and j + 1 < f.ranks[0].w.layers.len; // fused: the next layer's attention-site hc_pre too
+            for (f.ranks) |r| if (next) try hc_glue.fused(f, r, alt, r.w.layers[j + 1].attn_hc, r.w.layers[j + 1].in_norm, R) else try f.post(r, hc_glue.xAt(r, alt), R);
+            alt = alt != next;
+            if (f.taps) |t| try t.at(f.stream, j, hc_glue.xAt(f.ranks[0], alt), 0, R);
             if (f.prof) |p| p.mark(f.stream, .gather_b);
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,
@@ -482,7 +468,7 @@ pub const Forward = struct {
             }
         }
         if (f.l2pf) |p| try p.join(f.stream); // the side stream's forks rejoin before the window ends
-        for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+        for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, hc_glue.xAt(r, alt), r.b.hidden, R, c.hidden, c.hc);
     }
 
     /// TF_GLM_L2PF site `which` of layer `j` (a decode window's weight prefetch; off for prompt chunks).

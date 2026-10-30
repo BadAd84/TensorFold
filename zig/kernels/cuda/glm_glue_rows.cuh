@@ -1,6 +1,7 @@
 // GLM's element-wise glue by hand: each output value alone, in the Triton kernel's order of fp32 ops.
 #pragma once
 
+#include "glm_qmm_frag.cuh"
 #include "glm_triton.cuh"
 
 namespace glm_glue {
@@ -36,6 +37,34 @@ __device__ __forceinline__ void ranks8(const float* g, int64_t rs, int64_t i, in
     float b[8];
     ld8(g + k * rs + i, b);
     for (int j = 0; j < 8; ++j) a[j] = a[j] + b[j];
+  }
+}
+
+// glue._hc_post's stream s of row r at 8 columns, before the bf16 store: post[s] branch + sum_t comb[t][s] x[t].
+__device__ __forceinline__ void post_s(const float xv[4][8], const float branch[8], const float* comb,
+                                       const float* post, int64_t r, int s, float o[8]) {
+  const float* cm = comb + r * 16 + s;
+  const float c0 = cm[0], c1 = cm[4], c2 = cm[8], c3 = cm[12], p = post[r * 4 + s];
+  for (int j = 0; j < 8; ++j) {
+    float m = __fmul_rn(xv[1][j], c1);
+    m = __fmaf_rn(xv[0][j], c0, m);
+    m = __fmaf_rn(xv[2][j], c2, m);
+    m = __fmaf_rn(xv[3][j], c3, m);
+    o[j] = __fmaf_rn(rbf(branch[j]), p, m);
+  }
+}
+
+// glue._hc_post of row r's 8 columns at c, every stream; x may be xout (a thread reads its 4 x 8 values first).
+__device__ __forceinline__ void hc_post8(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g, const float* post,
+                                         const float* comb, int64_t rs, int64_t d, int world, int64_t r, int64_t c) {
+  float branch[8];
+  ranks8(g, rs, r * d + c, world, branch);
+  float xv[4][8];
+  for (int t = 0; t < 4; ++t) ld8(x + r * 4 * d + t * d + c, xv[t]);
+  for (int s = 0; s < 4; ++s) {
+    float o[8];
+    post_s(xv, branch, comb, post, r, s, o);
+    st8(xout + r * 4 * d + s * d + c, o);
   }
 }
 
@@ -93,24 +122,16 @@ extern "C" __global__ void tf_glm_hc_post(const __nv_bfloat16* x, __nv_bfloat16*
                                           const float* post, const float* comb, int64_t rs, int64_t d, int world) {
   const int64_t c = glm_glue::col8();
   if (c >= d) return;
-  const int64_t r = blockIdx.x;
-  float branch[8];
-  glm_glue::ranks8(g, rs, r * d + c, world, branch);
-  float xv[4][8];
-  for (int t = 0; t < 4; ++t) glm_glue::ld8(x + r * 4 * d + t * d + c, xv[t]);
-  for (int s = 0; s < 4; ++s) {
-    const float* cm = comb + r * 16 + s;
-    const float c0 = cm[0], c1 = cm[4], c2 = cm[8], c3 = cm[12], p = post[r * 4 + s];
-    float o[8];
-    for (int j = 0; j < 8; ++j) {
-      float m = __fmul_rn(xv[1][j], c1);
-      m = __fmaf_rn(xv[0][j], c0, m);
-      m = __fmaf_rn(xv[2][j], c2, m);
-      m = __fmaf_rn(xv[3][j], c3, m);
-      o[j] = __fmaf_rn(rbf(branch[j]), p, m);
-    }
-    glm_glue::st8(xout + r * 4 * d + s * d + c, o);
-  }
+  glm_glue::hc_post8(x, xout, g, post, comb, rs, d, world, blockIdx.x, c);
+}
+
+// TF_GLM_OVN_PDL_EARLY: hc_post releasing its dependent launch (hc_partial8_pdl's weight loads) at entry.
+extern "C" __global__ void tf_glm_hc_post_pdl(const __nv_bfloat16* x, __nv_bfloat16* xout, const float* g,
+                                              const float* post, const float* comb, int64_t rs, int64_t d, int world) {
+  qmm_frag::grid_launch();
+  const int64_t c = glm_glue::col8();
+  if (c >= d) return;
+  glm_glue::hc_post8(x, xout, g, post, comb, rs, d, world, blockIdx.x, c);
 }
 
 // glue._combine: fp32 sum over slots in order of y[r][k] wts[r][k] (fma from 0), y fp32 or bf16, 8 columns a thread.

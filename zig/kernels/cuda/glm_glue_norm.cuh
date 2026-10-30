@@ -1,6 +1,7 @@
 // glue._rmsnorm by hand (glm_glue.cu's first group): see glm_triton.cuh for the Triton ops it keeps.
 #pragma once
 
+#include "glm_qmm_frag.cuh"
 #include "glm_triton.cuh"
 
 namespace glm_glue {
@@ -152,3 +153,17 @@ extern "C" __global__ void __launch_bounds__(256)
                              int64_t o_stride, float* xs, float eps, int sums) {
   glm_glue::rmsnorm<4096, 4096, 8, 8, float>(x, x_stride, w, out, o_stride, xs, eps, sums);
 }
+
+// TF_GLM_OVN_PDL_EARLY: the norms above, releasing their dependent launch (a matmul's weight loads) at entry.
+#define RMSNORM_PDL(name, D, BLOCK, NW, S, W)                                                                      \
+  extern "C" __global__ void __launch_bounds__(NW * 32)                                                            \
+      name(const __nv_bfloat16* x, int64_t x_stride, const W* w, __nv_bfloat16* out, int64_t o_stride, float* xs, \
+           float eps, int sums) {                                                                                  \
+    qmm_frag::grid_launch();                                                                                       \
+    glm_glue::rmsnorm<D, BLOCK, NW, S, W>(x, x_stride, w, out, o_stride, xs, eps, sums);                          \
+  }
+RMSNORM_PDL(tf_glm_rmsnorm_4096_pdl, 4096, 4096, 8, 8, __nv_bfloat16)
+RMSNORM_PDL(tf_glm_rmsnorm_1536_pdl, 1536, 2048, 4, 8, __nv_bfloat16)
+RMSNORM_PDL(tf_glm_rmsnorm_512_pdl, 512, 512, 4, 4, __nv_bfloat16)
+RMSNORM_PDL(tf_glm_rmsnorm_4096_f32w_pdl, 4096, 4096, 8, 8, float)
+#undef RMSNORM_PDL
