@@ -111,3 +111,54 @@ extern "C" __global__ void __launch_bounds__(32)
     wts[r * (top_k + 1) + lane] = 1.0f;
   }
 }
+
+// tf_glm_topk on the router's K slices part[s][r][e], added in tf_glm_slice_sum's order: the same logits and bits.
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_topk_sum(const float* part, int64_t total, int ks, const float* bias, int* pick, float* wts, float scale,
+                    int ne, int top_k, int norm) {
+  constexpr int MAXE = 16;  // 512 experts a row
+  const int64_t r = blockIdx.x;
+  const int lane = threadIdx.x;
+  float score[MAXE], choice[MAXE];
+  for (int i = 0; i < MAXE; ++i) {
+    const int e = i * 32 + lane;
+    float logit = 0.0f;
+    if (e < ne) {
+      logit = part[r * ne + e];
+      for (int s = 1; s < ks; ++s) logit = logit + part[s * total + r * ne + e];
+    }
+    score[i] = e < ne ? div_full(1.0f, exp_approx(0.0f - logit) + 1.0f) : 0.0f;
+    choice[i] = e < ne ? score[i] + bias[e] : -INFINITY;
+  }
+  float total_w = 0.0f, mine = 0.0f;
+  int mine_id = 0;
+  for (int k = 0; k < top_k; ++k) {
+    float mx = choice[0];
+    for (int i = 1; i < MAXE; ++i) mx = fmaxf(mx, choice[i]);
+    for (int o = 16; o > 0; o >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    int id = 1 << 30;
+    for (int i = MAXE - 1; i >= 0; --i)
+      if (choice[i] == mx) id = i * 32 + lane;
+    for (int o = 16; o > 0; o >>= 1) id = min(id, __shfl_xor_sync(0xffffffffu, id, o));
+    float sk = 0.0f;
+    for (int i = 0; i < MAXE; ++i)
+      if (i * 32 + lane == id) {
+        sk = score[i];
+        choice[i] = -INFINITY;
+      }
+    sk = __shfl_sync(0xffffffffu, sk, id & 31);
+    total_w = total_w + sk;
+    if (lane == k) {
+      mine = sk;
+      mine_id = id;
+    }
+  }
+  if (lane < top_k) {
+    const float v = norm ? div_full(mine, total_w + 1e-20f) : mine;
+    pick[r * (top_k + 1) + lane] = mine_id;
+    wts[r * (top_k + 1) + lane] = __fmul_rn(v, scale);
+  } else if (lane == top_k) {
+    pick[r * (top_k + 1) + lane] = ne;
+    wts[r * (top_k + 1) + lane] = 1.0f;
+  }
+}

@@ -22,6 +22,7 @@ pub const Kernels = struct {
     rank_sum: cuda.Function,
     hc_post: cuda.Function,
     combine: cuda.Function,
+    combine_sy: cuda.Function,
     slice_sum: cuda.Function,
     top1: cuda.Function,
     put_words: cuda.Function,
@@ -31,6 +32,7 @@ pub const Kernels = struct {
     swiglu_64: cuda.Function,
     group_sums: cuda.Function,
     topk: cuda.Function,
+    topk_sum: cuda.Function,
     router_part: cuda.Function,
     router_tile: cuda.Function,
     hc_partial: cuda.Function,
@@ -163,6 +165,12 @@ pub const router_ks = 8;
 
 /// glue.router: out [m][ne] fp32 = x . w rows; d a multiple of router_ks x 64: K slices in `part`, added in order.
 pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, d: usize, ne: usize) !void {
+    try routerSlices(set, stream, x, x_stride, w, part, m, d, ne);
+    try sliceSum(set, stream, part, out, m * ne, router_ks, true);
+}
+
+/// glue._router_part alone: the router's K slices into `part` [router_ks][m][ne] fp32, not yet added.
+pub fn routerSlices(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, part: u64, m: usize, d: usize, ne: usize) !void {
     if (d % (router_ks * 64) != 0) return error.RouterWidth; // the Python family's single-pass _router: no GLM width
     var a: cuda.Args = .{};
     inline for (.{ x, w, part, i64of(m), i64of(x_stride), i64of(d), i64of(ne), @as(c_int, router_ks) }) |v| a.add(v);
@@ -170,7 +178,6 @@ pub fn router(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, ou
         try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a)
     else
         try cuda.launch.launch(set.glue.router_part, .{ .grid = .{ .x = cdiv(m, 16), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
-    try sliceSum(set, stream, part, out, m * ne, router_ks, true);
 }
 
 /// glue.select: top_k by sigmoid + bias (lower id on ties), normed if `norm`, times `scale`, then the shared expert.
@@ -181,11 +188,26 @@ pub fn select(set: Set, stream: cuda.Stream, logits: u64, bias: u64, pick: u64, 
     try cuda.launch.launch(set.glue.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
 }
 
+/// select on routerSlices' `part`: topk adds the K slices in sliceSum's order itself (the same logits).
+pub fn selectSum(set: Set, stream: cuda.Stream, part: u64, bias: u64, pick: u64, wts: u64, rows: usize, top_k: usize, experts: usize, scale: f32, norm: bool) !void {
+    if (experts > 512 or top_k >= 32) return error.TopkTooWide;
+    var a: cuda.Args = .{};
+    inline for (.{ part, i64of(rows * experts), @as(c_int, router_ks), bias, pick, wts, scale, cint(experts), cint(top_k), @as(c_int, @intFromBool(norm)) }) |v| a.add(v);
+    try cuda.launch.launch(set.glue.topk_sum, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
+}
+
 /// glue.combine: out [rows][d] fp32 = sum over slots in order of wts[r][k] y[r][k] (y fp32 in decode, bf16 in prefill).
 pub fn combine(set: Set, stream: cuda.Stream, y: u64, y_f32: bool, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
     var a: cuda.Args = .{};
     inline for (.{ y, @as(c_int, @intFromBool(y_f32)), wts, out, i64of(d), cint(slots) }) |v| a.add(v);
     try rows8Launch(set.glue.combine, stream, &a, rows, d, .{ y, out });
+}
+
+/// glue.combine_shared: combine with the last slot read in place from `sy` [rows][d] fp32 (rounded for bf16 slots).
+pub fn combineSy(set: Set, stream: cuda.Stream, y: u64, y_f32: bool, sy: u64, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
+    var a: cuda.Args = .{};
+    inline for (.{ y, @as(c_int, @intFromBool(y_f32)), sy, wts, out, i64of(d), cint(slots) }) |v| a.add(v);
+    try rows8Launch(set.glue.combine_sy, stream, &a, rows, d, .{ y, sy, out });
 }
 
 /// K blocks of the hyper-connection mixing dots (glue.HC_BLOCKS): fixed by the shape, like the router's slices.

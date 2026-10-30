@@ -26,6 +26,7 @@ const exl3 = @import("cuda_exl3.zig");
 const l2pf_mod = @import("cuda_l2pf.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
+const moe_side = @import("cuda_moe_side.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -50,6 +51,8 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    side: ?moe_side.Side, // TF_GLM_OVN_SHARED_SIDE: the stream a decode window's shared experts fork onto
+    moe_ovn: moe.Ovn, // TF_GLM_OVN_COMBINE_SY, _TOPK_SUM: the MoE block's knobs, read once here
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -83,6 +86,8 @@ pub const Modules = struct {
             std.log.warn("TF_GLM_INDEX_CUDA: the indexer kernels are not used ({t}); prompt chunks use tf_glm_scores", .{err});
             break :blk null;
         };
+        m.side = try moe_side.Side.init(d); // last: nothing after it fails
+        m.moe_ovn = moe.Ovn.read();
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
         return m;
@@ -98,6 +103,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.side) |*x| x.deinit();
         if (m.index) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
@@ -207,6 +213,7 @@ pub const Forward = struct {
     l2pf: ?*l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch beside the stream
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
+    side: ?*const moe_side.Side = null, // TF_GLM_OVN_SHARED_SIDE: this window's shared experts beside its routed ones
 
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
@@ -304,6 +311,7 @@ pub const Forward = struct {
                 if (out) |o| try mlp.fill(f.mlpKernels(), f.stream, m, b.dense, 0, rows, b.prefill, o);
             },
             .moe => |m| {
+                if (f.side) |sd| if (out) |o| return moe_side.block(f.moeKernels(), f.stream, sd, m, b.moe, b.normed, c.hidden, rows, o);
                 try moe.body(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, rows, b.prefill);
                 if (out) |o| try moe.fill(f.moeKernels(), f.stream, m, b.moe, b.normed, c.hidden, 0, rows, b.prefill, o);
             },
@@ -315,7 +323,7 @@ pub const Forward = struct {
     }
 
     fn moeKernels(f: *const Forward) moe.Kernels {
-        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof };
+        return .{ .set = f.set(), .experts = &f.m.experts, .exl3 = &f.m.exl3, .put_slot = f.m.put_slot, .prof = f.prof, .ovn = f.m.moe_ovn };
     }
 
     pub const Site = enum { mixer, ffn };

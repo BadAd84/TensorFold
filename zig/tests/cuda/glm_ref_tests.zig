@@ -206,5 +206,6 @@ pub fn run(gpu: Gpu) !void {
     try @import("glm_ref_index.zig").selection(&r, set, ops);
     try @import("glm_ref_index.zig").selectionWide(&r, set);
     try @import("glm_ref_hc.zig").gammas(&r, set); // last: its draws from r.rng follow every check above
+    try @import("glm_ref_moe_ovn.zig").run(&r, set, ops); // after gammas: the draws above keep their order
     check.pass("glm-ref: every projection within {e:.3} of its float64 tolerance", .{r.worst});
 }

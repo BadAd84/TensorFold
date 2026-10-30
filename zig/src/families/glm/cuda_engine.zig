@@ -290,7 +290,7 @@ pub const Engine = struct {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
         const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .split_min = e.settings.split_min, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .split_min = e.settings.split_min, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = @import("cuda_moe_side.zig").pick(e, b) };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -554,7 +554,7 @@ pub const Engine = struct {
             rows += p.ids.len;
         }
         var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = b, .segs = segs[0..parts.len] }};
-        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .taps = if (e.drafter) |dr| dr.taps(false) else null };
+        const f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = null, .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .taps = if (e.drafter) |dr| dr.taps(false) else null, .side = @import("cuda_moe_side.zig").pick(e, b) };
         try f.run(@ptrCast(ids[0..rows]));
         if (e.drafter) |dr| for (parts, segs[0..parts.len], 0..) |p, g, i| try dr.noteVerify(p.slot, g.row0, g.rows, g.st.pos, i == 0);
         for (parts, segs[0..parts.len]) |p, g| {
