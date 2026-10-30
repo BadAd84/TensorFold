@@ -3,9 +3,9 @@ const std = @import("std");
 const platform = @import("sys");
 const pc = @import("prompt_cache.zig");
 const modes = @import("cache_modes.zig");
-const image = @import("rows_image.zig");
+const image = @import("lanes").rows_image;
 const chain = @import("rows_chain.zig");
-const file = @import("rows_file.zig");
+const file = @import("lanes").rows_file;
 const rows_store = @import("rows_store.zig");
 const write = @import("rows_write.zig");
 const select = @import("rows_select.zig");
@@ -43,8 +43,9 @@ fn whole(text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, t, 10) catch null;
 }
 
-/// One file a state's read takes: name, kind, position, payload, its image ranges and its place in a read's buffer.
-pub const Piece = struct { name: Name, kind: file.Kind, at: u32, len: u64, first: usize, end: usize, off: u64 };
+/// One file a state's read takes: name, kind, position, payload, its image ranges and its place in a read's buffer;
+/// a block's group and index (TF_GLM_OVN_DISK_LOCAL: each other rank lays out its own part of the block from them).
+pub const Piece = struct { name: Name, kind: file.Kind, at: u32, len: u64, first: usize, end: usize, off: u64, window: u32 = 0, k: u32 = 0 };
 
 /// Every file a disk state's read takes, in the order `read` scatters them, with their ranges of its image.
 pub const Plan = struct {
@@ -67,7 +68,7 @@ pub const Plan = struct {
         for (wants.items) |w| {
             const first = ranges.items.len;
             try image.blockRanges(parts, r.keying.block, w.window, w.k, &ranges, a);
-            try add(&pieces, a, .{ .name = w.name, .kind = .block, .at = 0, .len = image.total(ranges.items[first..]), .first = first, .end = ranges.items.len, .off = off }, &off);
+            try add(&pieces, a, .{ .name = w.name, .kind = .block, .at = 0, .len = image.total(ranges.items[first..]), .first = first, .end = ranges.items.len, .off = off, .window = w.window, .k = w.k }, &off);
         }
         const first = ranges.items.len;
         try image.ownRanges(parts, s.at, r.keying.block, &ranges, a);
@@ -153,6 +154,7 @@ pub const Prefetch = struct {
     notify: ?Notify = null,
     reader: *const fn (f: *Prefetch, rd: *Read) anyerror!void = readFiles, // a test's slow or failing reader
     counts: Counts = .{},
+    threads: u32 = 1, // TF_GLM_OVN_DISK_READERS: a read's files on this many threads (1: one after another)
 
     /// Whether reads may start (reads above 0).
     pub fn on(f: *const Prefetch) bool {
@@ -375,7 +377,7 @@ pub fn make(r: *Rows, _: std.Io, limits: Limits) !*Prefetch {
     const a = write.io.allocator;
     const f = try a.create(Prefetch);
     errdefer a.destroy(f);
-    f.* = .{ .gpa = a, .io = undefined, .limits = limits, .dir = try a.dupeSentinel(u8, r.dir, 0), .block = r.keying.block };
+    f.* = .{ .gpa = a, .io = undefined, .limits = limits, .dir = try a.dupeSentinel(u8, r.dir, 0), .block = r.keying.block, .threads = r.readers };
     f.io = f.owned_io.io();
     r.fetch = f;
     return f;
@@ -411,17 +413,41 @@ pub fn choose(s: *pc.Store, prompt: []const u32, starts: []const u32, spans: []c
 
 /// Every file of `rd`, checked as a synchronous read checks it, its payload into the buffer (the I/O thread).
 pub fn readFiles(f: *Prefetch, rd: *Read) anyerror!void {
+    if (f.threads > 1) return readEach(f, rd);
     for (rd.plan.pieces) |p| {
         if (rd.cancel.load(.acquire)) return error.Cancelled;
-        var buf: [1200]u8 = undefined;
-        const path = try file.path(&buf, f.dir, &chain.hex(p.name), ext(p.kind), false);
-        var o = try file.open(path, p.kind, p.name);
-        defer o.close();
-        if (o.trailer.payload != p.len or o.trailer.block != f.block or o.trailer.at != p.at) return error.RowsRead;
-        const span = std.mem.alignForward(u64, p.len, file.alignment);
-        _ = try file.payload(&o, @alignCast(rd.buf[@intCast(p.off)..][0..@intCast(span)]));
-        rd.disk += o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer);
+        rd.disk += try readPiece(f, rd, p);
     }
+}
+
+/// One file of `rd` checked into its place in the buffer; its bytes on disk.
+fn readPiece(f: *const Prefetch, rd: *Read, p: Piece) !u64 {
+    var buf: [1200]u8 = undefined;
+    const path = try file.path(&buf, f.dir, &chain.hex(p.name), ext(p.kind), false);
+    var o = try file.open(path, p.kind, p.name);
+    defer o.close();
+    if (o.trailer.payload != p.len or o.trailer.block != f.block or o.trailer.at != p.at) return error.RowsRead;
+    const span = std.mem.alignForward(u64, p.len, file.alignment);
+    _ = try file.payload(&o, @alignCast(rd.buf[@intCast(p.off)..][0..@intCast(span)]));
+    return o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer);
+}
+
+/// TF_GLM_OVN_DISK_READERS: `rd`'s files on `f.threads` threads at once, each into its own place in the buffer.
+fn readEach(f: *Prefetch, rd: *Read) !void {
+    const disk = try f.gpa.alloc(u64, rd.plan.pieces.len);
+    defer f.gpa.free(disk);
+    @memset(disk, 0);
+    const Each = struct {
+        f: *const Prefetch,
+        rd: *Read,
+        disk: []u64,
+        fn one(x: @This(), i: usize) anyerror!void {
+            if (x.rd.cancel.load(.acquire)) return error.Cancelled;
+            x.disk[i] = try readPiece(x.f, x.rd, x.rd.plan.pieces[i]);
+        }
+    };
+    try @import("lanes").disk_readers.each(f.threads, rd.plan.pieces.len, Each{ .f = f, .rd = rd, .disk = disk }, Each.one);
+    for (disk) |d| rd.disk += d;
 }
 
 test {

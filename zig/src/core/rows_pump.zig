@@ -2,7 +2,7 @@
 const std = @import("std");
 const platform = @import("sys");
 const pc = @import("prompt_cache.zig");
-const image = @import("rows_image.zig");
+const image = @import("lanes").rows_image;
 const io = @import("rows_io.zig");
 const sync = @import("rows_write_sync.zig");
 const Rows = @import("rows_store.zig").Rows;
@@ -142,6 +142,7 @@ fn piece(r: *Rows, g: *io.Ring, p: *Pump) !bool {
         f.payload = s[0..bytes];
         f.ring = true;
         try r.img.gather(r.family.ptr, p.entry.saved, ranges.items, f.payload);
+        if (r.mirror) |m| try m.file(m.ctx, p.entry.saved, j.at, .{ .name = f.trailer.name, .kind = .block, .window = b.window, .k = b.k });
         p.next += 1;
         j.staged_files.store(p.next, .release);
         return true;
@@ -161,6 +162,8 @@ fn piece(r: *Rows, g: *io.Ring, p: *Pump) !bool {
     if (n > 0) try r.img.gather(r.family.ptr, p.entry.saved, ranges.items, f.payload[@intCast(p.own_done)..][0..@intCast(n)]);
     p.own_done += n;
     if (p.own_i == p.own.len) {
+        // TF_GLM_OVN_DISK_LOCAL: every other rank stages its own part of the state's file once rank 0's is whole
+        if (r.mirror) |m| try m.file(m.ctx, p.entry.saved, j.at, .{ .name = j.name, .kind = .state });
         p.next += 1;
         j.staged_files.store(p.next, .release);
     }

@@ -6,7 +6,8 @@ const page = @import("cuda_snapshot_pages.zig").page;
 const Engine = @import("cuda_engine.zig").Engine;
 
 /// A disk step's op (Header.flags); its id is `a`, its image offset `seed`, its bytes `depth`, its rank `top_k`.
-pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, bcast };
+/// The `local_` ops are TF_GLM_OVN_DISK_LOCAL's (cuda_disk_local): each rank's part on its own disk.
+pub const Op = enum(u32) { blank = 1, put, take, seal, prefixes, bcast, local_open, local_file, local_unlink, local_other, local_have, local_sweep, local_read, local_status, local_verify };
 const kind = @backingInt(follow.Kind.disk); // each op crosses the follow link as a disk step, its bytes as the ids
 
 /// This rank's image shape (every sequence of the engine has the same; TF_GLM_OVN_DROP_MTP's hold no head caches).
@@ -32,7 +33,7 @@ pub fn copy(e: *Engine, id: u64, off: u64, host: []u8, out: bool) !void {
 }
 
 /// `id`'s image on this rank for bytes up to `end` (unsealed: before its head only); `segs` and `w` hold its parts.
-fn copier(e: *Engine, id: u64, end: u64, segs: *std.ArrayList(image.Seg), w: *[6]u64) !image.Copy {
+pub fn copier(e: *Engine, id: u64, end: u64, segs: *std.ArrayList(image.Seg), w: *[6]u64) !image.Copy {
     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
     const sh = try shape(e);
     const at: u32 = @intCast(s.pos);
@@ -44,7 +45,7 @@ fn copier(e: *Engine, id: u64, end: u64, segs: *std.ArrayList(image.Seg), w: *[6
 }
 
 /// Rank 0's link at TP, else null (one rank: every op is local).
-fn leader(e: *Engine) ?follow.Leader {
+pub fn leader(e: *Engine) ?follow.Leader {
     const l = e.link orelse return null;
     return .{ .e = e, .link = @ptrCast(@alignCast(l)) };
 }
@@ -208,7 +209,7 @@ fn gather(l: *follow.Link, e: *const Engine, mine: u64, out: []u64) !void {
 
 /// A rank other than 0: rank 0's disk step on this rank's copy of its state.
 pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !void {
-    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.bcast)) return error.BadStep;
+    if (h.flags < @backingInt(Op.blank) or h.flags > @backingInt(Op.local_verify)) return error.BadStep;
     const op: Op = @fromBackingInt(h.flags);
     const rank: u32 = @intCast(e.share.rank);
     switch (op) {
@@ -239,5 +240,6 @@ pub fn step(e: *Engine, l: *follow.Link, h: follow.Header, ids: []const u32) !vo
             try gather(l, e, (try shape(e)).prefix, out[0..e.share.world]);
         },
         .bcast => try runs(l, e, h.a, ids),
+        else => try @import("cuda_disk_local.zig").step(e, l, h, ids, op),
     }
 }

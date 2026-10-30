@@ -2,12 +2,13 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 const store = @import("rows_store.zig");
-const image = @import("rows_image.zig");
-const file = @import("rows_file.zig");
+const image = @import("lanes").rows_image;
+const file = @import("lanes").rows_file;
 const chain = @import("rows_chain.zig");
 const sync = @import("rows_write_sync.zig");
 pub const io = @import("rows_io.zig");
 const pump = @import("rows_pump.zig");
+const local = @import("rows_local.zig");
 const Rows = store.Rows;
 pub const Want = sync.Want;
 pub const Queued = sync.Queued;
@@ -177,6 +178,7 @@ pub fn reap(r: *Rows) void {
         if (err) |e| {
             failed(r, j, e);
             r.admission.finish(r.dir, j.bytes, e == error.Cancelled);
+            local.forget(r, j);
             r.collect();
             continue;
         }
@@ -184,6 +186,7 @@ pub fn reap(r: *Rows) void {
             failed(r, j, e);
             // The job that owed the block already backed admission off.
             r.admission.finish(r.dir, j.bytes, e == error.MissingBlock);
+            local.forget(r, j);
             r.collect();
             continue;
         };
@@ -331,6 +334,10 @@ fn stageJob(r: *Rows, prepared: *const Job, may_wait: bool) !void {
         x.job = j;
         r.pump = x;
     }
+    if (p == null) if (r.mirror) |m| { // TF_GLM_OVN_DISK_LOCAL: every other rank stages its own part of each file
+        for (prepared.wants) |want| if (lacks(r, &promised, want)) try m.file(m.ctx, e.saved, e.at, .{ .name = want.name, .kind = .block, .window = want.window, .k = want.k });
+        try m.file(m.ctx, e.saved, e.at, .{ .name = prepared.name, .kind = .state });
+    };
     w.submit(j);
     if (p != null) _ = pump.step(r);
 }

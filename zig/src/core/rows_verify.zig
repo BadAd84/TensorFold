@@ -1,7 +1,7 @@
 //! TF_IMPRINT_VERIFY=1: a state just written is read back from disk and its image compared, piece by piece, with RAM's.
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
-const image = @import("rows_image.zig");
+const image = @import("lanes").rows_image;
 const read = @import("rows_read.zig");
 const Rows = @import("rows_store.zig").Rows;
 
@@ -43,4 +43,6 @@ fn compare(r: *Rows, i: usize, saved: pc.Saved) !void {
             done += n;
         }
     }
+    // TF_GLM_OVN_DISK_LOCAL: every other rank's own part, read from its own disk, checked the same way on that rank
+    if (r.mirror) |m| if (m.verify) |v| if (!try v(m.ctx, saved, back, at)) return error.ImageDiffers;
 }
