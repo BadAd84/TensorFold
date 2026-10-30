@@ -159,11 +159,11 @@ pub fn autoRows(rows: u32, streams: u32) u32 {
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
 pub const max_world = 16;
 
-/// TF_GLM_OVN_ROCE_RAILS (bit 0), LINK1 (1), LINK_ROCE (2) and ROCE_RAILS_KB (from bit 8): the shapes ranks exchange.
+/// TF_GLM_OVN_ROCE_RAILS (bit 0), LINK1 (1), LINK_ROCE (2), PRX (3, a collective setup), ROCE_RAILS_KB (bit 8 up).
 pub fn ovnComms() !u32 {
     const rails = try cuda.roce_rails.wanted();
     const kb: u32 = if (rails) try cuda.roce_rails.stripeMinKb() else 0;
-    return @as(u32, @intFromBool(rails)) | @as(u32, @intFromBool(cuda.ovn.on("LINK1"))) << 1 | @as(u32, @intFromBool(cuda.ovn.on("LINK_ROCE"))) << 2 | kb << 8;
+    return @as(u32, @intFromBool(rails)) | @as(u32, @intFromBool(cuda.ovn.on("LINK1"))) << 1 | @as(u32, @intFromBool(cuda.ovn.on("LINK_ROCE"))) << 2 | @as(u32, @intFromBool(cuda.ovn.on("PRX"))) << 3 | kb << 8;
 }
 
 /// The process environment's value of `name` (null when unset).
@@ -412,7 +412,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
-        .ovn_comms => "TF_GLM_OVN_ROCE_RAILS, TF_GLM_OVN_ROCE_RAILS_KB, TF_GLM_OVN_LINK1 or TF_GLM_OVN_LINK_ROCE",
+        .ovn_comms => "TF_GLM_OVN_ROCE_RAILS, TF_GLM_OVN_ROCE_RAILS_KB, TF_GLM_OVN_LINK1, TF_GLM_OVN_LINK_ROCE or TF_GLM_OVN_PRX",
         .moe_owners => "TF_GLM_OVN_EXPERT_ROTATE (each MoE layer's expert share owners)",
         .shared_rows => "TF_GLM_OVN_SHARED_ROWS (or auto's --parallel)",
         .capacity => "the sequence capacity (the context)",

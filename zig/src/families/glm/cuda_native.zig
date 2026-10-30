@@ -296,6 +296,9 @@ fn finishRank(a: OpenArgs) !Loaded {
     }
     try own.group.openRoce(gpa, io, ctx.d, own.e.stream, roce_bytes); // both ranks bring it up or neither does
     errdefer if (own.group.fast) |f| f.deinit();
+    // TF_GLM_OVN_PRX (cuda_ranks agreed it): its pinned region before the rooms are measured, so they count it
+    if (cuda.ovn.on("PRX")) try own.group.openPrx(gpa, io, ctx.d, own.e.stream);
+    errdefer if (own.group.prx) |c| c.deinit();
     own.e.group = &own.group;
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
