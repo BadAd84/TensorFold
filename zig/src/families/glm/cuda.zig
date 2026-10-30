@@ -100,6 +100,7 @@ test {
     _ = @import("cuda_cost_time.zig");
     _ = @import("cuda_prompt_pieces.zig");
     _ = @import("cuda_lanes_fill.zig");
+    _ = @import("cuda_prompt_slices.zig");
     _ = @import("heat"); // upstream's heat bands, run where the GLM ranks use them
     _ = @import("dflash_ovn.zig");
 }

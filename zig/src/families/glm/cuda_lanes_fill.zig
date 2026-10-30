@@ -1,13 +1,64 @@
-//! TF_GLM_OVN_MULTI_FILL: prefill_many over fresh, marked and resumed prompts. Each pass takes every unfinished
-//! prompt's next piece (from where it stands to its next mark or its end), shortest first, up to a chunk's rows,
-//! until every prompt's first token is drawn: Leader.chunk's cuts, several streams a pass.
+//! The lane backend's fills past one chunk a call. TF_GLM_OVN_MULTI_FILL: prefill_many over fresh, marked and resumed
+//! prompts; each pass takes every unfinished prompt's next piece (from where it stands to its next mark or its end),
+//! shortest first, up to a chunk's rows, until every prompt's first token is drawn: Leader.chunk's cuts, several
+//! streams a pass. TF_GLM_OVN_FILL_SLICE_MS: a chunk part-way through its layers (`onward`, `settle`).
 const std = @import("std");
 const lanes = @import("lanes");
 const engine = @import("cuda_engine.zig");
 const pieces_mod = @import("cuda_prompt_pieces.zig");
-const Lanes = @import("cuda_lanes.zig").Lanes;
+const prompt_slices = @import("cuda_prompt_slices.zig");
+const cuda_lanes = @import("cuda_lanes.zig");
+const Lanes = cuda_lanes.Lanes;
+const Lane = cuda_lanes.Lane;
 
 const max = engine.max_together;
+
+/// TF_GLM_OVN_FILL_SLICE_MS: the stream's chunk part-way through its layers runs its next slice (every layer left
+/// once no other stream decodes); true once its prompt pass has its first token, also one `settle` drew.
+pub fn onward(self: *Lanes, s: *lanes.Stream, l: *Lane) !bool {
+    if (l.settled) {
+        l.settled = false;
+        s.slice_pending = false;
+        return true;
+    }
+    errdefer {
+        l.slicing = false;
+        l.fill = null;
+        s.slice_pending = false;
+    }
+    try self.x.bind(l.slot);
+    const step = try self.x.slicePart(self.othersDecode(s));
+    s.slice_pending = step.sliced;
+    if (step.sliced) return false;
+    l.slicing = false;
+    if (step.first) |first| {
+        l.first = self.take(first);
+        l.fill = null;
+        return true;
+    }
+    l.fill = l.fill.? + step.rows;
+    if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
+    return false;
+}
+
+/// Before any other prompt work (it overwrites the prompt buffers): a chunk part-way through its layers runs all the
+/// rest now; its stream's next prefill step then reports what it drew (`onward`) or goes on from the next chunk.
+pub fn settle(self: *Lanes) !void {
+    if (!prompt_slices.pending(self.x.e)) return;
+    var it = self.lanes.valueIterator();
+    while (it.next()) |l| if (l.slicing) {
+        try self.x.bind(l.slot);
+        const step = try self.x.slicePart(false);
+        l.slicing = false;
+        if (step.first) |first| {
+            l.first = self.take(first);
+            l.fill = null;
+            l.settled = true;
+        } else l.fill = l.fill.? + step.rows;
+        return;
+    };
+    return error.ChunkPending; // a pending chunk with no lane: release forgets it, so none should be left
+}
 
 /// A prompt a batched pass takes: no prompt logprobs or images (their rows go through other steps), one chunk at most
 /// past its kept state (a stale one then fills from 0 here, a chunk a pass).

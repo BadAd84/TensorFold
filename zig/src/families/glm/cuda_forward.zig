@@ -31,6 +31,7 @@ const moe_side = @import("cuda_moe_side.zig");
 const hc_glue = @import("cuda_forward_glue.zig");
 const onepass_mod = @import("cuda_onepass.zig");
 const kda_chunk = @import("cuda_kda_chunk.zig");
+const slices = @import("cuda_forward_slices.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -431,25 +432,9 @@ pub const Forward = struct {
     /// forward.forward of `ids`: logits in b.logits; a prompt chunk's KDA layers committed, a window's at `commit`.
     pub fn run(f: *const Forward, ids: []const i32) !void {
         const R = ids.len;
-        for (f.ranks) |r| {
-            if (R == 0 or R > r.b.rows) return error.BadWindow;
-            if (r.segs.len == 0) {
-                try r.st.ready(f.stream, R);
-                r.st.pending = R;
-                r.st.prompt = r.b.prefill;
-            } else try shared.begin(r, R, f.stream);
-            try cuda.copy_source.enqueue(f.d, r.b.ids, std.mem.sliceAsBytes(ids), f.stream);
-        }
-        const c = &f.ranks[0].w.config;
-        const embed_stamp = prof_mod.span(f.prof, f.stream, .embed);
-        for (f.ranks) |r| try glue.embedB16(f.set(), f.stream, r.b.ids, r.w.embed, r.b.x, R, c.hidden, c.hc);
-        if (f.images) |im| for (f.ranks) |r| try im.v.splice(f.stream, im.slot, r.st.pos, r.st.pos + R, r.b.x, c.hc);
-        embed_stamp.end();
-        if (f.prof) |p| p.mark(f.stream, .embed);
+        try slices.enter(f, ids);
         var cut: [max_pieces][2]usize = undefined;
-        const pieces = if (f.pieces) |p| (if (f.ranks[0].b.prefill) ranges(R, p.count, &cut) else 0) else 0;
-        // overlap.Overlap.begin: pieced with two pieces or more, and split takes a chunk of one piece too
-        if (pieces > 1 or (pieces == 1 and f.splits(R))) try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
+        if (slices.cuts(f, R, &cut)) |pieces| try f.pieced(f.pieces.?, R, cut[0..pieces]) else try f.whole(R);
         try f.finish(R);
         if (f.prof) |p| p.mark(f.stream, .head);
     }

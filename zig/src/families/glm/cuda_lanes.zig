@@ -38,6 +38,8 @@ pub const Lane = struct {
     held_n: usize = 0,
     first: ?u64 = null,
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
+    slicing: bool = false, // TF_GLM_OVN_FILL_SLICE_MS: its chunk from `fill` waits part-way through its layers
+    settled: bool = false, // and its prompt pass ended inside another call (fill_mod.settle): `first` holds its token
 };
 
 pub const Lanes = struct {
@@ -204,6 +206,7 @@ pub const Lanes = struct {
     /// The prompt pass in one call, Leader.chunk's steps unpaired: each ends at Engine.chunkEnd, so every mark keeps.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
         const self = of(ptr);
+        try fill_mod.settle(self);
         var from = try self.opening(s);
         try self.images(s, from);
         var sink: Sink = .{ .gpa = self.x.e.gpa, .s = s };
@@ -224,7 +227,8 @@ pub const Lanes = struct {
 
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        if (self.multi) return @import("cuda_lanes_fill.zig").multiFill(self, ss);
+        try fill_mod.settle(self);
+        if (self.multi) return fill_mod.multiFill(self, ss);
         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
         for (ss) |s| if (!canBatch(s)) return false;
         var opened: usize = 0;
@@ -256,6 +260,8 @@ pub const Lanes = struct {
     /// One chunk of the stream's prompt pass (other rounds run between); true once the first token is drawn.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
+        if (self.lanes.getPtr(s)) |l| if (l.slicing or l.settled) return fill_mod.onward(self, s, l);
+        try fill_mod.settle(self); // another stream's chunk part-way through its layers finishes first
         const going: ?usize = if (self.lanes.getPtr(s)) |l| l.fill else null;
         const from = if (going == null) try self.opening(s) else null;
         if (going == null) try self.images(s, from);
@@ -267,19 +273,24 @@ pub const Lanes = struct {
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        const step = try self.x.chunk(s.prompt(), at, !self.othersDecode(s), from, .{ .ptr = s, .check = cancelled }, marksOf(s));
+        const busy = self.othersDecode(s); // a pair would hold up their rounds; TF_GLM_OVN_FILL_SLICE_MS slices instead
+        const step = try self.x.chunkOf(s.prompt(), at, !busy, from, .{ .ptr = s, .check = cancelled }, marksOf(s), busy and @import("cuda_prompt_slices.zig").of(self.x.e) != null);
         if (step.first) |first| {
             l.first = self.take(first);
             l.fill = null;
             return true;
         }
-        l.fill = at + step.rows;
+        l.fill = if (step.sliced) at else at + step.rows; // sliced: its start until its last layer (fill_mod.onward)
+        l.slicing = step.sliced;
+        s.slice_pending = step.sliced;
         if (s.settle_step) try self.x.e.stream.synchronize(); // its tail would land in the next decode round's time
         return false;
     }
+    const fill_mod = @import("cuda_lanes_fill.zig");
 
     fn cancelPrefillFn(ptr: *anyopaque, s: *lanes.Stream) !void {
         const self = of(ptr);
+        try fill_mod.settle(self); // a chunk part-way through its layers (this one's too) finishes before any keep
         const l = self.lanes.getPtr(s) orelse return;
         const at = l.fill orelse return;
         if (at <= s.cached or s.reuse.hook == null) return;
@@ -318,6 +329,8 @@ pub const Lanes = struct {
         l.held_n = 0;
         l.fill = null;
         l.first = null;
+        l.slicing = false;
+        l.settled = false;
         errdefer {
             if (self.x.e.pages) |p| p.close(l.slot);
             _ = self.lanes.remove(s);
