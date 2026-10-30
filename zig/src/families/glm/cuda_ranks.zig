@@ -24,6 +24,7 @@ pub const Settings = struct {
     dense_bits: u8 = 16, // TF_GLM_DENSE_BITS: the dense linears packed at load to 4, 6 or 8 bits (16: bf16)
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
     ovn_comms: u32 = 0, // the comms lane's TF_GLM_OVN_* knobs as one word (ovnComms): every rank exchanges alike
+    shared_rows: u32 = least_shared_rows, // TF_GLM_OVN_SHARED_ROWS: a shared verify's rows at most (0: auto, unresolved)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -108,6 +109,10 @@ pub const Settings = struct {
                 },
             };
         };
+        s.shared_rows = sharedRows(get("TF_GLM_OVN_SHARED_ROWS")) catch {
+            problem.* = "TF_GLM_OVN_SHARED_ROWS: a shared verify's rows, 32, 40, 48, 56 or 64; or auto (64 above 4 streams)";
+            return error.BadSetting;
+        };
         s.ovn_comms = ovnComms() catch {
             problem.* = "TF_GLM_OVN_ROCE_RAILS: 1 or 2; TF_GLM_OVN_ROCE_RAILS_KB: under 1048576";
             return error.BadSetting;
@@ -128,6 +133,29 @@ pub const Settings = struct {
     }
 };
 
+/// TF_GLM_OVN_SHARED_ROWS's range: the default (32) to 64 rows a shared verify, in steps of 8.
+pub const least_shared_rows = 32;
+pub const most_shared_rows = 64;
+
+/// A TF_GLM_OVN_SHARED_ROWS value as Settings holds it: unset is 32, "auto" is 0 (resolved by autoRows at open).
+pub fn sharedRows(text: ?[]const u8) error{BadSetting}!u32 {
+    const v = text orelse return least_shared_rows;
+    if (std.mem.eql(u8, v, "auto")) return 0;
+    const n = std.fmt.parseInt(u32, v, 10) catch return error.BadSetting;
+    return if (validRows(n)) n else error.BadSetting;
+}
+
+/// Whether `n` is one of TF_GLM_OVN_SHARED_ROWS's row counts (auto's 0 is not: it must be resolved first).
+pub fn validRows(n: u32) bool {
+    return n >= least_shared_rows and n <= most_shared_rows and n % 8 == 0;
+}
+
+/// Production's rule (config-v110.sh, TF_GLM_MULTI_WINDOW): 64 rows above 4 streams (--parallel), else 32.
+pub fn autoRows(rows: u32, streams: u32) u32 {
+    if (rows != 0) return rows;
+    return if (streams > 4) most_shared_rows else least_shared_rows;
+}
+
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
 pub const max_world = 16;
 
@@ -145,7 +173,7 @@ pub fn environment(name: [:0]const u8) ?[]const u8 {
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 16, // this struct's version
+    layout: u32 = 17, // this struct's version
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -167,6 +195,7 @@ pub const Fingerprint = extern struct {
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     ovn_comms: u32 = 0, // Settings.ovn_comms: the RoCE gather's blob and stripes and the step link's transport
     moe_owners: u32 = 0, // TF_GLM_OVN_EXPERT_ROTATE's owners (cuda_rotlayer digest): every rank sums a layer alike
+    shared_rows: u32 = least_shared_rows, // TF_GLM_OVN_SHARED_ROWS, resolved: every rank sizes its shared windows alike
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
@@ -197,6 +226,7 @@ pub const Fingerprint = extern struct {
         bits,
         ovn_comms,
         moe_owners,
+        shared_rows,
         capacity,
         heat_high,
         heat_low,
@@ -231,6 +261,7 @@ pub const Fingerprint = extern struct {
             .mtp = @intFromBool(mtp),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .ovn_comms = s.ovn_comms,
+            .shared_rows = s.shared_rows,
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,
@@ -270,6 +301,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "bits",
             "ovn_comms",
             "moe_owners",
+            "shared_rows",
             "capacity",
             "heat_high",
             "heat_low",
@@ -382,6 +414,7 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .ovn_comms => "TF_GLM_OVN_ROCE_RAILS, TF_GLM_OVN_ROCE_RAILS_KB, TF_GLM_OVN_LINK1 or TF_GLM_OVN_LINK_ROCE",
         .moe_owners => "TF_GLM_OVN_EXPERT_ROTATE (each MoE layer's expert share owners)",
+        .shared_rows => "TF_GLM_OVN_SHARED_ROWS (or auto's --parallel)",
         .capacity => "the sequence capacity (the context)",
         .heat_high => "TF_HEAT_HIGH",
         .heat_low => "TF_HEAT_LOW",

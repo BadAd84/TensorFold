@@ -10,7 +10,7 @@ const Engine = engine.Engine;
 
 /// sample.cu's candidate cap (tf_sample::C): a top_k past it draws from whole rows as before.
 pub const max_k = 1024;
-const rows_max = engine.shared_rows;
+const rows_max = engine.max_shared_rows; // the host arrays' rows; the device buffers hold the load's (Draw1.rows)
 const pair_bytes = 16;
 
 /// A draw's per-row words as one upload: each sampled row's rule, its position less one, its logits row.
@@ -35,26 +35,30 @@ pub const Draw1 = struct {
     full: cuda.DeviceBuffer, // bf16 [rows][vocab]: -inf but the gathered candidates
     ctl: cuda.DeviceBuffer, // Ctl
     tok: cuda.DeviceBuffer, // u32 [rows]
+    rows: usize, // the rows the buffers hold: the load's TF_GLM_OVN_SHARED_ROWS
 
     /// Made at load with the knob on; glm_glue is the forward's module 6 (fw.Modules.load's order).
     pub fn init(e: *Engine) !Draw1 {
         const d = e.d;
         const world = e.share.world;
+        const rows: usize = e.settings.shared_rows;
+        std.debug.assert(rows <= rows_max);
         var x: Draw1 = undefined;
+        x.rows = rows;
         x.top1_rows = try e.m.mods[6].function("tf_glm_top1_rows");
         x.cands = try e.smp.module.function("tf_draw_cands");
         x.place = try e.smp.module.function("tf_draw_place");
         x.draw_rows = try e.smp.module.function("tf_draw_rows");
-        x.picks = try cuda.DeviceBuffer.alloc(d, world * rows_max * pair_bytes);
+        x.picks = try cuda.DeviceBuffer.alloc(d, world * rows * pair_bytes);
         errdefer x.picks.free();
         try x.picks.fill8(0, null); // each pick's padding stays zero
-        x.cand = try cuda.DeviceBuffer.alloc(d, world * rows_max * max_k * 8);
+        x.cand = try cuda.DeviceBuffer.alloc(d, world * rows * max_k * 8);
         errdefer x.cand.free();
-        x.full = try cuda.DeviceBuffer.alloc(d, rows_max * e.c.vocab * 2);
+        x.full = try cuda.DeviceBuffer.alloc(d, rows * e.c.vocab * 2);
         errdefer x.full.free();
         x.ctl = try cuda.DeviceBuffer.alloc(d, @sizeOf(Ctl));
         errdefer x.ctl.free();
-        x.tok = try cuda.DeviceBuffer.alloc(d, rows_max * 4);
+        x.tok = try cuda.DeviceBuffer.alloc(d, rows * 4);
         return x;
     }
 
@@ -84,7 +88,7 @@ pub fn draw(e: *Engine, logits: u64, parts: []const Part) !void {
     var k: u32 = 0;
     var ctl: Ctl = undefined;
     for (parts) |p| {
-        if (p.rows == 0 or p.row0 + p.rows > rows_max or p.first < 1) return error.BadDraw;
+        if (p.rows == 0 or p.row0 + p.rows > x.rows or p.first < 1) return error.BadDraw;
         const s = p.sampling orelse {
             greedy_rows = @max(greedy_rows, p.row0 + p.rows);
             continue;
@@ -179,4 +183,53 @@ test "the ranks' greedy picks: largest value, then the lowest id, as cuda_engine
     const all = [_][4]u32{ f(2.0, 9), f(1.0, 1), f(2.0, 4), f(0.5, 100), f(1.0, 7), f(3.0, 200) };
     try std.testing.expectEqual(@as(u32, 4), pick(&all, 2, 0));
     try std.testing.expectEqual(@as(u32, 200), pick(&all, 2, 1));
+}
+
+/// A recording driver: each allocation's bytes; functions and fills succeed without a device.
+const Fake = struct {
+    var sizes: [8]usize = undefined;
+    var n: usize = 0;
+    fn alloc(p: *cuda.abi.DevicePtr, len: usize) callconv(.c) cuda.abi.Result {
+        sizes[n] = len;
+        n += 1;
+        p.* = 0x1000 * n;
+        return cuda.abi.success;
+    }
+    fn free(_: cuda.abi.DevicePtr) callconv(.c) cuda.abi.Result {
+        return cuda.abi.success;
+    }
+    fn fill(_: cuda.abi.DevicePtr, _: u8, _: usize) callconv(.c) cuda.abi.Result {
+        return cuda.abi.success;
+    }
+    fn function(f: *cuda.abi.Function, _: cuda.abi.Module, _: [*:0]const u8) callconv(.c) cuda.abi.Result {
+        f.* = @ptrFromInt(0x40);
+        return cuda.abi.success;
+    }
+};
+
+test "TF_GLM_OVN_DRAW1: its buffers hold the load's TF_GLM_OVN_SHARED_ROWS rows; a part past them is refused" {
+    var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = Fake.alloc;
+    d.api.cuMemFree_v2 = Fake.free;
+    d.api.cuMemsetD8_v2 = Fake.fill;
+    d.api.cuModuleGetFunction = Fake.function;
+    var e: Engine = undefined;
+    e.d = &d;
+    e.share.world = 3;
+    e.share.vocab = .{ .lo = 0, .hi = 51627 };
+    e.c.vocab = 154880;
+    e.m.mods[6] = .{ .d = &d, .handle = null };
+    e.smp.module = .{ .d = &d, .handle = null };
+    var out: [8]u32 = undefined;
+    for ([_]u32{ 32, 48, 64 }) |rows| {
+        e.settings = .{ .shared_rows = rows };
+        Fake.n = 0;
+        e.draw1 = try Draw1.init(&e);
+        defer e.draw1.?.deinit();
+        try std.testing.expectEqual(@as(usize, rows), e.draw1.?.rows);
+        const want = [_]usize{ 3 * rows * pair_bytes, 3 * rows * max_k * 8, rows * 154880 * 2, @sizeOf(Ctl), rows * 4 };
+        try std.testing.expectEqualSlices(usize, &want, Fake.sizes[0..Fake.n]);
+        // a part ending one row past the load's rows is refused before any launch
+        try std.testing.expectError(error.BadDraw, draw(&e, 0, &.{.{ .row0 = rows - 4, .rows = 5, .first = 1, .sampling = null, .out = &out }}));
+    }
 }

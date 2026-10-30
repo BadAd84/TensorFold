@@ -4,7 +4,7 @@ const cuda = @import("cuda");
 const Engine = @import("cuda_engine.zig").Engine;
 const Prof = @import("cuda_prof.zig").Prof;
 const max_shared = @import("cuda_engine.zig").max_shared;
-const shared_rows = @import("cuda_engine.zig").shared_rows;
+const max_shared_rows = @import("cuda_engine.zig").max_shared_rows;
 
 pub fn freeProfs(e: *Engine) void {
     for (&e.profs) |*p| {
@@ -28,8 +28,8 @@ pub fn verifyLabel(rows: usize) []const u8 {
     return l[@min(rows, l.len) - 1];
 }
 
-/// Shared rounds' row buckets: to 8, 16, 24 and 32 rows.
-const buckets = shared_rows / 8;
+/// Shared rounds' row buckets: to 8, 16, 24 ... rows, up to TF_GLM_OVN_SHARED_ROWS's widest (64).
+const buckets = max_shared_rows / 8;
 
 /// TF_GLM_OVN_SHARED_PROF: shared rounds' sections by segments and rows, and their commits by segments (made on use).
 pub const Shared = struct {
@@ -40,6 +40,7 @@ pub const Shared = struct {
     commits: [max_shared + 1]?*Prof = @splat(null),
 
     const round_labels = labels: {
+        @setEvalBranchQuota(200_000); // 17 x 8 labels printed at compile time
         var l: [max_shared + 1][buckets][]const u8 = undefined;
         for (&l, 0..) |*by_rows, segs| {
             for (by_rows, 0..) |*x, b| x.* = std.fmt.comptimePrint("shared {d} segs to {d} rows", .{ segs, 8 * (b + 1) });
@@ -71,7 +72,7 @@ pub const Shared = struct {
 
     /// A shared forward of `segs` streams and `rows` rows begins on `stream`: its profiler, labelled by both.
     pub fn round(s: *Shared, stream: cuda.Stream, segs: usize, rows: usize) !*Prof {
-        const b = (@min(rows, shared_rows) - 1) / 8;
+        const b = (@min(rows, max_shared_rows) - 1) / 8;
         const p = try s.made(&s.rounds[segs][b]);
         try p.begin(stream, round_labels[segs][b]);
         return p;
@@ -84,3 +85,10 @@ pub const Shared = struct {
         return p;
     }
 };
+
+test "TF_GLM_OVN_SHARED_PROF: a row bucket for every shared round up to TF_GLM_OVN_SHARED_ROWS's widest" {
+    const ranks = @import("cuda_ranks.zig");
+    try std.testing.expectEqual(@as(usize, ranks.most_shared_rows / 8), buckets);
+    try std.testing.expectEqualStrings("shared 3 segs to 64 rows", Shared.round_labels[3][(ranks.most_shared_rows - 1) / 8]);
+    try std.testing.expectEqualStrings("shared 2 segs to 40 rows", Shared.round_labels[2][(33 - 1) / 8]); // 33 rows
+}

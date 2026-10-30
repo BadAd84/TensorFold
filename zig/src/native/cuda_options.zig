@@ -9,6 +9,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
     if (@hasField(F.Options, "mtp_drafts") and o.mtp_drafts == 0) opts.drafts = false;
     if (@hasField(F.Options, "lanes")) opts.lanes = o.lanes;
     if (@hasField(F.Options, "lanes_fixed")) opts.lanes_fixed = o.lanes_fixed;
+    if (@hasField(F.Options, "parallel")) opts.parallel = o.lanes; // the streams asked for, read-only (no room planning)
     if (@hasField(F.Options, "rank")) {
         opts.tp = @intCast(o.tp);
         opts.rank = @intCast(o.rank);
@@ -75,6 +76,16 @@ test "native family options forward lane counts and fixedness only when declared
     try std.testing.expectEqual(@as(u32, 7), counted.lanes);
     try std.testing.expectEqual(@as(u32, 7), fixed.lanes);
     try std.testing.expect(fixed.lanes_fixed);
+}
+
+test "native family options: --parallel's count reaches a family that reads it as `parallel`, without `lanes`" {
+    const Glm = struct {
+        pub const Options = struct { parallel: u32 = 8 }; // GLM: no `lanes`, so its room planning is unchanged
+    };
+    var why: []const u8 = "";
+    var opts: Glm.Options = .{};
+    try std.testing.expect(set(Glm, .{ .dir = "", .model_type = "glm5_next", .lanes = 6 }, &opts, &why));
+    try std.testing.expectEqual(@as(u32, 6), opts.parallel);
 }
 
 test "prompt precision: family options receive both explicit int8 and default bf16" {

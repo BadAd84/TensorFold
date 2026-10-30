@@ -112,6 +112,8 @@ test {
     _ = @import("cuda_mtp_chance.zig");
     _ = @import("cuda_tile.zig");
     _ = @import("cuda_draw1.zig");
+    _ = @import("cuda_engine_shared.zig");
+    _ = @import("cuda_engine_prof.zig");
     _ = @import("cuda_cost_time.zig");
     _ = @import("cuda_prompt_pieces.zig");
     _ = @import("cuda_lanes_fill.zig");

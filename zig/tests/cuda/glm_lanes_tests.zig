@@ -241,7 +241,9 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
     }
     const x: glm.follow.Leader = .{ .e = e, .link = &link };
     defer x.end() catch {};
-    const S = 5; // streams: every prompt, the first twice, the last sampled
+    const S = 8; // streams: every prompt, each twice; stream 4 sampled
+    const sampled = 4;
+    const W = glm.forward.window_rows; // a stream's rows a round at most
     const V = e.share.vocab.len();
     var failed = false;
     var first: [S]u32 = undefined;
@@ -251,7 +253,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         const ids = try a.alloc(u32, k.prompt.len);
         for (ids, k.prompt) |*u, v| u.* = @intCast(v);
         try x.bind(@intCast(slot));
-        try x.begin(if (i == S - 1) .{ .seed = 77, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null);
+        try x.begin(if (i == sampled) .{ .seed = 77, .temperature = 0.7, .top_k = 20, .top_p = 0.95 } else null);
         const t = try x.prefill(ids, null, null);
         if (slot >= S and t != first[i]) {
             std.debug.print("FAIL shared: stream {d}'s twin drew {d} from the prompt, the stream {d}\n", .{ i, t, first[i] });
@@ -261,21 +263,32 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         var held: [glm.engine.max_drafts]u32 = undefined;
         try x.draft(true, &.{t}, 1, &held, null);
     }
-    const lone = try a.alloc(u16, 4 * V);
-    const mine = try a.alloc(u16, 4 * V);
+    const lone = try a.alloc(u16, W * V);
+    const mine = try a.alloc(u16, W * V);
+    // after 12 rounds of 1 to 4 rows a stream: wide forwards of 33 to 64 rows (TF_GLM_OVN_SHARED_ROWS), 8-row windows
+    const wide = [_]usize{ 33, 40, 47, 48, 56, 57, 63, 64 };
+    var wide_n: usize = 0;
+    for (wide) |total| wide_n += @intFromBool(total <= e.settings.shared_rows);
     var compared: usize = 0;
+    var widest: usize = 0;
+    var most_streams: usize = 0;
     var round: usize = 0;
-    while (round < 12) : (round += 1) {
-        const n = 2 + round % (S - 1); // streams this round: 2 to S
+    while (round < 12 + wide_n) : (round += 1) {
+        const total: usize = if (round < 12) 0 else wide[round - 12]; // wide's first wide_n fit the load's rows
+        const n = if (round < 12) 2 + round % 4 else (total + W - 1) / W; // streams this round
         var parts: [S]glm.engine.Part = undefined;
-        var ids: [S][4]u32 = undefined;
-        var outs: [S][4]u32 = undefined;
-        var twin: [S][4]u32 = undefined;
+        var ids: [S][W]u32 = undefined;
+        var outs: [S][W]u32 = undefined;
+        var twin: [S][W]u32 = undefined;
+        var sum: usize = 0;
         for (0..n) |i| {
-            const rows = 1 + (round + i) % 4;
+            const rows = if (round < 12) 1 + (round + i) % 4 else total / n + @intFromBool(i < total % n);
             for (0..rows) |r| ids[i][r] = @intCast(100 + (round * 31 + i * 7 + r * 13) % 5000);
             parts[i] = .{ .slot = @intCast(i), .ids = ids[i][0..rows], .out = outs[i][0..rows] };
+            sum += rows;
         }
+        widest = @max(widest, sum);
+        most_streams = @max(most_streams, n);
         try x.verifyShared(parts[0..n]);
         var row0: usize = 0;
         for (0..n) |i| { // each stream's rows of the shared forward against its twin's lone round (verify, keep, draft)
@@ -320,7 +333,7 @@ pub fn sharedCheck(gpu: Gpu, checkpoint: []const u8, dc_path: []const u8, rank: 
         }
     }
     if (failed) return error.TestFailed;
-    check.pass("shared windows at TP={d}: {d} rows of {d} streams over 12 rounds (2 to {d} streams a forward, 1 to 4 rows each, greedy and sampled) equal their lone twins' logits, tokens and drafts byte for byte, and every state its twin's", .{ world, compared, S, S });
+    check.pass("shared windows at TP={d}: {d} rows of {d} streams over {d} rounds (2 to {d} streams a forward, 1 to {d} rows each, up to {d} rows a forward of the load's {d}, greedy and sampled) equal their lone twins' logits, tokens and drafts byte for byte, and every state its twin's", .{ world, compared, S, 12 + wide_n, most_streams, @as(usize, if (wide_n > 0) W else 4), widest, e.settings.shared_rows });
 }
 
 /// A concurrent case's stream: prompt `p` joining at round `at`; `filled`: its prompt a chunk at a time between rounds.

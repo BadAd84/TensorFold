@@ -59,3 +59,35 @@ test "a prompt step pairs only while no other stream is past its prompt pass" {
     _ = self.lanes.remove(&streams[2]); // released
     try std.testing.expect(!self.othersDecode(&streams[0]));
 }
+
+test "TF_GLM_OVN_SHARED_ROWS: the round loop's batch rows and shared costs reach the load's rows, 76 + 4.1 ms a row" {
+    const gpa = std.testing.allocator;
+    const cl = @import("cuda_lanes.zig");
+    var e: engine.Engine = undefined;
+    e.gpa = gpa;
+    e.mtp = true;
+    var dr: @import("dflash.zig").Drafter = undefined;
+    e.drafter = &dr; // DFlash2: the windows priced by the cost tables
+    for ([_]u32{ 32, 48, 64 }) |rows| {
+        e.settings = .{ .shared_rows = rows };
+        var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+        defer self.lanes.deinit(gpa);
+        var cfg = try lanes.Config.init(gpa, self.facts(), cl.max_rows, cl.max_rows - 1);
+        defer cfg.deinit(gpa);
+        try std.testing.expectEqual(rows, cfg.batch_rows); // the window allocator's and the turn taker's cap
+        try std.testing.expectEqual(@as(usize, rows + 1), cfg.shared_costs.slots.len);
+        // the two-GB10 line itself at every width, not the table's 32-row end scaled up
+        for ([_]u32{ 32, @min(33, rows), rows }) |w| try std.testing.expectApproxEqAbs(76.0 + 4.1 * @as(f64, @floatFromInt(w - 1)), cfg.shared_costs.get(w).?, 1e-9);
+    }
+}
+
+test "structured output's grammar rows: a window past the load's shared rows is refused before the words are made" {
+    var e: engine.Engine = undefined; // no device: a refusal allocates nothing
+    e.c.vocab = 64; // two words a row
+    var masks: [3 * 2]u32 = @splat(0);
+    for ([_]u32{ 32, 48 }) |rows| {
+        e.settings = .{ .shared_rows = rows };
+        var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+        try std.testing.expectError(error.InvalidGrammarMasks, self.putBits(rows - 2, 3, &masks));
+    }
+}

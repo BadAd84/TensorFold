@@ -88,6 +88,7 @@ test "GLM structured: failed mask mapping publishes no owner and can retry" {
     e.gpa = std.testing.allocator;
     e.d = &d;
     e.c.vocab = 64;
+    e.settings = .{}; // putBits' rows: the load's shared rows (TF_GLM_OVN_SHARED_ROWS, unset)
     var l: glm.lanes.Lanes = .{ .x = .{ .e = &e, .link = undefined } };
     defer l.deinit();
     refuse_mapping = true;
