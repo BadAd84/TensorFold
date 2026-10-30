@@ -167,6 +167,8 @@ pub const Engine = struct {
         const kb = @import("cuda_kda_block.zig");
         kb.pad_to = if (o.settings.kda_pad) kb.padWidth(c.kda_heads, world) else 0; // read once: rowWidth reads only this
         @import("cuda_state.zig").drop_mtp = o.mtp and o.drafter and cuda.ovn.on("DROP_MTP"); // read once, as pad_to
+        @import("cuda_sparse.zig").pk8 = cuda.ovn.on("PK8"); // TF_GLM_OVN_PK8, read once: pooled keys' format everywhere
+        if (@import("cuda_sparse.zig").pk8 and c.i_dim != 128) return error.Pk8NeedsIndexDim128; // glm_pk8_row.cuh's D
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;

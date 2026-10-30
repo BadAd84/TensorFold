@@ -174,6 +174,7 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
     var facts: std.ArrayList(u64) = .empty;
     try facts.appendSlice(a, &.{ e.share.world, sh.capacity, sh.ring_rows, sh.tail, @intFromBool(sh.head), @intFromBool(sh.scales), @intFromBool(e.drafter != null) });
     try facts.appendSlice(a, prefixes);
+    if (glm.sparse.pk8) try facts.append(a, sh.pooled_row); // TF_GLM_OVN_PK8: its own store, the default's id unchanged
     const p = try probe(a, io, loaded.backend, e);
     const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
     const gibs = struct {

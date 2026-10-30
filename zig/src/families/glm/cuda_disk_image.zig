@@ -17,15 +17,18 @@ pub const Words = struct {
     cur: u64,
 
     pub const bytes: u64 = 48;
-    const format: u64 = 1;
+    /// 1: bf16 pooled keys; 2: TF_GLM_OVN_PK8's kv8 rows (a state saved in one is never read in the other).
+    fn format() u64 {
+        return if (sparse.pk8) 2 else 1;
+    }
 
     pub fn encode(w: Words) [6]u64 {
-        return .{ format, w.at, w.mtp_len, w.base, w.mtp_base, w.cur };
+        return .{ format(), w.at, w.mtp_len, w.base, w.mtp_base, w.cur };
     }
 
     /// Words read back: refused unless the format is this one and the state stands at `at`.
     pub fn decode(x: [6]u64, at: u32) !Words {
-        if (x[0] != format or x[1] != at) return error.DiskWords;
+        if (x[0] != format() or x[1] != at) return error.DiskWords;
         return .{ .at = x[1], .mtp_len = x[2], .base = x[3], .mtp_base = x[4], .cur = x[5] };
     }
 };
@@ -66,7 +69,7 @@ pub const Shape = struct {
             .ring_rows = @intCast(st.ring_rows),
             .ring_row = @intCast(st.ring_row),
             .pk_rows = @intCast(capacity / sparse.pool + 2),
-            .pooled_row = c.i_dim * 2,
+            .pooled_row = @intCast(sparse.pooledRow(c.i_dim)),
             .capacity = @intCast(capacity),
             .head = head,
         };

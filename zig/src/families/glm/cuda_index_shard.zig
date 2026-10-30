@@ -100,7 +100,7 @@ fn score(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64
         try cuda.launch.launch(try ops.function("tf_glm_add_i32"), .{ .grid = .{}, .block = .{ .x = 32 } }, stream, &a);
         at = s.at;
     }
-    const keys = if (t.pt != 0) pk else pk + p.off * d * 2;
+    const keys = if (t.pt != 0) pk else pk + p.off * sparse.pooledRow(d);
     const pt = if (t.pt != 0) t.pt + p.off / unit * 4 else 0;
     const out = s.scores + p.off * 4;
     const nb = cdiv(p.ext, 64);
@@ -111,7 +111,7 @@ fn score(set: glue.Set, ops: cuda.Module, stream: cuda.Stream, qi: u64, wts: u64
     const loop: usize = if (rows >= sparse.score_loop_from) sparse.score_loop else 1;
     var sa: cuda.Args = .{};
     inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), keys, out, at, @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, sparse.headScale(heads), @as(i64, @intCast(heads)), @as(c_int, @intCast(loop)), pt, @as(i64, @intCast(t.ps)) }) |v| sa.add(v);
-    try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
+    try cuda.launch.launch(sparse.scoresFn(set), .{ .grid = .{ .x = @intCast(rows), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
 }
 
 /// tf_glm_index_shard_pick: each row's K best pools of share `p` of scores [rows][np] as pairs at `out` [rows][2 K].

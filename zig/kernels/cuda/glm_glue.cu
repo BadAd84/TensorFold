@@ -13,3 +13,4 @@
 #include "glm_glue_latent_mma.cuh"
 #include "glm_glue_shard.cuh"
 #include "glm_glue_seg.cuh"
+#include "glm_glue_pk8.cuh"

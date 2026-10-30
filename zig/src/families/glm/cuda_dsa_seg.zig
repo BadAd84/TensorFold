@@ -51,13 +51,13 @@ const Fns = struct {
             .lat_write = try g.function("tf_glm_lat_write_seg"),
             .lat_write_fp8 = try g.function("tf_glm_lat_write_fp8_seg"),
             .index_write = try g.function("tf_glm_index_write_seg"),
-            .pool_keys = try g.function("tf_glm_pool_keys_seg"),
+            .pool_keys = try g.function(if (sparse.pk8) "tf_glm_pool_keys_seg_pk8" else "tf_glm_pool_keys_seg"),
             .chunks = .{
                 .{ try g.function("tf_glm_chunks_16_seg"), try g.function("tf_glm_chunks_16_fp8_seg") },
                 .{ try g.function("tf_glm_chunks_32_seg"), try g.function("tf_glm_chunks_32_fp8_seg") },
             },
             .merge = try g.function("tf_glm_merge_seg"),
-            .scores = try g.function("tf_glm_scores_seg"),
+            .scores = try g.function(if (sparse.pk8) "tf_glm_scores_seg_pk8" else "tf_glm_scores_seg"),
             .select = .{ try g.function("tf_glm_select_rows_seg"), try g.function("tf_glm_select_rows_wide_seg") },
             .tokens = try ops.function("tf_glm_dsa_tokens_seg"),
         };

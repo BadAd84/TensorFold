@@ -22,9 +22,9 @@ pub const Mla = struct {
     }
 
     /// Whether a TF_GLM_OVN knob whose kernels sit in glm_glue is set (MLA_FUSEMERGE, ABSORB_VEC, KVB8, DECODE_SHARD,
-    /// LATENT_MMA).
+    /// LATENT_MMA, PK8).
     pub fn wanted() bool {
-        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD") or cuda.ovn.on("LATENT_MMA");
+        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD") or cuda.ovn.on("LATENT_MMA") or cuda.ovn.on("PK8");
     }
 };
 
@@ -118,6 +118,8 @@ pub const Kernels = struct {
     expand_mma: cuda.Function,
     absorb_mma8: cuda.Function, // and on TF_GLM_OVN_KVB8's E4M3 kv_b
     expand_mma8: cuda.Function,
+    pool_keys_pk8: cuda.Function, // TF_GLM_OVN_PK8 (glm_glue_pk8.cuh): pooled keys as kv8 rows, and their scores
+    scores_pk8: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         return loadOvn(m, Mla.wanted());
