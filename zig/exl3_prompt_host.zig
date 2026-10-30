@@ -54,7 +54,7 @@ fn run(rows: usize, prompt: bool, shared: bool) !void {
     d.api.cuLaunchKernel = Capture.launch;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
-    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
+    var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .grouped_pipe = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
     if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
     const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
@@ -85,30 +85,31 @@ test "exl3 prompt: dispatch rotates once per row only with verified shared scale
 }
 
 test "exl3 prompt: scratch omits global split partials and shared rotation storage is independent of pick count" {
-    const shared = glm.exl3.scratchBytes(1024, 512, 256, true, true)[0];
-    const separate = glm.exl3.scratchBytes(1024, 512, 256, true, false)[0];
-    const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false)[0];
+    const shared = glm.exl3.scratchBytes(1024, 512, 256, true, true, .{})[0];
+    const separate = glm.exl3.scratchBytes(1024, 512, 256, true, false, .{})[0];
+    const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false, .{})[0];
     try std.testing.expect(shared < separate and separate < decode);
     if (comptime @hasDecl(ex, "prompt")) {
         const l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .shared_input = true };
-        const bytes = try ex.prompt.bytes(l, 1024, 8);
-        const sc = try ex.prompt.scratch(0x1000, l, 1024, 8);
+        const bytes = try ex.prompt.bytes(l, 1024, 8, .{});
+        const sc = try ex.prompt.scratch(0x1000, l, 1024, 8, .{});
         try std.testing.expectEqual(@as(u64, sc.xg), sc.xu);
         try std.testing.expectEqual(@as(u64, 0x1000 + bytes), sc.y + 1024 * 8 * 512 * 4);
-        try std.testing.expectError(error.Exl3Shape, ex.prompt.bytes(l, std.math.maxInt(usize), 8));
+        try std.testing.expectError(error.Exl3Shape, ex.prompt.bytes(l, std.math.maxInt(usize), 8, .{}));
     } else try std.testing.expect(false);
 }
 
-test "exl3 prompt: 1024-row calls keep row and pick offsets on both sides of the boundary" {
-    try run(1030, true, true);
+test "exl3 prompt: chunk-row calls keep row and pick offsets on both sides of the boundary" {
+    const c: u64 = glm.exl3.chunk_rows; // one call a prompt chunk (0aec07b2f); a longer pass splits at it
+    try run(c + 6, true, true);
     try std.testing.expectEqual(@as(usize, 4), Capture.copied);
-    try std.testing.expectEqual(@as(usize, 1024), Capture.copies[0].height);
+    try std.testing.expectEqual(@as(usize, c), Capture.copies[0].height);
     try std.testing.expectEqual(@as(usize, 6), Capture.copies[2].height);
-    try std.testing.expectEqual(@as(u64, 0x300000000 + 1024 * 9 * 4), Capture.copies[2].src);
-    try std.testing.expectEqual(@as(u64, 0x400000000 + 1024 * 9 * 512 * 4), Capture.copies[3].dst);
+    try std.testing.expectEqual(@as(u64, 0x300000000 + c * 9 * 4), Capture.copies[2].src);
+    try std.testing.expectEqual(@as(u64, 0x400000000 + c * 9 * 512 * 4), Capture.copies[3].dst);
     var rotations: usize = 0;
     for (Capture.calls[0..Capture.count]) |call| if (call.id == 11) {
-        const at: u64 = if (rotations == 0) 0 else 1024;
+        const at: u64 = if (rotations == 0) 0 else c;
         try std.testing.expectEqual(@as(u64, 0x200000000 + at * 520 * 2), call.args[0]);
         rotations += 1;
     };
@@ -146,16 +147,16 @@ test "exl3 prompt: the common dispatch requires verified mcg4 geometry and keeps
     l.act_mode = 1;
     for ([_]usize{ 1, 7, 8, 15, 16, 17, 63, 64, 65, 1023, 1024 }) |rows| for ([_]usize{ 1, 3, 8, 32 }) |slots| for ([_]bool{ false, true }) |shared| {
         l.shared_input = shared;
-        const size = try P.bytes(l, rows, slots);
-        const sc = try P.scratch(4096, l, rows, slots);
+        const size = try P.bytes(l, rows, slots, .{});
+        const sc = try P.scratch(4096, l, rows, slots, .{});
         try std.testing.expect(sc.xg + rows * (if (shared) @as(usize, 1) else slots) * l.dims * 2 <= sc.xd);
         try std.testing.expect(sc.xd + rows * slots * l.width * 2 <= sc.y);
         try std.testing.expect(sc.y + rows * slots * l.dims * 4 <= 4096 + size);
         for ([_]u64{ sc.xg, sc.xu, sc.xd, sc.y }) |p| try std.testing.expectEqual(@as(u64, 0), p % 256);
     };
-    try std.testing.expectError(error.Exl3Shape, P.bytes(l, 1, 0));
-    try std.testing.expectError(error.Exl3Shape, P.bytes(l, 1, 33));
-    try std.testing.expectError(error.Exl3Shape, P.scratch(std.math.maxInt(u64) - 255, l, 1, 1));
+    try std.testing.expectError(error.Exl3Shape, P.bytes(l, 1, 0, .{}));
+    try std.testing.expectError(error.Exl3Shape, P.bytes(l, 1, 33, .{}));
+    try std.testing.expectError(error.Exl3Shape, P.scratch(std.math.maxInt(u64) - 255, l, 1, 1, .{}));
 }
 
 test "exl3 prompt: the common entry takes as many experts as the grouped router counts, and refuses one more" {
@@ -164,10 +165,10 @@ test "exl3 prompt: the common entry takes as many experts as the grouped router 
     try std.testing.expectEqual(@as(usize, 1024), cuda.grouped.max_experts);
     for ([_]usize{ 1, 1024, 2048 }) |rows| {
         l.experts = cuda.grouped.max_experts;
-        _ = try P.scratch(4096, l, rows, 8);
+        _ = try P.scratch(4096, l, rows, 8, .{});
         l.experts = cuda.grouped.max_experts + 1;
-        try std.testing.expectError(error.Exl3Shape, P.bytes(l, rows, 8));
-        try std.testing.expectError(error.Exl3Shape, P.scratch(4096, l, rows, 8));
+        try std.testing.expectError(error.Exl3Shape, P.bytes(l, rows, 8, .{}));
+        try std.testing.expectError(error.Exl3Shape, P.scratch(4096, l, rows, 8, .{}));
     }
 }
 
