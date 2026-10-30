@@ -24,6 +24,7 @@ const prof_mod = @import("cuda_prof.zig");
 const images_mod = @import("cuda_images.zig");
 const exl3 = @import("cuda_exl3.zig");
 const l2pf_mod = @import("cuda_l2pf.zig");
+const l2pace = @import("cuda_l2pace.zig");
 const shared = @import("cuda_shared.zig");
 const index_mod = @import("cuda_index.zig");
 
@@ -50,6 +51,7 @@ pub const Modules = struct {
     pack_dense: cuda.Function,
     quant: quant.Kernels,
     q4: q4.Kernels,
+    l2pace: ?l2pace.Paced, // TF_GLM_OVN_L2PF_PACED: #1580's paced prefetch, opened by the engine after the weights tile
 
     pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
         const k = cuda.kernels;
@@ -85,6 +87,7 @@ pub const Modules = struct {
         };
         m.tiled = false;
         m.packs = null; // `m` starts undefined: the field default does not apply
+        m.l2pace = null;
         return m;
     }
 
@@ -98,6 +101,7 @@ pub const Modules = struct {
     }
 
     pub fn deinit(m: *Modules) void {
+        if (m.l2pace) |*p| p.deinit();
         if (m.index) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
@@ -208,6 +212,11 @@ pub const Forward = struct {
     taps: ?taps_mod.Taps = null, // DFlash2 (--drafter): the tapped layers' rows, after each such layer
     index_split: bool = false, // TF_GLM_INDEX_SPLIT: this prompt chunk's indexer rows split across the ranks (rank 0's choice)
 
+    /// TF_GLM_OVN_L2PF_PACED on this forward: a decode window of one rank with at most the knob's streams in it.
+    pub fn paced(f: *const Forward) ?*const l2pace.Paced {
+        return l2pace.Paced.gate(&f.m.l2pace, f.ranks.len, f.ranks[0].b.prefill, f.ranks[0].segs.len);
+    }
+
     pub fn set(f: *const Forward) glue.Set {
         return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows };
     }
@@ -272,7 +281,7 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
+                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof, if (f.paced()) |p| .{ .l2 = p, .layer = li + di } else null);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
@@ -451,6 +460,7 @@ pub const Forward = struct {
         const c = &f.ranks[0].w.config;
         var li: usize = 0;
         var di: usize = 0;
+        const pf = f.paced(); // TF_GLM_OVN_L2PF_PACED
         for (f.ranks[0].w.layers, 0..) |_, j| {
             prof_mod.context(f.prof, j, null, .mixer);
             try f.prefetch(j, 2); // L2PF site `o`: the mixer's output projection while it runs
@@ -461,6 +471,7 @@ pub const Forward = struct {
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].mixer == .kda) .kda else .mla);
             try f.prefetch(j, 0); // L2PF site `a`: this layer's FFN across the mixer's all-gather
+            if (pf) |p| try p.fork(f.stream, j, .f); // paced site f: this layer's router or dense gate/up across gather_a
             try f.gather(R);
             if (f.prof) |p| p.mark(f.stream, .gather_a);
             prof_mod.context(f.prof, j, null, .ffn);
@@ -472,6 +483,7 @@ pub const Forward = struct {
             }
             if (f.prof) |p| p.mark(f.stream, if (f.ranks[0].w.layers[j].ffn == .dense) .dense else .shared); // MoE: its fill
             try f.prefetch(j, 1); // L2PF site `f`: the next layer's mixer across the FFN's all-gather
+            if (pf) |p| try p.fork(f.stream, j, .n); // paced site n: the next layer's input projections across gather_b
             try f.gather(R);
             for (f.ranks) |r| try f.post(r, R);
             if (f.taps) |t| try t.at(f.stream, j, f.ranks[0].b.x, 0, R);
@@ -483,6 +495,7 @@ pub const Forward = struct {
         }
         if (f.l2pf) |p| try p.join(f.stream); // the side stream's forks rejoin before the window ends
         for (f.ranks) |r| try glue.streamMean(f.set(), f.stream, r.b.x, r.b.hidden, R, c.hidden, c.hc);
+        if (pf) |p| try p.join(f.stream); // every paced site rejoins before the window ends
     }
 
     /// TF_GLM_L2PF site `which` of layer `j` (a decode window's weight prefetch; off for prompt chunks).
