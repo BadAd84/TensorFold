@@ -57,9 +57,11 @@ pub fn layout(e: *const Engine, at: u32, a: Allocator) ![]rimg.Part {
 /// The image ranges of file `f` of a state at `at` in this rank's layout `parts`, appended to `out`.
 pub fn ranges(parts: []const rimg.Part, at: u32, block: u32, f: File, out: *std.ArrayList(rimg.Range), a: Allocator) !void {
     if (f.kind == .block) return rimg.blockRanges(parts, block, f.window, f.k, out, a);
+    const first = out.items.len; // a restore lists every file's ranges in one list: the blocks' come before these
     try rimg.ownRanges(parts, at, block, out, a);
     // the words lead the own file: the state is sealed from them before its head and tail are copied in
-    if (out.items.len == 0 or out.items[0].off != 0 or out.items[0].len != image.Words.bytes) return error.SnapshotShape;
+    const own = out.items[first..];
+    if (own.len == 0 or own[0].off != 0 or own[0].len != image.Words.bytes) return error.SnapshotShape;
 }
 
 /// TF_IMPRINT_VERIFY=1 on this rank: whether kept states `a` and `b` at `at` hold the same image (16 MiB a pass).
@@ -417,4 +419,16 @@ test "glm disk part: a rank's files carry its rank's names, read back checked, a
     try p.unlink(k);
     p.drain();
     try std.testing.expect(!p.has(k));
+}
+
+test "glm disk part: a state's own file is checked by its own ranges when block files' ranges come first" {
+    const a = std.testing.allocator;
+    // a state at 600 rows with 256-row blocks: words, a prefix, one cache's latent rows (8 bytes a row)
+    const parts = [_]rimg.Part{ .{ .bytes = image.Words.bytes }, .{ .bytes = 64 }, .{ .bytes = 600 * 8, .row = 8 } };
+    var rs: std.ArrayList(rimg.Range) = .empty;
+    defer rs.deinit(a);
+    const files = [_]File{ .{ .name = @splat(1), .kind = .block, .k = 0 }, .{ .name = @splat(2), .kind = .block, .k = 1 }, .{ .name = @splat(3), .kind = .state } };
+    for (files) |f| try ranges(&parts, 600, 256, f, &rs, a);
+    try std.testing.expectEqual(@as(u64, 0), rs.items[2].off); // the own file's words, after the two blocks' rows
+    try std.testing.expectEqual(@as(u64, image.Words.bytes), rs.items[2].len);
 }
