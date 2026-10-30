@@ -30,7 +30,8 @@ struct GroupedArgs {
 namespace tf_exl3 {
 
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
-template <int CB, int K2, int NT>
+// ONE (4-bit, TF_GLM_OVN_X3_NC=w): word lane loaded, word lane + 31 by shuffle; the same two words as ldg_lane_words.
+template <int CB, int K2, int NT, bool ONE = false>
 __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
                                            const half* x1, bool ok0, bool ok1, int lane, float (&acc)[NT][2][4]) {
     constexpr int TW = tile_words<K2>(), LW = lane_words<K2>();
@@ -38,8 +39,16 @@ __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt
     for (int i = 0; i < nkt; ++i) {
         const uint32_t* t0 = T + (size_t)(kt0 + i) * kstride + (size_t)nt0 * TW;
         uint32_t w[NT][LW];
+        if constexpr (ONE && K2 == 8) {
 #pragma unroll
-        for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+            for (int j = 0; j < NT; ++j) w[j][1] = ldg_stream_u32(t0 + j * TW + lane);
+            __syncwarp(); // converged at the shuffles and the .aligned mma below, as nc's staging guarantees
+#pragma unroll
+            for (int j = 0; j < NT; ++j) w[j][0] = __shfl_sync(0xffffffffu, w[j][1], (lane + 31) & 31);
+        } else {
+#pragma unroll
+            for (int j = 0; j < NT; ++j) ldg_lane_words<K2>(t0 + j * TW, lane, w[j]);
+        }
         const int k = (kt0 + i) * 16;
         const uint32_t a[4] = {ok0 ? *reinterpret_cast<const uint32_t*>(x0 + k) : 0u,
                                ok1 ? *reinterpret_cast<const uint32_t*>(x1 + k) : 0u,
@@ -94,7 +103,7 @@ __device__ __forceinline__ void warp_tiles_pipe(const uint32_t* T, int ntiles, i
 }
 
 // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-// ONEW: warp_tiles_w (4-bit only); OVN: the TF_GLM_OVN_X3_* tail `ot` (row inputs, the fused down epilogue).
+// ONEW: warp_tiles' one-word loads for 4-bit tiles; OVN: the TF_GLM_OVN_X3_* tail `ot` (row inputs, fused down).
 template <int CB, int NT, int W, bool PIPE = false, bool ONEW = false, bool OVN = false>
 __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz, const OvnTail ot = OvnTail{}) {
     if (u >= a.ucount[0]) return;
@@ -137,14 +146,10 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
     __shared__ __align__(16) float red[W][16][NT * 16];
-    if constexpr (ONEW) {
-        if (k2 != 8) __trap();
-        warp_tiles_w<CB, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
-    } else
-    switch (k2) {
+    switch (k2) { // ONEW: case 8 walks with one-word loads; no extra guard branch ahead of the warp-collective mma
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
-        if (PIPE) warp_tiles_pipe<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); else warp_tiles<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
+        if (PIPE) warp_tiles_pipe<CB, K2_, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); else warp_tiles<CB, K2_, NT, ONEW>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc); \
         break;
         TF_EXL3X_CASE(2)
         TF_EXL3X_CASE(3)
