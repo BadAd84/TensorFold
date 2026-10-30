@@ -27,7 +27,8 @@ pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
         g.st.pending = g.rows;
         g.st.prompt = r.b.prefill;
     }
-    if (r.b.seg_kda) |x| if (!r.b.prefill) try x.fill(r.segs, stream);
+    if (r.b.seg.kda) |x| if (!r.b.prefill) try x.fill(r.segs, stream);
+    if (r.b.seg.dsa) |x| if (!r.b.prefill) try x.fill(r.segs, stream); // TF_GLM_OVN_SEG_DSA
 }
 
 /// Forward.finish's head on a prompt buffer: each segment's last final-norm row, logits row k for segment k.
@@ -49,7 +50,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             var s = b.kda;
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
-            const seg = if (r.b.seg_kda) |x| (if (!b.prefill and x.segs == r.segs.len) x else null) else null;
+            const seg = if (r.b.seg.kda) |x| (if (!b.prefill and x.segs == r.segs.len) x else null) else null;
             if (f.paced()) |p| try p.fork(f.stream, li + di, .o); // TF_GLM_OVN_L2PF_PACED: o into L2 while the chains run
             for (r.segs) |g| {
                 const st = g.st;
@@ -83,7 +84,8 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             var sparse_any = false;
             for (r.segs) |g| sparse_any = sparse_any or dsa_block.sparseRows(a, g.st.pos, g.rows);
             try dsa_block.prepare(f.set(), f.stream, a, b.dsa, b.normed, c.hidden, rows, sparse_any);
-            for (r.segs) |g| {
+            const seg = if (b.seg.dsa) |x| (if (!b.prefill and x.takes(r.segs.len, f.set(), a, di)) x else null) else null;
+            if (seg) |x| try x.attend(.{ .set = f.set(), .ops = f.m.ops() }, f.stream, a, di, b.dsa) else for (r.segs) |g| {
                 const nch = @min(latent.chunksFor(g.st.pos + g.rows), b.nch);
                 try dsa_block.attend(.{ .set = f.set(), .ops = f.m.ops(), .shard = dsa_block.index_shard.of(f.m.shard_from, b.prefill, f.exchange, r.w.share.rank, r.w.share.world) }, f.stream, a, g.st.caches[di], b.dsa, g.row0, g.rows, g.st.pos_dev, g.st.pos, nch, b.part_rows);
             }

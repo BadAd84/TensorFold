@@ -217,7 +217,7 @@ pub const Buffers = struct {
     mcat: u64, // bf16 [rows][2 dims]: [enorm(me) | hnorm(hin)]
     mx: u64, // bf16 [rows][dims]: its stream
     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
-    seg_kda: ?*@import("cuda_kda_seg.zig").SegKda = null, // TF_GLM_OVN_SEG_KDA: a shared window's chains at once
+    seg: @import("cuda_dsa_seg.zig").Tables = .{}, // TF_GLM_OVN_SEG_KDA and _SEG_DSA: a shared window's segment tables
     x_alt: u64 = 0, // TF_GLM_OVN_GLUE_FUSE (decode buffers): the residual's second buffer, bf16 [rows][4][dims]
     hc_count: u64 = 0, // and hcGlue's blocks counted in, u32 a row (zero between launches)
     fuse_rows: usize = 0, // TF_GLM_OVN_GLUE_FUSE=N: the most rows a fused window takes (0: off)

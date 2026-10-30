@@ -5,10 +5,12 @@
 
 using namespace glm_triton;
 
+namespace glm_index {
+
 // sparse._index_write, a warp a row (D 128): LayerNorm of k_raw (div.full, sqrt.approx) into ik, gate row into ig.
-extern "C" __global__ void __launch_bounds__(32)
-    tf_glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
-                       const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
+__device__ __forceinline__ void index_write_body(const __nv_bfloat16* kr, int64_t k_stride, const float* gr,
+                                                 const __nv_bfloat16* lnw, const __nv_bfloat16* lnb,
+                                                 __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
   constexpr int D = 128;
   const int64_t r = blockIdx.x, at = (int64_t)pos[0] + r;
   const int d0 = threadIdx.x * 4;
@@ -35,9 +37,9 @@ extern "C" __global__ void __launch_bounds__(32)
 }
 
 // sparse._pool_keys, a warp a completed pool: softmax of its 4 gate rows (+ ape) times bf16 keys, summed in order.
-extern "C" __global__ void __launch_bounds__(32)
-    tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, __nv_bfloat16* pk,
-                     const int* pos, int64_t rows, const int* pt, int64_t ps) {
+__device__ __forceinline__ void pool_keys_body(const __nv_bfloat16* ik, const __nv_bfloat16* ig,
+                                               const __nv_bfloat16* ape, __nv_bfloat16* pk, const int* pos,
+                                               int64_t rows, const int* pt, int64_t ps) {
   constexpr int D = 128;
   const int64_t P = pos[0], p = P / 4 + blockIdx.x;
   if (4 * p + 3 > P + rows - 1) return;
@@ -56,6 +58,22 @@ extern "C" __global__ void __launch_bounds__(32)
     }
     out[d] = __float2bfloat16_rn(t);
   }
+}
+
+}  // namespace glm_index
+
+// sparse._index_write, a warp a row (D 128): LayerNorm of k_raw (div.full, sqrt.approx) into ik, gate row into ig.
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_index_write(const __nv_bfloat16* kr, int64_t k_stride, const float* gr, const __nv_bfloat16* lnw,
+                       const __nv_bfloat16* lnb, __nv_bfloat16* ik, __nv_bfloat16* ig, const int* pos, float eps) {
+  glm_index::index_write_body(kr, k_stride, gr, lnw, lnb, ik, ig, pos, eps);
+}
+
+// sparse._pool_keys, a warp a completed pool: softmax of its 4 gate rows (+ ape) times bf16 keys, summed in order.
+extern "C" __global__ void __launch_bounds__(32)
+    tf_glm_pool_keys(const __nv_bfloat16* ik, const __nv_bfloat16* ig, const __nv_bfloat16* ape, __nv_bfloat16* pk,
+                     const int* pos, int64_t rows, const int* pt, int64_t ps) {
+  glm_index::pool_keys_body(ik, ig, ape, pk, pos, rows, pt, ps);
 }
 
 namespace glm_index {

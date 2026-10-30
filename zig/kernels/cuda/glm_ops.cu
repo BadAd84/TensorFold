@@ -42,6 +42,8 @@ extern "C" __global__ void tf_glm_dsa_tokens_i32(const int* __restrict__ pools, 
     dsa_tokens(pools, pos, K, tokens, counts, pt, page_rows);
 }
 
+#include "glm_ops_seg.cuh"
+
 // TF_GLM_OVN_POOLS32: n int64 pool ids (each below 2^31) as int32, for the prompt indexer split's gather.
 extern "C" __global__ void tf_glm_pools_i32(const long long* __restrict__ src, int* __restrict__ dst, long long n) {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;

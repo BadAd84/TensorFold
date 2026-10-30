@@ -11,3 +11,4 @@
 #include "glm_glue_attn_ovn.cuh"
 #include "glm_glue_latent_ovn.cuh"
 #include "glm_glue_shard.cuh"
+#include "glm_glue_seg.cuh"

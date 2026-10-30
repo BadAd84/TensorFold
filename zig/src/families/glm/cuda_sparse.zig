@@ -23,7 +23,7 @@ fn cdiv(a: usize, b: usize) usize {
 const wide_rows = 48;
 const wide_pools = 4096;
 
-fn wideSelect(rows: usize, np: usize) bool {
+pub fn wideSelect(rows: usize, np: usize) bool {
     return rows <= wide_rows and np >= wide_pools;
 }
 
