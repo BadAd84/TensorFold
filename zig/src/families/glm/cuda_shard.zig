@@ -3,6 +3,7 @@
 const std = @import("std");
 const canon = @import("canon");
 const Config = @import("config.zig").Config;
+const rotlayer = @import("cuda_rotlayer.zig");
 
 /// Elements of an MLP width or the vocabulary a rank takes whole (split.UNIT).
 pub const unit = 64;
@@ -25,6 +26,7 @@ pub const Share = struct {
     moe: Span, // each routed expert's intermediate rows
     shared: Span, // the shared expert's intermediate rows
     vocab: Span, // the head's rows
+    rot: rotlayer.Owners = .{}, // TF_GLM_OVN_EXPERT_ROTATE: per MoE layer the rank holding the expert shares' first
 
     /// Rank `rank` of `world`; refused where a rank would be left empty (the Python family's split_units refuses it).
     pub fn of(c: *const Config, rank: usize, world: usize) !Share {
@@ -35,10 +37,38 @@ pub const Share = struct {
             .kda = try span(c.kda_heads, kdaUnit(world), rank, world),
             .mla = try span(c.mla_heads, 1, rank, world),
             .dense = try span(c.dense_inter, unit, rank, world),
-            .moe = try span(c.moe_inter, if (c.exl3) 128 else unit, rank, world), // EXL3 tiles and rotations: 128
+            .moe = try span(c.moe_inter, rotlayer.moeUnit(c), rank, world), // EXL3 tiles and rotations: 128
             .shared = try span(c.shared_inter, unit, rank, world),
             .vocab = try span(c.vocab, c.head_unit, rank, world),
         };
+    }
+
+    /// Layer `layer`'s share: its routed and shared expert spans are share (rank - owner) mod world's, rot off.
+    pub fn at(s: Share, c: *const Config, layer: usize) !Share {
+        if (!s.rot.on) return s;
+        const q = s.rot.held(s.rank, s.world, layer);
+        var out = s;
+        out.moe = try span(c.moe_inter, rotlayer.moeUnit(c), q, s.world);
+        out.shared = try span(c.shared_inter, unit, q, s.world);
+        out.rot = .{};
+        return out;
+    }
+
+    /// The widest routed and shared expert spans this rank holds on any layer: what its buffers take.
+    pub fn widest(s: Share, c: *const Config) [2]usize {
+        return s.widths(c, true);
+    }
+
+    /// The widest (`most`) or narrowest routed and shared expert spans this rank holds on any layer.
+    pub fn widths(s: Share, c: *const Config, most: bool) [2]usize {
+        var w: [2]usize = .{ s.moe.len(), s.shared.len() };
+        if (!s.rot.on) return w;
+        for (0..c.layers) |i| {
+            const l = s.at(c, i) catch continue; // rotlayer.parse refused any empty share
+            const v = [2]usize{ l.moe.len(), l.shared.len() };
+            for (&w, v) |*x, y| x.* = if (most) @max(x.*, y) else @min(x.*, y);
+        }
+        return w;
     }
 
     /// KDA heads a rank takes, in units of this many heads. TF_GLM_KDA_ALIGN=8 makes every rank's KDA count a
@@ -55,12 +85,13 @@ pub const Share = struct {
 
     /// This rank's largest fraction of an axis as (part, whole): its weights are at most that much of the checkpoint.
     pub fn part(s: Share, c: *const Config) [2]u64 {
+        const w = s.widest(c); // TF_GLM_OVN_EXPERT_ROTATE: the widest expert shares any layer holds
         const axes = [_][2]u64{
             .{ s.kda.len(), c.kda_heads },
             .{ s.mla.len(), c.mla_heads },
             .{ s.dense.len(), c.dense_inter },
-            .{ s.moe.len(), c.moe_inter },
-            .{ s.shared.len(), c.shared_inter },
+            .{ w[0], c.moe_inter },
+            .{ w[1], c.shared_inter },
             .{ s.vocab.len(), c.vocab },
         };
         var best: [2]u64 = .{ 0, 1 };

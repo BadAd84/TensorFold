@@ -32,6 +32,7 @@ const hc_glue = @import("cuda_forward_glue.zig");
 const onepass_mod = @import("cuda_onepass.zig");
 const kda_chunk = @import("cuda_kda_chunk.zig");
 const slices = @import("cuda_forward_slices.zig");
+const rotlayer = @import("cuda_rotlayer.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -303,11 +304,12 @@ pub const Forward = struct {
         try glue.hcPre(f.set(), f.stream, b.x, hc.fn_w, hc.base, hc.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, c.eps, c.hc_eps, c.sinkhorn, rows, c.hidden, c.hc);
     }
 
-    fn post(f: *const Forward, r: Rank, x: u64, rows: usize) !void {
+    /// `first`: the rank whose partial the sum takes first (rotlayer.first: a rotated MoE layer's owner, else 0).
+    fn post(f: *const Forward, r: Rank, x: u64, rows: usize, first: usize) !void {
         const stamp = prof_mod.span(f.prof, f.stream, .glue);
         defer stamp.end();
         const c = &r.w.config;
-        try glue.hcPost(f.set(), f.stream, x, x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, r.w.share.world);
+        try glue.hcPost(f.set(), f.stream, x, x, r.b.gathered, r.b.post, r.b.comb, rows, c.hidden, c.hc, rotlayer.word(r.w.share.world, first));
     }
 
     /// forward._mixer: the layer's KDA or DSA block on b.normed; `li`/`di`: its index among loaded KDA / DSA layers.
@@ -466,9 +468,9 @@ pub const Forward = struct {
             for (f.ranks) |r| {
                 const l = r.w.layers[j];
                 if (fuse) {
-                    try hc_glue.fused(f, r, alt, l.ffn_hc, l.post_norm, R);
+                    try hc_glue.fused(f, r, alt, l.ffn_hc, l.post_norm, R, 0);
                 } else {
-                    try f.post(r, r.b.x, R);
+                    try f.post(r, r.b.x, R, 0);
                     try f.pre(r, l.ffn_hc, l.post_norm, R);
                 }
                 try f.ffn(r, l, R, slot(r, R));
@@ -479,9 +481,10 @@ pub const Forward = struct {
             if (pf) |p| try p.fork(f.stream, j, .n); // paced site n: the next layer's input projections across gather_b
             try f.gather(R);
             const next = fuse and j + 1 < f.ranks[0].w.layers.len; // fused: the next layer's attention-site hc_pre too
-            for (f.ranks) |r| if (next) try hc_glue.fused(f, r, alt, r.w.layers[j + 1].attn_hc, r.w.layers[j + 1].in_norm, R) else try f.post(r, hc_glue.xAt(r, alt), R);
+            for (f.ranks) |r| if (next) try hc_glue.fused(f, r, alt, r.w.layers[j + 1].attn_hc, r.w.layers[j + 1].in_norm, R, rotlayer.first(&r.w.share, j)) else try f.post(r, hc_glue.xAt(r, alt), R, rotlayer.first(&r.w.share, j));
             alt = alt != next;
             if (f.taps) |t| try t.at(f.stream, j, hc_glue.xAt(f.ranks[0], alt), 0, R);
+            if (rotlayer.capture) |cap| for (f.ranks) |r| try cap.at(f.stream, r.w.share.rank, j, hc_glue.xAt(r, alt), 0, R, c.hc * c.hidden * 2);
             if (f.prof) |p| p.mark(f.stream, .gather_b);
             switch (f.ranks[0].w.layers[j].mixer) {
                 .kda => li += 1,

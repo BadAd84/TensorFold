@@ -114,7 +114,9 @@ pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64
     const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return total;
     const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 24)) catch return total;
     const c = config.parse(a, text) catch return total;
-    const f = (shard.Share.of(&c, p.rank, p.world) catch return total).part(&c);
+    var s = shard.Share.of(&c, p.rank, p.world) catch return total;
+    s.rot = @import("cuda_rotlayer.zig").read(&c, p.world) catch return total; // TF_GLM_OVN_EXPERT_ROTATE's widest
+    const f = s.part(&c);
     return @intCast(@as(u128, total) * f[0] / f[1]);
 }
 

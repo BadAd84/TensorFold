@@ -30,12 +30,15 @@ __device__ __forceinline__ void st8(__nv_bfloat16* p, const float v[8]) {
   *reinterpret_cast<uint4*>(p) = u;
 }
 
-// The ranks' fp32 partials at i .. i + 7, rank 0 first and `rs` apart.
+// The ranks' fp32 partials at i .. i + 7, `rs` apart. `world`: the ranks in its low byte, from bit 8 the rank summed
+// first, then on in rank order modulo the ranks (TF_GLM_OVN_EXPERT_ROTATE, cuda_rotlayer.slot; 0: rank 0 first).
 __device__ __forceinline__ void ranks8(const float* g, int64_t rs, int64_t i, int world, float a[8]) {
-  ld8(g + i, a);
-  for (int k = 1; k < world; ++k) {
+  const int n = world & 255, first = world >> 8;
+  ld8(g + first * rs + i, a);
+  for (int k = 1; k < n; ++k) {
+    const int q = first + k < n ? first + k : first + k - n;
     float b[8];
-    ld8(g + k * rs + i, b);
+    ld8(g + q * rs + i, b);
     for (int j = 0; j < 8; ++j) a[j] = a[j] + b[j];
   }
 }

@@ -158,7 +158,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
 }
 
 /// A rank's B16 matmul shapes ([n, k]) whose split-K partials the buffers hold.
-fn b16Shapes(w: *const weights.Weights) [12][2]usize {
+fn b16Shapes(w: *const weights.Weights) [13][2]usize {
     const c = &w.config;
     const s = &w.share;
     const n = s.kda.len() * c.kda_dim;
@@ -166,8 +166,8 @@ fn b16Shapes(w: *const weights.Weights) [12][2]usize {
     return .{
         .{ kw, c.hidden },                   .{ n, c.kda_dim },                    .{ c.hidden, n },
         .{ c.q_lora + c.kv_lora, c.hidden }, .{ s.mla.len() * c.nope, c.q_lora },  .{ c.i_dim + c.i_heads, c.hidden },
-        .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.shared.len(), c.hidden },
-        .{ c.hidden, 2 * c.hidden }, // the MTP head's eh_proj
+        .{ c.i_heads * c.i_dim, c.q_lora },  .{ c.hidden, s.mla.len() * c.v_dim }, .{ 2 * s.widest(c)[1], c.hidden },
+        .{ c.hidden, 2 * c.hidden }, .{ 2 * s.widths(c, false)[1], c.hidden }, // MTP's eh_proj; the narrowest shared
         if (c.exl3) .{ 2 * s.dense.len(), c.hidden } else .{ c.hidden, 2 * c.hidden }, // bf16 dense layers: [gate | up]
         if (c.exl3) .{ c.hidden, s.dense.len() } else .{ c.hidden, 2 * c.hidden }, // and down
     };
@@ -259,8 +259,8 @@ pub const Buffers = struct {
         const n = LL * c.kda_dim;
         const kw = @import("cuda_kda_block.zig").rowWidth(LL); // TF_GLM_KDA_PAD
         const mw = s.dense.len();
-        const ew = if (c.exl3) try exl3.routedWidth(s.*, c.moe_inter) else s.moe.len(); // TF_GLM_OVN_X3_ROTEXPERT: the widest
-        const sh = s.shared.len();
+        const ew = if (c.exl3) try exl3.routedWidth(s.*, c) else s.widest(c)[0]; // the widest share any layer takes
+        const sh = s.widest(c)[1];
         const slots: usize = c.topk + 1;
         const pairs = rows * slots;
         const count: usize = c.experts;
@@ -275,7 +275,7 @@ pub const Buffers = struct {
         var mm: usize = 4;
         // windows under rows_from rows keep their K slices apart (a prompt's tail chunk on the prefill buffers too)
         for (b16Shapes(w)) |sh_| mm = @max(mm, b16.partBytes(@min(rows, b16.rows_from - 1), sh_[0], sh_[1]));
-        const x3: [4]usize = if (c.exl3) exl3.scratchBytes(rows, D, ew, prefill, w.exl3_shx, try exl3.Ovn.fromEnv()) else @splat(4);
+        const x3: [4]usize = if (c.exl3) try exl3.heldScratch(rows, D, s.*, c, prefill, w.exl3_shx, try exl3.Ovn.fromEnv()) else @splat(4);
         var split = false; // a KDA stack in two parts moves each part's rows through one more buffer
         for (w.layers) |l| split = split or (l.mixer == .kda and l.mixer.kda.proj == .split);
         const hist_len = if (pairs > cuda.grouped.small) (pairs + cuda.grouped.small - 1) / cuda.grouped.small * (count + 1) else 1;
