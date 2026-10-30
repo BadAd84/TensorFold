@@ -10,6 +10,7 @@ pub const image_core = @import("image_core.zig");
 pub const image = image_core.For(@import("core").picture);
 pub const glue = @import("cuda_glue.zig");
 pub const kda = @import("cuda_kda.zig");
+pub const kda_chunk = @import("cuda_kda_chunk.zig");
 pub const b16 = @import("cuda_b16.zig");
 pub const latent = @import("cuda_latent.zig");
 pub const sparse = @import("cuda_sparse.zig");
@@ -66,6 +67,7 @@ test {
     _ = image_core;
     _ = glue;
     _ = kda;
+    _ = kda_chunk;
     _ = b16;
     _ = latent;
     _ = sparse;

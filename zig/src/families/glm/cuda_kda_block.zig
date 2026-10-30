@@ -4,6 +4,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const glue = @import("cuda_glue.zig");
 const kda = @import("cuda_kda.zig");
+const kda_chunk = @import("cuda_kda_chunk.zig");
 const b16 = @import("cuda_b16.zig");
 const prof = @import("cuda_prof.zig");
 const l2pace = @import("cuda_l2pace.zig");
@@ -81,17 +82,18 @@ pub fn fill(set: glue.Set, stream: cuda.Stream, l: Layer, s: Scratch, lo: usize,
 
 /// The block up to its out_proj: the projections, the chain, and a prompt chunk's conv window commit.
 pub fn body(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool) !void {
-    return bodyProfile(set, ks, stream, l, s, x, x_stride, rows, conv_state, state_in, wide, prompt, null, null);
+    return bodyProfile(set, ks, stream, l, s, x, x_stride, rows, conv_state, state_in, wide, prompt, null, null, null);
 }
 
-pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, o_site: ?l2pace.At) !void {
+/// `o_site`: TF_GLM_OVN_L2PF_PACED's fork; `chunked`: a prompt chunk's chain on TF_GLM_OVN_KDA_CHUNKED's kernel.
+pub fn bodyProfile(set: glue.Set, ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_stride: usize, rows: usize, conv_state: u64, state_in: u64, wide: bool, prompt: bool, profile: ?*prof.Prof, o_site: ?l2pace.At, chunked: ?kda_chunk.Prompt) !void {
     var stamp = prof.span(profile, stream, .projections);
     try project(set, stream, l, s, x, x_stride, rows);
     stamp.end();
     if (o_site) |at| try at.fork(stream); // TF_GLM_OVN_L2PF_PACED: o read into L2 while the chain runs
     stamp = prof.span(profile, stream, .kda);
     defer stamp.end();
-    try chainRows(ks, stream, l, s, rows, conv_state, state_in, wide);
+    try chainRows(ks, stream, l, s, rows, conv_state, state_in, wide, chunked);
     if (prompt) try glue.convShift(set, stream, conv_state, s.p, rows, rows * l.matWidth(), l.matWidth(), 1, 3 * l.heads * kda.dk);
 }
 
@@ -148,11 +150,13 @@ fn columns(set: glue.Set, stream: cuda.Stream, src: u64, cols: usize, dst: u64, 
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast((rows * cols * 2 + 255) / 256) }, .block = .{ .x = 256 } }, stream, &a);
 }
 
-/// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state.
-pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool) !void {
+/// The chain over `rows` projected rows (s.p, s.ka, s.kg) on one sequence's conv window and recurrent state; a prompt
+/// chunk with `chunked` runs kda_chunk.cu (it writes out and state_out only: a prompt chunk keeps every row).
+pub fn chainRows(ks: *const kda.Kernels, stream: cuda.Stream, l: Layer, s: Scratch, rows: usize, conv_state: u64, state_in: u64, wide: bool, chunked: ?kda_chunk.Prompt) !void {
     const n = l.heads * kda.dk;
     const fa = 3 * n;
     const c: kda.Chain = .{ .p = s.p, .p_stride = l.matWidth(), .b_off = fa + 2 * kda.dk, .a = s.ka, .a_stride = n, .g = s.kg, .g_stride = n, .conv_state = conv_state, .conv_w = l.conv_w, .state_in = state_in, .a_log = l.a_log, .dt_bias = l.dt_bias, .norm_w = l.norm_w, .eps = l.eps, .lower = l.lower, .heads = l.heads };
+    if (chunked) |p| return kda_chunk.chain(p, stream, c, rows, s.saves.out, s.saves.state_out);
     try kda.chain(ks, stream, c, rows, s.saves, if (wide or rows >= kda.wide_rows) s.wide else null);
 }
 

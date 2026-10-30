@@ -30,6 +30,7 @@ const index_mod = @import("cuda_index.zig");
 const moe_side = @import("cuda_moe_side.zig");
 const hc_glue = @import("cuda_forward_glue.zig");
 const onepass_mod = @import("cuda_onepass.zig");
+const kda_chunk = @import("cuda_kda_chunk.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
@@ -49,6 +50,7 @@ pub const Modules = struct {
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
     pools32: bool = false, // TF_GLM_OVN_POOLS32: a split prompt indexer gathers its picks as int32
     onepass: ?onepass_mod.Kernels, // TF_GLM_OVN_SPARSE_ONEPASS: prompt rows' sparse attention in one pass (glm_onepass)
+    chunked: ?kda_chunk.Kernel, // TF_GLM_OVN_KDA_CHUNKED: prompt chunks' KDA chain in chunked (WY) form
     tiled: bool = false, // eligible bf16 linears are tiled; KDA inputs with uneven strides retain their row-major path
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     copy_rows: cuda.Function,
@@ -88,6 +90,8 @@ pub const Modules = struct {
         m.exl3 = try exl3.Kernels.load(d);
         errdefer m.exl3.unload();
         m.mm = try mm_mod.Kernels.load(m.mods[7]);
+        m.chunked = if (kda_chunk.enabled()) try kda_chunk.Kernel.load(d) else null;
+        errdefer if (m.chunked) |*x| x.unload();
         m.index = null;
         m.mla = try glue.Mla.read();
         errdefer if (m.index) |*x| x.unload();
@@ -126,6 +130,7 @@ pub const Modules = struct {
     pub fn deinit(m: *Modules) void {
         if (m.side) |*x| x.deinit();
         if (m.l2pace) |*p| p.deinit();
+        if (m.chunked) |*x| x.unload();
         if (m.index) |*x| x.unload();
         if (m.onepass) |*x| x.unload();
         m.exl3.unload();
@@ -308,7 +313,7 @@ pub const Forward = struct {
                     s.saves.b = st.save_b + li * window_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
-                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof, if (f.paced()) |p| .{ .l2 = p, .layer = li + di } else null);
+                try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof, if (f.paced()) |p| .{ .l2 = p, .layer = li + di } else null, if (b.prefill) kda_chunk.prompt(&f.m.chunked, st.pos) else null);
                 if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);
                 if (b.prefill) st.cur[li] = 1 - cur; // a prompt chunk keeps every row: the layer commits now
             },
