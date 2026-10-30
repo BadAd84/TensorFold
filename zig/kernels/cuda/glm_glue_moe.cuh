@@ -3,6 +3,7 @@
 
 #include "glm_swiglu.cuh"
 #include "glm_triton.cuh"
+#include "glm_qmm_frag.cuh"
 
 using namespace glm_triton;
 
@@ -19,9 +20,11 @@ __device__ __forceinline__ float group64(const float* q) {
 
 }  // namespace glm_moe
 
+namespace glm_moe {
+
 // glue._swiglu with BLOCK 512 (128 threads, 4 values each, 64-group sums over 16 lanes), column block blockIdx.y.
-extern "C" __global__ void __launch_bounds__(128)
-    tf_glm_swiglu_512(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+__device__ __forceinline__ void swiglu_512(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit,
+                                           int64_t w) {
   const int64_t r = blockIdx.x, d0 = blockIdx.y * 512 + threadIdx.x * 4;
   const uint2 gv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + d0);
   const uint2 uv = *reinterpret_cast<const uint2*>(gu + r * 2 * w + w + d0);
@@ -40,14 +43,39 @@ extern "C" __global__ void __launch_bounds__(128)
 }
 
 // glue._swiglu with BLOCK 64 (the TP=3 shared expert's 704): one value a thread, the warp's butterfly, then 2 warps.
-extern "C" __global__ void __launch_bounds__(64)
-    tf_glm_swiglu_64(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+__device__ __forceinline__ void swiglu_64(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit,
+                                          int64_t w) {
   __shared__ float smem[2];
   const int64_t r = blockIdx.x, d = blockIdx.y * 64 + threadIdx.x;
   const float a = glm_moe::swiglu1(bf(gu[r * 2 * w + d]), bf(gu[r * 2 * w + w + d]), limit);
   out[r * w + d] = __float2bfloat16_rn(a);
   const float g = block_sum<2>(a, smem);
   if (threadIdx.x == 0) xs[r * (w / 64) + blockIdx.y] = g;
+}
+
+}  // namespace glm_moe
+
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_swiglu_512(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+  glm_moe::swiglu_512(gu, out, xs, limit, w);
+}
+
+extern "C" __global__ void __launch_bounds__(64)
+    tf_glm_swiglu_64(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+  glm_moe::swiglu_64(gu, out, xs, limit, w);
+}
+
+// TF_GLM_OVN_PDL_EARLY: the swiglus releasing their dependent launch (the down projection's weight loads) at entry.
+extern "C" __global__ void __launch_bounds__(128)
+    tf_glm_swiglu_512_pdl(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+  qmm_frag::grid_launch();
+  glm_moe::swiglu_512(gu, out, xs, limit, w);
+}
+
+extern "C" __global__ void __launch_bounds__(64)
+    tf_glm_swiglu_64_pdl(const __nv_bfloat16* gu, __nv_bfloat16* out, float* xs, float limit, int64_t w) {
+  qmm_frag::grid_launch();
+  glm_moe::swiglu_64(gu, out, xs, limit, w);
 }
 
 // qmm._group_sums: row blockIdx.x's 64-input sums, 8 lanes a group of 8 consecutive inputs each, 16 groups a block.

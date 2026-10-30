@@ -6,7 +6,7 @@ const mm_mod = @import("cuda_mm.zig");
 const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false };
 
 /// A hidden-size norm's weight: bf16, or float32 (FP4-Local's) read as float32 by the _f32w kernels.
 pub const Norm = union(enum) { bf16: u64, f32: u64 };
@@ -62,6 +62,24 @@ pub const Kernels = struct {
     merge: cuda.Function,
     scores: cuda.Function,
     router16: ?cuda.Function, // TF_GLM_OVN_ROUTER16=<stages, 3 or 4>: 16-row router tiles for up to 16 rows (else null)
+    // TF_GLM_OVN_GLUE_FUSE (hcGlue), TF_GLM_OVN_GLUE_ROW (hcRow) and TF_GLM_OVN_PDL_EARLY's variants (Set.pdl_early)
+    hc_glue: cuda.Function,
+    hc_glue_f32w: cuda.Function,
+    hc_glue_pdl: cuda.Function,
+    hc_glue_f32w_pdl: cuda.Function,
+    hc_row: cuda.Function,
+    hc_row_f32w: cuda.Function,
+    hc_post_pdl: cuda.Function,
+    hc_partial8_pdl: cuda.Function,
+    hc_finish_pdl: cuda.Function,
+    hc_finish_f32w_pdl: cuda.Function,
+    router_tile_pdl: cuda.Function,
+    swiglu_512_pdl: cuda.Function,
+    swiglu_64_pdl: cuda.Function,
+    rmsnorm_4096_pdl: cuda.Function,
+    rmsnorm_1536_pdl: cuda.Function,
+    rmsnorm_512_pdl: cuda.Function,
+    rmsnorm_4096_f32w_pdl: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         var k: Kernels = undefined;
@@ -106,10 +124,12 @@ fn pow2(d: usize) i64 {
 
 /// glue.rmsnorm: bf16(w * bf16(x / sqrt(mean(x^2) + eps))) into `out`, with `xs` each 64 outputs' fp32 sum.
 pub fn rmsnorm(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u64, out: u64, o_stride: usize, xs: ?u64, eps: f32, rows: usize, d: usize) !void {
+    const k = set.glue;
+    const e = set.pdl_early;
     const f, const warps: u32 = switch (d) {
-        4096 => .{ set.glue.rmsnorm_4096, 8 },
-        1536 => .{ set.glue.rmsnorm_1536, 4 },
-        512 => .{ set.glue.rmsnorm_512, 4 },
+        4096 => .{ if (e) k.rmsnorm_4096_pdl else k.rmsnorm_4096, 8 },
+        1536 => .{ if (e) k.rmsnorm_1536_pdl else k.rmsnorm_1536, 4 },
+        512 => .{ if (e) k.rmsnorm_512_pdl else k.rmsnorm_512, 4 },
         else => return error.NoRmsnormWidth,
     };
     var a: cuda.Args = .{};
@@ -133,7 +153,8 @@ pub fn rmsnormBy(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, n: Norm
     if (d != 4096) return error.NoRmsnormWidth;
     var a: cuda.Args = .{};
     inline for (.{ x, i64of(x_stride), g, out, i64of(o_stride), xs orelse @as(u64, 0), eps, @as(c_int, @intFromBool(xs != null)) }) |v| a.add(v);
-    try cuda.launch.launch(set.glue.rmsnorm_4096_f32w, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
+    const f = if (set.pdl_early) set.glue.rmsnorm_4096_f32w_pdl else set.glue.rmsnorm_4096_f32w;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, stream, &a);
 }
 
 fn cdiv(a: usize, b: usize) u32 {
@@ -150,7 +171,9 @@ fn swigluBlock(w: usize) !usize {
 /// glue.swiglu: [gate | up] -> bf16(bf16(silu(min(g, L))) * clip(u, -L, L)), 64-sums in `xs`.
 pub fn swiglu(set: Set, stream: cuda.Stream, gu: u64, out: u64, xs: u64, limit: f32, rows: usize, w: usize) !void {
     const block = try swigluBlock(w);
-    const f, const threads: u32 = if (block == 512) .{ set.glue.swiglu_512, 128 } else .{ set.glue.swiglu_64, 64 };
+    const k = set.glue;
+    const e = set.pdl_early;
+    const f, const threads: u32 = if (block == 512) .{ if (e) k.swiglu_512_pdl else k.swiglu_512, 128 } else .{ if (e) k.swiglu_64_pdl else k.swiglu_64, 64 };
     var a: cuda.Args = .{};
     inline for (.{ gu, out, xs, limit, i64of(w) }) |v| a.add(v);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(w / block) }, .block = .{ .x = threads } }, stream, &a);
@@ -183,7 +206,8 @@ pub fn routerSlices(set: Set, stream: cuda.Stream, x: u64, x_stride: usize, w: u
         if (set.glue.router16) |f| if (m <= 16) { // TF_GLM_OVN_ROUTER16: 16-row tiles, each warp 8 experts
             return cuda.launch.launch(f, .{ .grid = .{ .x = 1, .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
         };
-        try cuda.launch.launch(set.glue.router_tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
+        const tile = if (set.pdl_early) set.glue.router_tile_pdl else set.glue.router_tile; // _pdl: launched dependent
+        try cuda.launch.launch(tile, .{ .grid = .{ .x = cdiv(m, 64), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 }, .pdl = set.pdl_early }, stream, &a);
     } else try cuda.launch.launch(set.glue.router_part, .{ .grid = .{ .x = cdiv(m, 16), .y = cdiv(ne, 32), .z = router_ks }, .block = .{ .x = 128 } }, stream, &a);
 }
 
@@ -232,14 +256,16 @@ pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale:
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
     // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
     if (rows < 64) {
-        try cuda.launch.launch(set.glue.hc_partial8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 } }, stream, &a);
+        const p8 = if (set.pdl_early) set.glue.hc_partial8_pdl else set.glue.hc_partial8; // _pdl: launched dependent
+        try cuda.launch.launch(p8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_early }, stream, &a);
     } else {
         a.add(i64of(rows));
         try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
     }
+    const e = set.pdl_early;
     const f, const w = switch (norm) {
-        .bf16 => |p| .{ set.glue.hc_finish, p },
-        .f32 => |p| .{ set.glue.hc_finish_f32w, p },
+        .bf16 => |p| .{ if (e) set.glue.hc_finish_pdl else set.glue.hc_finish, p },
+        .f32 => |p| .{ if (e) set.glue.hc_finish_f32w_pdl else set.glue.hc_finish_f32w, p },
     };
     var b: cuda.Args = .{};
     inline for (.{ x, part, base, scale, w, out, xs, post, comb, eps, hc_eps, @as(c_int, hc_blocks), cint(iters) }) |v| b.add(v);
@@ -251,7 +277,36 @@ pub fn hcPost(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, post: u6
     if (s != 4) return error.StreamsNotFour;
     var a: cuda.Args = .{};
     inline for (.{ x, xout, g, post, comb, i64of(rows * d), i64of(d), cint(world) }) |v| a.add(v);
-    try rows8Launch(set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
+    try rows8Launch(if (set.pdl_early) set.glue.hc_post_pdl else set.glue.hc_post, stream, &a, rows, d, .{ x, xout, g });
+}
+
+/// TF_GLM_OVN_GLUE_FUSE: hcPost from x into xout (never in place), hcPre on xout, one kernel; `count` u32 zeros a row.
+pub fn hcGlue(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, count: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize, world: usize) !void {
+    if (d != 4096 or s != 4) return error.HcShape;
+    if (rows == 0 or rows >= 64 or x == xout) return error.HcGlueWindow;
+    inline for (.{ x, xout, g }) |p| if (p % 16 != 0) return error.RowsUnaligned;
+    const k = set.glue;
+    const e = set.pdl_early;
+    const f, const w = switch (norm) {
+        .bf16 => |p| .{ if (e) k.hc_glue_pdl else k.hc_glue, p },
+        .f32 => |p| .{ if (e) k.hc_glue_f32w_pdl else k.hc_glue_f32w, p },
+    };
+    var a: cuda.Args = .{};
+    inline for (.{ x, xout, g, i64of(rows * d), cint(world), fn_w, part, count, base, scale, w, out, xs, post, comb, eps, hc_eps, cint(iters) }) |v| a.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 256 } }, stream, &a);
+}
+
+/// TF_GLM_OVN_GLUE_ROW: hcPost in place then hcPre of `rows` rows, one kernel of 4 rows a block, their bytes.
+pub fn hcRow(set: Set, stream: cuda.Stream, x: u64, g: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize, world: usize) !void {
+    if (d != 4096 or s != 4) return error.HcShape;
+    inline for (.{ x, g }) |p| if (p % 16 != 0) return error.RowsUnaligned;
+    const f, const w = switch (norm) {
+        .bf16 => |p| .{ set.glue.hc_row, p },
+        .f32 => |p| .{ set.glue.hc_row_f32w, p },
+    };
+    var a: cuda.Args = .{};
+    inline for (.{ x, g, i64of(rows * d), cint(world), fn_w, base, scale, w, out, xs, post, comb, eps, hc_eps, cint(iters), i64of(rows) }) |v| a.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = cdiv(rows, 4) }, .block = .{ .x = 256 } }, stream, &a);
 }
 
 /// glue.rank_sum: out bf16 = partials summed rank 0 first, `me`'s from `own`, others' from `peers` in rank order.

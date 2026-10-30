@@ -185,6 +185,10 @@ pub const Buffers = struct {
     mx: u64, // bf16 [rows][dims]: its stream
     part: u64, // fp32 [rows][dims]: this rank's partial rows a split exchange sends from
     seg_kda: ?*@import("cuda_kda_seg.zig").SegKda = null, // TF_GLM_OVN_SEG_KDA: a shared window's chains at once
+    x_alt: u64 = 0, // TF_GLM_OVN_GLUE_FUSE (decode buffers): the residual's second buffer, bf16 [rows][4][dims]
+    hc_count: u64 = 0, // and hcGlue's blocks counted in, u32 a row (zero between launches)
+    fuse_rows: usize = 0, // TF_GLM_OVN_GLUE_FUSE=N: the most rows a fused window takes (0: off)
+    alt: ?cuda.DeviceBuffer = null, // x_alt and hc_count's own allocation: the arena's sizes stay as they are
 
     pub fn init(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize) !Buffers {
         return make(d, w, rows, prefill, capacity, rows, null);
@@ -339,14 +343,35 @@ pub const Buffers = struct {
         if (twin) |of| {
             var t = of.*;
             t.arena = out.arena;
+            t.x_alt = 0;
+            t.alt = null; // a twin owns no fused-glue buffer (prompt buffers have none)
             inline for (@typeInfo(@TypeOf(twin_at)).@"struct".field_names) |f| @field(t, f) = @field(out, f);
             return t;
         }
+        if (!prefill) out.glueAlt(d, S * D * 2) catch |err| {
+            out.arena.buf.free();
+            return err;
+        };
         return out;
+    }
+
+    /// TF_GLM_OVN_GLUE_FUSE=N (N > 0): x_alt and hc_count for hcGlue, zeroed, in their own allocation (none when off).
+    fn glueAlt(b: *Buffers, d: *const cuda.Driver, row_bytes: usize) !void {
+        const n = try cuda.ovn.int("GLUE_FUSE", 0);
+        if (n == 0) return;
+        const at = std.mem.alignForward(usize, b.rows * row_bytes, 256);
+        var buf = try cuda.DeviceBuffer.alloc(d, at + b.rows * 4);
+        errdefer buf.free();
+        try buf.fill8(0, null);
+        b.x_alt = buf.ptr;
+        b.hc_count = buf.ptr + at;
+        b.fuse_rows = @intCast(n);
+        b.alt = buf;
     }
 
     pub fn deinit(b: *Buffers) void {
         b.arena.buf.free();
+        if (b.alt) |*x| x.free();
         b.* = undefined;
     }
 };
