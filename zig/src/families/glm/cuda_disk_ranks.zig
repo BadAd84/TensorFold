@@ -111,7 +111,7 @@ pub fn seal(e: *Engine, id: u64, w: image.Words) !void {
 const bcast_runs = 64;
 
 /// TF_GLM_OVN_DISK_BCAST, rank 0: shared bytes at `off` of its image into its lease, then every rank's by broadcast.
-pub fn share(e: *Engine, id: u64, off: u64, bytes: []const u8, prefixes: []const u64) !void {
+pub fn share(e: *Engine, id: u64, off: u64, bytes: []const u8, pre: []const u64) !void {
     try copy(e, id, off, @constCast(bytes), false);
     const x = leader(e) orelse return;
     try e.d.synchronize(); // the synchronous uploads into rank 0's lease have landed before a broadcast reads them
@@ -120,7 +120,7 @@ pub fn share(e: *Engine, id: u64, off: u64, bytes: []const u8, prefixes: []const
     var w: [6]u64 = undefined;
     const c = try copier(e, id, off + bytes.len, &segs, &w);
     var ids: [2 + 3 * bcast_runs]u32 = undefined;
-    ids[0..2].* = halves(prefixes[0]);
+    ids[0..2].* = halves(pre[0]);
     var k: usize = 0;
     const end = off + bytes.len;
     for (c.segs) |s| {
@@ -131,9 +131,9 @@ pub fn share(e: *Engine, id: u64, off: u64, bytes: []const u8, prefixes: []const
         var at = @max(off, s.img);
         const hi = @min(end, s.img + s.len);
         while (at < hi) {
-            const past = base + (at - s.img) - prefixes[0]; // lease bytes past rank 0's prefix: rank r's sit at its own
+            const past = base + (at - s.img) - pre[0]; // lease bytes past rank 0's prefix: rank r's sit at its own
             var n = hi - at;
-            for (prefixes) |q| n = @min(n, page - (past + q) % page);
+            for (pre) |q| n = @min(n, page - (past + q) % page);
             ids[2 + 3 * k ..][0..3].* = .{ halves(at)[0], halves(at)[1], @intCast(n) };
             k += 1;
             at += n;

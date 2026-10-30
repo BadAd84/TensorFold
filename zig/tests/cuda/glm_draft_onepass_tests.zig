@@ -77,7 +77,7 @@ fn shape(gpu: check.Gpu, ks: *const glm.q4.Kernels, s: cuda.Stream, n: usize, k:
         try glm.q4.matmulF32(ks, f32_tile, s, x.ptr, k, xs.ptr, q, wide.ptr, m);
         try s.synchronize();
         try wide.download(0, std.mem.sliceAsBytes(got_wide));
-        for (rounded[0 .. m * n], got_wide[0 .. m * n]) |*r, v| r.* = bf(v);
+        for (rounded[0 .. m * n], got_wide[0 .. m * n]) |*o, v| o.* = bf(v);
         try check.sameBytes("glm-draft-onepass: the fp32 tile rounded against the bf16 tile", std.mem.sliceAsBytes(rounded[0 .. m * n]), got_many[0 .. m * n * 2]);
     }
 }

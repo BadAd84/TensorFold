@@ -72,7 +72,7 @@ fn decode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, w
         .rank = try r.zeros(4),
         .hist = try r.zeros(4),
     };
-    const sz = glm.exl3.scratchBytes(rows, D, n, false, w.shx);
+    const sz = glm.exl3.scratchBytes(rows, D, n, false, w.shx, .{});
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * D * 4);
     const xd = try r.zeros(P * n * 2);

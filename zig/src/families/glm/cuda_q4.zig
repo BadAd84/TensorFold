@@ -94,22 +94,22 @@ pub const many_rows: usize = 128;
 /// qmm.matmul of a Q4 (tile 2, up to 16 rows): x bf16 (`ldx` apart), group sums xs fp32 [rows][k/64] -> out bf16.
 pub fn matmul(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     if (rows == 0 or rows > 16) return error.WindowTooWide;
-    try group(ks, ks.group, stream, x, ldx, xs, q, out, rows);
+    try launchGroup(ks, ks.group, stream, x, ldx, xs, q, out, rows);
 }
 
 /// matmul over up to many_rows rows in one launch: row tile t is matmul's launch for rows 16t.., the weights read once.
 pub fn matmulMany(ks: *const Kernels, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     if (rows == 0 or rows > many_rows) return error.WindowTooWide;
-    try group(ks, ks.group, stream, x, ldx, xs, q, out, rows);
+    try launchGroup(ks, ks.group, stream, x, ldx, xs, q, out, rows);
 }
 
 /// matmulMany with fp32 out (`f` from loadF32): the same K order a row, no bf16 rounding of the result.
 pub fn matmulF32(ks: *const Kernels, f: cuda.Function, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     if (rows == 0 or rows > many_rows) return error.WindowTooWide;
-    try group(ks, f, stream, x, ldx, xs, q, out, rows);
+    try launchGroup(ks, f, stream, x, ldx, xs, q, out, rows);
 }
 
-fn group(ks: *const Kernels, f: cuda.Function, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
+fn launchGroup(ks: *const Kernels, f: cuda.Function, stream: cuda.Stream, x: u64, ldx: usize, xs: u64, q: Q4, out: u64, rows: usize) !void {
     const sk = splitK(q.n, q.k);
     const tiles = (q.n + 63) / 64;
     var parts: Parts = std.mem.zeroes(Parts);

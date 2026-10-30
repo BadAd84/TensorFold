@@ -47,10 +47,10 @@ test "fixed K prompt experiment uses the same shape split across bucket, offset 
 
 fn ovnKernels() mm.Kernels {
     var k = kernels;
-    k.ovn.wide = [_]cuda.Function{.{ .id = 2000 }} ** 4;
-    k.ovn.cluster = [_][3]cuda.Function{.{ .{ .id = 3016 }, .{ .id = 3032 }, .{ .id = 3064 } }} ** 4;
+    k.ovn.wide = @splat(.{ .id = 2000 });
+    k.ovn.cluster = @splat(.{ .{ .id = 3016 }, .{ .id = 3032 }, .{ .id = 3064 } });
     k.ovn.cluster_from = 32 << 20;
-    k.ovn.dectile = [_]cuda.Function{.{ .id = 4000 }} ** 4;
+    k.ovn.dectile = @splat(.{ .id = 4000 });
     k.ovn.dectile_below = 96;
     k.ovn.swiglu = .{ .id = 5000 };
     return k;

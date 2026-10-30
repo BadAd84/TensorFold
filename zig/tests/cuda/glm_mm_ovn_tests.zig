@@ -100,11 +100,11 @@ fn compare(r: *Rig, what: []const u8, on: *const glm.mm.Kernels, w: glm.mm.Tiled
     defer a.free();
     var b = try cuda.DeviceBuffer.alloc(r.gpu.d, a.len);
     defer b.free();
-    for ([_]bool{ false, true }) |wide| {
+    for ([_]bool{ false, true }) |wd| {
         try a.fill8(marker, r.s.handle);
         try b.fill8(marker, r.s.handle);
-        try glm.mm.matmul(&r.mk, r.s, x.ptr, stride, w, a.ptr, part.ptr, rows, wide, one);
-        try glm.mm.matmul(on, r.s, x.ptr, stride, w, b.ptr, part.ptr, rows, wide, one);
+        try glm.mm.matmul(&r.mk, r.s, x.ptr, stride, w, a.ptr, part.ptr, rows, wd, one);
+        try glm.mm.matmul(on, r.s, x.ptr, stride, w, b.ptr, part.ptr, rows, wd, one);
         try same(r, what, b, a);
     }
 }

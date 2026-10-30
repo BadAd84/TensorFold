@@ -40,9 +40,9 @@ pub fn select(dr: *const df.Drafter, i: usize, M: usize, q: df.Req) void {
             }
         }
         if (n == 0) { // no candidate (cannot happen with a whole vocabulary): the anchor repeated, chance 0
-            for (t - 1..df.BLOCK - 1) |k| {
-                out[k] = @intCast(prev);
-                if (q.probs) |p| p[k] = 0;
+            for (t - 1..df.BLOCK - 1) |slot| {
+                out[slot] = @intCast(prev);
+                if (q.probs) |p| p[slot] = 0;
             }
             return;
         }
