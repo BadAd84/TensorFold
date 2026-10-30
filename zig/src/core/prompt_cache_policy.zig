@@ -2,6 +2,7 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 
+/// The entry to free first: a superseded one, oldest; else the oldest (none while `spares_only`: a latest state stays).
 pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born: u32) ?usize {
     var best: ?usize = null;
     var oldest: ?usize = null;
@@ -17,7 +18,7 @@ pub fn victimBut(s: *const pc.Store, skip: ?*pc.Entry, prompt: []const u32, born
         const now = born > e.born and prompt.len > e.tokens.len and on; // a longer request's tokens extend it
         if ((now or extended(s, e)) and (best == null or e.used < s.entries.items[best.?].used)) best = i;
     }
-    return best orelse oldest;
+    return best orelse if (s.spares_only) null else oldest;
 }
 
 /// Only live continuations make a prefix a branch point or a superseded state.

@@ -55,7 +55,16 @@ pub const Job = struct {
         const job: *Job = @ptrCast(@alignCast(ptr));
         job.reached = @max(job.reached, at); // a request waiting for this cut goes on, whether the store keeps it or not
         job.reported(); // before a keep can evict the entry the pass restored
-        if (job.host.cache) |store| _ = store.keepBorn(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+        if (job.host.cache) |store| {
+            store.spares_only = job.spares();
+            defer store.spares_only = false;
+            _ = store.keepBorn(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+        }
+    }
+
+    /// A warm pass on a `warm_spares` host: its lookup and keeps evict no conversation's latest state.
+    pub fn spares(job: *const Job) bool {
+        return job.request.background and job.host.warm_spares;
     }
 
     /// Report a restored prefix or its failed copy; an untouched prefix remains kept.

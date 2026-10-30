@@ -324,7 +324,7 @@ test "a finished warm pass keeps its states with its request's length: the histo
 }
 
 /// Warm-pass chunks run while another request's prompt still fills (a stepped backend), the pass sent during its first.
-fn warmBesideFill(alone: bool) !usize {
+fn warmBesideFill(quiet: u64) !usize {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
     defer cfg.deinit(gpa);
@@ -334,8 +334,7 @@ fn warmBesideFill(alone: bool) !usize {
     var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock());
     defer core.deinit();
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
-    host.warm_quiet = 1; // a filling prompt never wakes the wait: it times out at once unless warm_alone ends it first
-    host.warm_alone = alone;
+    host.warm_quiet = quiet; // 0: qwen27, qwen4 and Flash Next's; else a filling prompt never wakes the wait
     try host.start();
     defer host.stop();
     const prompt = [_]u32{ 2, 7, 1, 8 };
@@ -368,12 +367,109 @@ fn warmBesideFill(alone: bool) !usize {
     try host.engine().submit(1, &request, .{ .ctx = &real, .event = Box.event });
     try std.testing.expectEqual(Reason.length, real.wait());
     try std.testing.expectEqual(@as(usize, 4), real.tokens);
-    const warm_end = warm.wait();
-    if (alone) try std.testing.expectEqual(Reason.cancelled, warm_end); // dropped before it touched the backend
+    try std.testing.expectEqual(Reason.cancelled, warm.wait()); // dropped before it touched the backend
     return arrival.beside;
 }
 
-test "warm_alone: a warm pass sent while a prompt fills is dropped untouched; without it the pass runs inside that fill" {
-    try std.testing.expectEqual(@as(usize, 0), try warmBesideFill(true));
-    try std.testing.expect(try warmBesideFill(false) > 0); // the gap warm_alone closes (GLM's stepped prompts)
+test "a warm pass sent while another prompt fills by steps is dropped untouched, with or without a quiet wait" {
+    try std.testing.expectEqual(@as(usize, 0), try warmBesideFill(0));
+    try std.testing.expectEqual(@as(usize, 0), try warmBesideFill(1));
+}
+
+test "a warm pass taken into a batch behind real prompts is dropped untouched; they run" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 3 };
+    defer target.deinit();
+    var chunks: WarmChunks = .{};
+    target.prefill_hook = WarmChunks.hook;
+    target.prefill_hook_ctx = &chunks;
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.stepped(), clock.clock()); // short prompts batch (many_rows 8)
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3, .warm_turns = true });
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var boxes: [3]Box = @splat(.{});
+    const requests = [3]Request{ .{ .prompt = &prompt, .max_tokens = 4 }, .{ .prompt = &prompt, .max_tokens = 4 }, .{ .prompt = &prompt, .max_tokens = 0, .background = true } };
+    for (&requests, &boxes, 0..) |*r, *b, i| try host.engine().submit(i + 1, r, .{ .ctx = b, .event = Box.event }); // queued before the thread
+    try host.start();
+    defer host.stop();
+    for (boxes[0..2]) |*b| try std.testing.expectEqual(Reason.length, b.wait());
+    try std.testing.expectEqual(Reason.cancelled, boxes[2].wait());
+    try std.testing.expectEqual(@as(usize, 0), chunks.n.load(.monotonic)); // it never ran ahead of the batch
+}
+
+/// Conversation A's latest state, then B's reply pass and a request for C on a store with room for one state.
+fn otherLatest(spares: bool) !struct { a_after_pass: bool, b_kept: bool, a_after_request: bool, c_kept: bool, flag: bool } {
+    const gpa = std.testing.allocator;
+    const pc = api.prompt_cache;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    const Snaps = struct {
+        fn bytes(_: *anyopaque, at: u32) u64 {
+            return 64 + 4 * @as(u64, at);
+        }
+        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
+            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+            return f.save(@ptrCast(@alignCast(owner.?)), at);
+        }
+        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
+            return error.BackendRestores;
+        }
+        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
+            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+            f.drop(saved);
+        }
+    };
+    // GLM's rules (a token of lookahead, warm .waits); 150 bytes: an 8-row state (96) leaves no room for a 9-row (100)
+    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .lookahead = 1, .warm = .waits, .min_prompt = 0, .min_gap = 4 }, 150);
+    defer store.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .warm_turns = true });
+    host.cache = &store;
+    host.warm_spares = spares;
+    try host.start();
+    defer host.stop();
+    const a = [_]u32{ 100, 101, 102, 103, 104, 105, 106, 107, 108, 109 };
+    const b = [_]u32{ 200, 201, 202, 203, 204, 205, 206, 207, 208, 209 };
+    const c = [_]u32{ 300, 301, 302, 303, 304, 305, 306, 307, 308, 309 };
+    const short = [_]u32{7}; // a pass with no mark: it looks up, keeps nothing and ends
+    const Has = struct {
+        fn at(st: *pc.Store, h: *LaneHost, p: []const u32, row: u32) bool {
+            h.lock(); // the engine thread is idle between these requests: the store holds still
+            defer h.unlock();
+            for (st.entries.items) |e| if (!e.expired and e.at == row and std.mem.eql(u32, e.tokens, p[0 .. row + 1])) return true;
+            return false;
+        }
+    };
+    const e = host.engine();
+    const requests = [4]Request{
+        .{ .prompt = &a, .max_tokens = 2, .history_len = 8 }, // A's turn: its latest state at its history
+        .{ .prompt = &b, .max_tokens = 0, .background = true, .history_len = b.len, .born = b.len }, // B's reply pass
+        .{ .prompt = &short, .max_tokens = 0, .background = true, .history_len = 1, .born = 1 },
+        .{ .prompt = &c, .max_tokens = 2, .history_len = 8 }, // C's turn: a request
+    };
+    var boxes: [4]Box = @splat(.{});
+    var flag = false; // the store's guard left set after a pass ended, where a later caller's eviction would see it
+    var seen: [4]struct { a: bool, b: bool, c: bool } = undefined;
+    for (&requests, &boxes, &seen, 0..) |*r, *x, *got, i| {
+        try e.submit(i + 1, r, .{ .ctx = x, .event = Box.event });
+        _ = x.wait();
+        flag = flag or store.spares_only;
+        got.* = .{ .a = Has.at(&store, &host, &a, 8), .b = Has.at(&store, &host, &b, 9), .c = Has.at(&store, &host, &c, 8) };
+    }
+    return .{ .a_after_pass = seen[1].a, .b_kept = seen[1].b, .a_after_request = seen[3].a, .c_kept = seen[3].c, .flag = flag };
+}
+
+test "warm_spares: a reply pass evicts no other conversation's latest state and keeps nothing; a request still evicts" {
+    const on = try otherLatest(true);
+    try std.testing.expect(on.a_after_pass and !on.b_kept and !on.flag);
+    try std.testing.expect(!on.a_after_request and on.c_kept); // a real request's keep evicts as before
+    const off = try otherLatest(false); // the guard off (other families): the pass's keep pushes A's latest state out
+    try std.testing.expect(!off.a_after_pass and off.b_kept);
 }

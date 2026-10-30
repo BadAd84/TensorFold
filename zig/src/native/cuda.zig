@@ -136,7 +136,7 @@ pub const Host = struct {
         h.host.health = @import("cuda_readiness.zig").source(h);
         h.host.cache = h.store;
         h.host.warm_quiet = if (info.warm_turns) snaps.warmQuiet(F) orelse 0 else 0;
-        h.host.warm_alone = info.warm_turns and @hasDecl(F, "warm_alone"); // its pass waits for no admitted prompt either
+        h.host.warm_spares = info.warm_turns and @hasDecl(F, "warm_spares"); // its pass evicts no conversation's latest state
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -547,7 +547,7 @@ test "family readiness reaches production lane admission without binding CUDA" {
     try @import("cuda_health_test.zig").check(Host, Host.readiness, Host.serve);
 }
 
-test "a family's warm wait and warm_alone reach the lane host only with warm turns on" {
+test "a family's warm wait and warm_spares reach the lane host only with warm turns on" {
     try @import("cuda_warm_serve_test.zig").check(Host, Host.serve);
 }
 
