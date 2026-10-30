@@ -56,7 +56,19 @@ pub const Experts = struct {
     svh_d: u64,
     k2: u64, // independent per-expert projection widths in the common module
     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
+    gb: u64 = 0, // the gate trellis of every expert back to back (gt's pointers are gb + e * one expert's bytes)
+    ub: u64 = 0,
+    db: u64 = 0,
+    ovn: cuda.exl3_experts.Ovn = .{}, // the TF_GLM_OVN_X3_* decode variants, read once at load
 };
+
+/// TF_GLM_OVN_X3_NC (1, 2 or w), TF_GLM_OVN_X3_FUSEDOWN and TF_GLM_OVN_X3_XROW: the decode variants (unset: none).
+fn ovnKnobs() !cuda.exl3_experts.Ovn {
+    const nc = cuda.ovn.text("X3_NC") orelse "0";
+    const eql = std.mem.eql;
+    const loads: cuda.exl3_experts.Ovn.Loads = if (eql(u8, nc, "0")) .off else if (eql(u8, nc, "1")) .nc1 else if (eql(u8, nc, "2")) .nc2 else if (eql(u8, nc, "w")) .word else return error.BadOvnKnob;
+    return .{ .loads = loads, .fuse_down = cuda.ovn.on("X3_FUSEDOWN"), .xrow = cuda.ovn.on("X3_XROW") };
+}
 
 const tile = 128; // a 16 x 16 tile's bytes at 4 bits
 
@@ -73,7 +85,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
         .{ .k = inter, .n = dims, .by_cols = false },
     };
     var first_suh: ?[]const u8 = null;
-    inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }) |m, proj, tw, su, sv| {
+    inline for (mats, .{ "gate_proj", "up_proj", "down_proj" }, .{ "gt", "ut", "dt" }, .{ "gb", "ub", "db" }, .{ "suh_g", "suh_u", "suh_d" }, .{ "svh_g", "svh_u", "svh_d" }) |m, proj, tw, tb, su, sv| {
         const kt = (if (m.by_cols) m.k else width) / 16; // the rank's tiles
         const nt = (if (m.by_cols) width else m.n) / 16;
         for (0..count) |e| {
@@ -89,6 +101,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
             } else try L.host.appendSlice(L.gpa, t.bytes[(cut.lo / 16) * nt * tile ..][0 .. kt * nt * tile]); // its tile rows
         }
         const base = try L.put("layers.{d}.moe.exl3." ++ tw, .{i});
+        @field(out, tb) = base;
         for (0..count) |e| {
             const ptr = base + e * kt * nt * tile;
             try L.host.appendSlice(L.gpa, std.mem.asBytes(&ptr));
@@ -118,6 +131,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
         try L.host.appendSlice(L.gpa, std.mem.asBytes(&bits));
     }
     out.k2 = try L.put("layers.{d}.moe.exl3.k2", .{i});
+    out.ovn = try ovnKnobs();
     return out;
 }
 
@@ -130,7 +144,7 @@ pub const top_k = 8;
 /// (cuda_state.prefill_rows) runs as one call, where two calls of half a chunk would read every expert twice.
 pub const chunk_rows = @import("cuda_state.zig").prefill_rows;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx, .gate_base = w.gb, .up_base = w.ub, .down_base = w.db };
 }
 fn shape(dims: usize, width: usize) common.Layer {
     const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
@@ -164,6 +178,10 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     var at: usize = 0;
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
+        if (!prompt and w.ovn.any()) {
+            try decodeOvn(k, stream, l, w.ovn, sc.picks, arena, cap, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, ey + at * slots * dims * 4);
+            continue;
+        }
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
         const output = if (fused) blk: {
             const scratch = try common.prompt.scratch(arena, l, cap, top_k);
@@ -176,6 +194,23 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
         };
         try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, output, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
     }
+}
+
+/// A decode window's routed experts through the TF_GLM_OVN_X3_* variants: ey's routed slot rows get the same bytes.
+fn decodeOvn(k: *const Kernels, stream: cuda.Stream, l: common.Layer, o: common.Ovn, compact: u64, arena: u64, cap: usize, x: u64, x_stride: usize, picks: u64, n: usize, ey: u64) !void {
+    const slots = top_k + 1;
+    const d = l.dims;
+    // the fused layout (slots 9, no y) fits inside the plain one this arena was sized for
+    if (o.fuse_down and common.fusable(l) and (try common.fusedBytes(l, cap, slots)) <= (try common.scratchBytes(l, cap, top_k))) {
+        const scratch = try common.fusedScratch(arena, l, cap, slots);
+        return k.runWith(stream, l, x, x_stride, .bf16, picks, 0, n, 0, scratch, o, ey);
+    }
+    var plain = o;
+    plain.fuse_down = false;
+    try copyRows(stream, compact, top_k * 4, picks, slots * 4, top_k * 4, n, "EXL3 compact route rows");
+    const scratch = try common.scratch(arena, l, cap, top_k);
+    try k.runWith(stream, l, x, x_stride, .bf16, compact, 0, n, 0, scratch, plain, 0);
+    try copyRows(stream, ey, slots * d * 4, scratch.y, top_k * d * 4, top_k * d * 4, n, "EXL3 routed output slots");
 }
 
 test "EXL3 admission: Mia-AiLab's block passes; other widths and codebooks are refused by name" {

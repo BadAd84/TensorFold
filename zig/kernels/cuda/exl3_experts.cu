@@ -23,6 +23,12 @@ struct GroupedArgs {
     int k, n, p, sk, maxm, slots, nexp_max, mats, ns, standard, skip, ord;
 };
 
+}  // namespace tf_exl3
+
+#include "exl3_ovn.cuh"
+
+namespace tf_exl3 {
+
 // One warp's k tiles [kt0, kt0 + nkt) of an expert matrix into acc: per-lane loads and the shared decode (same bits).
 template <int CB, int K2, int NT>
 __device__ __forceinline__ void warp_tiles(const uint32_t* T, int ntiles, int kt0, int nkt, int nt0, const half* x0,
@@ -88,8 +94,9 @@ __device__ __forceinline__ void warp_tiles_pipe(const uint32_t* T, int ntiles, i
 }
 
 // Program (expert u, n block, split, member tile): 16 members times W_q over the split's K range, summed in warp order.
-template <int CB, int NT, int W, bool PIPE = false>
-__device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz) {
+// ONEW: warp_tiles_w (4-bit only); OVN: the TF_GLM_OVN_X3_* tail `ot` (row inputs, the fused down epilogue).
+template <int CB, int NT, int W, bool PIPE = false, bool ONEW = false, bool OVN = false>
+__device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nblock, int zz, const OvnTail ot = OvnTail{}) {
     if (u >= a.ucount[0]) return;
     const int MT = (a.maxm + 15) / 16;
     const int mtile = zz % MT;
@@ -115,8 +122,8 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     __syncthreads();
     if (rows_sh[0] < 0) return; // members come first, so this tile is empty
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
-    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * a.k + 2 * t;
-    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * a.k + 2 * t;
+    const half* x0 = X + (size_t)(r0 < 0 ? 0 : (OVN && ot.xrow ? r0 / a.slots : r0)) * a.k + 2 * t;
+    const half* x1 = X + (size_t)(r1 < 0 ? 0 : (OVN && ot.xrow ? r1 / a.slots : r1)) * a.k + 2 * t;
     const int per_warp = (a.k >> 4) / a.sk / W;
     const int kt0 = split * (per_warp * W) + warp * per_warp;
     const int nt0 = nblock * NT;
@@ -130,6 +137,10 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
             for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
 
     __shared__ __align__(16) float red[W][16][NT * 16];
+    if constexpr (ONEW) {
+        if (k2 != 8) __trap();
+        warp_tiles_w<CB, NT>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0, lane, acc);
+    } else
     switch (k2) {
 #define TF_EXL3X_CASE(K2_)                                                                                   \
     case K2_:                                                                                                \
@@ -166,6 +177,12 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
             red[warp][g + 8][col + 1] = acc[i][h][3];
         }
     __syncthreads();
+    if constexpr (OVN) {
+        if (ot.fuse) {
+            fused_down<NT, W>(red, rows_sh, e, nt0, a.n, ot.svh, ot.y, warp, lane);
+            return;
+        }
+    }
     for (int idx = threadIdx.x; idx < 16 * NT * 16; idx += W * 32) {
         const int row = idx / (NT * 16), col = idx % (NT * 16);
         const int r = rows_sh[row];
@@ -198,6 +215,14 @@ extern "C" __global__ void tf_exl3_grouped_2(tf_exl3::GroupedArgs a) {  // mul1,
 extern "C" __global__ void tf_exl3_grouped_p0(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<0, 8, 4, true>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z); }
 extern "C" __global__ void tf_exl3_grouped_p1(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<1, 8, 4, true>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z); }
 extern "C" __global__ void tf_exl3_grouped_p2(tf_exl3::GroupedArgs a) { tf_exl3::grouped_body<2, 8, 4, true>(a, a.ord ? blockIdx.y : blockIdx.x, a.ord ? blockIdx.x : blockIdx.y, blockIdx.z); }
+
+// TF_GLM_OVN_X3_*: the mcg walker with the row inputs and fused down epilogue, its one-word form, the 16-byte loads.
+#define TF_EXL3_OVN_BLOCKS o.g.ord ? blockIdx.y : blockIdx.x, o.g.ord ? blockIdx.x : blockIdx.y, blockIdx.z
+extern "C" __global__ void tf_exl3_ovn_walk(tf_exl3::OvnArgs o) { tf_exl3::grouped_body<1, 8, 4, false, false, true>(o.g, TF_EXL3_OVN_BLOCKS, o.t); }
+extern "C" __global__ void tf_exl3_ovn_walkw(tf_exl3::OvnArgs o) { tf_exl3::grouped_body<1, 8, 4, false, true, true>(o.g, TF_EXL3_OVN_BLOCKS, o.t); }
+extern "C" __global__ void tf_exl3_ovn_nc1(tf_exl3::OvnArgs o) { tf_exl3::nc_body<1>(o, TF_EXL3_OVN_BLOCKS); }
+extern "C" __global__ void tf_exl3_ovn_nc2(tf_exl3::OvnArgs o) { tf_exl3::nc_body<2>(o, TF_EXL3_OVN_BLOCKS); }
+#undef TF_EXL3_OVN_BLOCKS
 
 namespace tf_exl3 {
 
@@ -298,6 +323,28 @@ extern "C" __global__ void tf_exl3_experts_rot_in(const RotInArgs a) {
     }
     fwht128(v, lane);
     half* o = (mat ? a.out1 : a.out0) + (size_t)p * a.k + blk * 128 + 4 * lane;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+// tf_exl3_experts_rot_in once a row (TF_GLM_OVN_X3_XROW, every expert's gate and up suh equal): program (row, block).
+extern "C" __global__ void tf_exl3_ovn_rot_rows(const RotInArgs a) {
+    const int row = blockIdx.x, blk = blockIdx.y, mat = blockIdx.z;
+    const int lane = threadIdx.x;
+    const half* suh = (mat ? a.suh1 : a.suh0) + blk * 128 + 4 * lane;
+    const uint16_t* xr = reinterpret_cast<const uint16_t*>(a.x) + (size_t)row * a.x_stride + blk * 128 + 4 * lane;
+    float v[4];
+    if (a.x_dtype == 1) {
+        const __nv_bfloat16* xv = reinterpret_cast<const __nv_bfloat16*>(xr);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = __bfloat162float(xv[j]) * __half2float(suh[j]);
+    } else {
+        const half* xv = reinterpret_cast<const half*>(xr);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = __half2float(xv[j]) * __half2float(suh[j]);
+    }
+    fwht128(v, lane);
+    half* o = (mat ? a.out1 : a.out0) + (size_t)row * a.k + blk * 128 + 4 * lane;
 #pragma unroll
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
