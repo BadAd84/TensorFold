@@ -20,9 +20,9 @@ pub const Mla = struct {
         return .{ .fuse_rows = if (fuse == 1) @import("cuda_latent.zig").prompt_rows else fuse, .skip = fuse != 0, .vec = cuda.ovn.on("ABSORB_VEC") };
     }
 
-    /// Whether any TF_GLM_OVN knob whose kernels sit in glm_glue is set (MLA_FUSEMERGE, ABSORB_VEC, KVB8).
+    /// Whether a TF_GLM_OVN knob whose kernels sit in glm_glue is set (MLA_FUSEMERGE, ABSORB_VEC, KVB8, DECODE_SHARD).
     pub fn wanted() bool {
-        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8");
+        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD");
     }
 };
 
@@ -110,6 +110,8 @@ pub const Kernels = struct {
     expand_v_vec: cuda.Function,
     absorb_q8: cuda.Function,
     expand_v8: cuda.Function,
+    index_shard_pick: cuda.Function, // TF_GLM_OVN_DECODE_SHARD (glm_glue_shard.cuh): a rank's share, then the merge
+    index_shard_merge: cuda.Function,
 
     pub fn load(m: cuda.Module) !Kernels {
         return loadOvn(m, Mla.wanted());

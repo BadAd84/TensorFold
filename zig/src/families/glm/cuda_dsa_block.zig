@@ -8,6 +8,7 @@ const latent = @import("cuda_latent.zig");
 const sparse = @import("cuda_sparse.zig");
 const onepass = @import("cuda_onepass.zig");
 const prof = @import("cuda_prof.zig");
+pub const index_shard = @import("cuda_index_shard.zig");
 
 /// A prompt chunk's rows one dense latent attention call takes (geometry.MLA_PROMPT_ATT_ROWS).
 pub const prompt_att_rows = 512;
@@ -73,8 +74,9 @@ pub const Scratch = struct {
     at: u64, // an i32: a prompt block's first position (pos + its first row)
 };
 
-/// The kernels: the captured Triton set and glm_ops (the token lists and position offsets).
-pub const Kernels = struct { set: glue.Set, ops: cuda.Module, prof: ?*prof.Prof = null, split: ?sparse.Split = null };
+/// The kernels: the captured Triton set and glm_ops (the token lists and position offsets); `shard`: a decode window's
+/// indexer pools across the ranks (TF_GLM_OVN_DECODE_SHARD, index_shard.of).
+pub const Kernels = struct { set: glue.Set, ops: cuda.Module, prof: ?*prof.Prof = null, split: ?sparse.Split = null, shard: ?index_shard.Shard = null };
 
 /// forward.dsa_block (latent path) of `rows` rows at pos to an fp32 partial; `nch`: 512-key chunks, `part_rows`: block.
 pub fn block(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, x: u64, x_stride: usize, rows: usize, pos: u64, host_pos: usize, nch: usize, part_rows: usize, out: u64) !void {
@@ -175,7 +177,8 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         stamp.end();
     }
     if (sparseRows(l, host_pos, rows)) {
-        try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
+        const sharded = if (k.shard) |x| index_shard.takes(x, host_pos, rows) else false; // the same on every rank
+        if (sharded) try index_shard.select(set, k.ops, stream, k.shard.?, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.prof) else try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
         stamp = prof.span(k.prof, stream, .mla);
         defer stamp.end();
         // TF_GLM_OVN_SPARSE_ONEPASS: prompt rows in one pass a row (production's kernel and bits), no partials or merge

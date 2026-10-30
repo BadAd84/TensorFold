@@ -15,6 +15,7 @@ pub const b16 = @import("cuda_b16.zig");
 pub const latent = @import("cuda_latent.zig");
 pub const sparse = @import("cuda_sparse.zig");
 pub const index = @import("cuda_index.zig");
+pub const index_shard = @import("cuda_index_shard.zig");
 pub const onepass = @import("cuda_onepass.zig");
 pub const moe = @import("cuda_moe.zig");
 pub const kda_block = @import("cuda_kda_block.zig");
@@ -72,6 +73,7 @@ test {
     _ = latent;
     _ = sparse;
     _ = index;
+    _ = index_shard;
     _ = onepass;
     _ = moe;
     _ = kda_block;

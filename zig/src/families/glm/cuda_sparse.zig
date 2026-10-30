@@ -55,7 +55,8 @@ pub fn headScale(heads: usize) f32 {
 }
 
 /// The scratch of one selectTokens: scores fp32 [min(rows, 512)][np], and with np past select_list the list rows
-/// (ls, li; ls at least ovnListBytes: TF_GLM_OVN_DECODE_INDEX's split tables, TF_GLM_OVN_POOLS32's int32 pools).
+/// (ls, li; ls at least ovnListBytes: TF_GLM_OVN_DECODE_INDEX's split tables, TF_GLM_OVN_POOLS32's int32 pools,
+/// TF_GLM_OVN_DECODE_SHARD's gathered pairs).
 pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64 };
 
 /// The bytes the TF_GLM_OVN_ knobs need at Scratch.ls (0 with them off): `seg` the most rows one selectTokens
@@ -64,7 +65,8 @@ pub fn ovnListBytes(rows: usize, seg: usize, prefill: bool, world: usize, np_max
     const index = @import("cuda_index.zig");
     const sr = try index.splitRows();
     const tables = if (sr > 0) index.splitBytes(@min(seg, sr - 1), np_max) else 0;
-    return @max(tables, if (prefill and cuda.ovn.on("POOLS32")) (rows + world) * topk_pools * 4 else 0);
+    const pools32 = if (prefill and cuda.ovn.on("POOLS32")) (rows + world) * topk_pools * 4 else 0;
+    return @max(tables, pools32, try @import("cuda_index_shard.zig").listBytes(rows, prefill, world));
 }
 
 /// A prompt chunk's indexer rows split across the ranks (TF_GLM_INDEX_SPLIT): a block each, the picks all-gathered;
