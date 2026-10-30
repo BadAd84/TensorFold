@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const types = @import("cuda_engine_types.zig");
 pub const pages = @import("cuda_snapshot_pages.zig");
 pub const layout = @import("cuda_snapshot_layout.zig");
+const ring_bytes = @import("dflash.zig").ring_bytes;
 
 pub const Setup = struct { ptr: *anyopaque, run: *const fn (*anyopaque, u64) anyerror!void };
 
@@ -24,12 +25,63 @@ pub fn agree(e: anytype, budget: u64) !void {
     if (try e.shared(if (failed != null) 1 else 0) > 0) return failed orelse error.PeerSnapshotCache;
 }
 
+/// A kept state's pool bytes at `at`, KEEPWIN's drafter ring on whole pages after the state's.
 pub fn bytes(e: anytype, at: usize) u64 {
+    return planBytes(e, at) +| windowBytes(e);
+}
+
+fn planBytes(e: anytype, at: usize) u64 {
     // the head's rows as keepAs plans them: none while it absorbs nothing (DFlash2 drafting), so mtp_len stays 0
     const head: ?usize = if (!e.mtp) null else if (!e.head) 0 else @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64));
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
     const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
     return pages.rounded(n) catch std.math.maxInt(u64);
+}
+
+/// TF_GLM_OVN_DRAFT_KEEPWIN: the bound sequence's drafter ring and its first row a state kept here carries.
+const Window = struct { ring: u64, from: i64 };
+
+fn window(e: anytype) ?Window {
+    if (comptime !@hasField(@TypeOf(e.*), "drafter")) {
+        return null;
+    } else {
+        const dr = e.drafter orelse return null;
+        const w = dr.window(e.slot, e.cur.st.pos) orelse return null;
+        return .{ .ring = w.ring, .from = w.from };
+    }
+}
+
+/// KEEPWIN's share of a kept state's bytes: the drafter's whole ring (0 without the knob or a drafter).
+fn windowBytes(e: anytype) u64 {
+    if (comptime !@hasField(@TypeOf(e.*), "drafter")) {
+        return 0;
+    } else {
+        const dr = e.drafter orelse return 0;
+        return if (dr.knobs.keepwin) ring_bytes else 0;
+    }
+}
+
+/// `len` bytes at `live` into a lease's pages from byte `off` on (`into`), or back out of them.
+fn moveFlat(pool: *const pages.Pool, stream: cuda.Stream, lease: *const pages.Lease, off: usize, live: u64, len: usize, into: bool) !void {
+    const arena = pool.arena orelse return error.NoSnapshotRoom;
+    if (off + len > lease.ids.items.len * pages.page) return error.SnapshotSize;
+    var done: usize = 0;
+    while (done < len) {
+        const at = off + done;
+        const held = arena.ptr + @as(u64, lease.ids.items[at / pages.page]) * pages.page + at % pages.page;
+        const n = @min(len - done, pages.page - at % pages.page);
+        try arena.d.check(arena.d.api.cuMemcpyDtoDAsync_v2(if (into) held else live + done, if (into) live + done else held, n, stream.handle), "cuMemcpyDtoDAsync");
+        done += n;
+    }
+}
+
+/// The drafter at a resume: its kept window back in the slot's ring (KEEPWIN), else a fresh start at `r.at`.
+pub fn resumeDrafter(e: anytype, dr: anytype, r: types.Resume) !void {
+    const s = e.snaps.getPtr(r.id) orelse return error.NoKeptState;
+    const from = s.win_from orelse return dr.restart(e.slot, r.at); // the rows before it were never tapped
+    const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
+    try moveFlat(pool, e.stream, &s.lease, try pages.rounded(s.len), try dr.ringOf(e.slot), ring_bytes, false);
+    try dr.restartKept(e.slot, from, r.at);
 }
 
 pub fn keep(e: anytype) !u64 {
@@ -47,7 +99,9 @@ pub fn keepAs(e: anytype, id: u64) !void {
         return error.NotAtMark;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null);
-    var lease = try pool.take(plan.len);
+    const win = window(e);
+    const state_len = if (win != null) try pages.rounded(plan.len) else plan.len; // the ring starts on a page
+    var lease = try pool.take(state_len + @as(usize, if (win != null) ring_bytes else 0));
     errdefer {
         cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot copy did not drain");
         pool.give(&lease);
@@ -55,15 +109,16 @@ pub fn keepAs(e: anytype, id: u64) !void {
     const cur = try e.gpa.dupe(u1, e.cur.st.cur);
     errdefer e.gpa.free(cur);
     try pool.move(e.stream, &lease, &plan, true);
+    if (win) |w| try moveFlat(pool, e.stream, &lease, state_len, w.ring, ring_bytes, true);
     try e.stream.synchronize();
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base } });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .win_from = if (win) |w| w.from else null });
 }
 
 /// A disk read's state: `at`'s pages leased under rank 0's id on each rank, refused by `restore` until `seal`.
 pub fn blankAs(e: anytype, id: u64, at: usize) !void {
     if (e.snaps.contains(id)) return error.StateKept;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    var lease = try pool.take(bytes(e, at));
+    var lease = try pool.take(planBytes(e, at)); // a disk image holds no drafter window
     errdefer pool.give(&lease);
     const cur = try e.gpa.alloc(u1, e.cur.st.cur.len);
     @memset(cur, 0);

@@ -17,24 +17,38 @@ fn set(e: anytype) glue.Set {
     return .{ .glue = &e.m.glue, .mm = &e.m.mm };
 }
 
-/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm only): 4 bits 16 rows a launch, or glm_mm.
+/// out[m, n] = x[m, k] . w^T, bf16 out (`wide`: fp32, glm_mm or DOWN4's tile): 4 bits 16 rows a launch, or glm_mm.
 fn lin(dr: *const Drafter, e: anytype, x: u64, w: df.Lin, out: u64, m: usize, wide: bool) !void {
     switch (w) {
         .bf16 => |t| try mm.matmul(&e.m.mm, e.stream, x, t.k, t, out, dr.part, m, wide, false),
         .q4 => |q| {
-            if (wide) return error.WideFromFourBits;
+            if (wide and dr.wide4 == null) return error.WideFromFourBits;
             var a: cuda.Args = .{};
             a.add(x);
             a.add(@as(i32, @intCast(q.k)));
             a.add(@as(i32, @intCast(q.k)));
             a.add(dr.gs);
             try go(dr.k.gsum, .{ .x = @intCast(m) }, 128, e, &a);
+            if (wide) return many(e, dr.wide4, x, dr.gs, q, out, m);
+            if (dr.knobs.onepass) return many(e, null, x, dr.gs, q, out, m);
             var r0: usize = 0;
             while (r0 < m) : (r0 += 16) {
                 const rows = @min(16, m - r0);
                 try q4.matmul(&e.m.q4, e.stream, x + r0 * q.k * 2, q.k, dr.gs + r0 * (q.k / 64) * 4, q, out + r0 * q.n * 2, rows);
             }
         },
+    }
+}
+
+/// TF_GLM_OVN_DRAFT_ONEPASS: q4.many_rows rows a launch, a 16-row tile lin's own launch for it (`wide4`: fp32 out).
+fn many(e: anytype, wide4: ?cuda.Function, x: u64, xs: u64, q: q4.Q4, out: u64, m: usize) !void {
+    var r0: usize = 0;
+    while (r0 < m) : (r0 += q4.many_rows) {
+        const rows = @min(q4.many_rows, m - r0);
+        const at = .{ x + r0 * q.k * 2, xs + r0 * (q.k / 64) * 4 };
+        if (wide4) |f| {
+            try q4.matmulF32(&e.m.q4, f, e.stream, at[0], q.k, at[1], q, out + r0 * q.n * 4, rows);
+        } else try q4.matmulMany(&e.m.q4, e.stream, at[0], q.k, at[1], q, out + r0 * q.n * 2, rows);
     }
 }
 
@@ -95,6 +109,29 @@ fn conv(dr: *const Drafter, e: anytype, z: u64, which: i32, base: u64, out: u64,
     try go(dr.k.conv, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
 }
 
+/// gate and up, SwiGLU, down: whole into a, or this rank's `ff` columns with down's K slice as fp32 partials, summed.
+fn mlp(dr: *const Drafter, e: anytype, gu: df.Lin, down: df.Lin, ff: usize, split: bool, M: usize) !void {
+    try lin(dr, e, dr.y2, gu, dr.gu, M, false);
+    {
+        var a: cuda.Args = .{};
+        a.add(dr.gu);
+        a.add(dr.act);
+        a.add(@as(i32, @intCast(ff)));
+        try go(dr.k.swiglu, .{ .x = @intCast(M), .y = @intCast(ff / 1024) }, 256, e, &a);
+    }
+    if (!split) return lin(dr, e, dr.act, down, dr.a, M, false);
+    const bytes = M * D * 4; // every rank's partials gathered, then added in rank order
+    try lin(dr, e, dr.act, down, dr.sums + e.share.rank * bytes, M, true);
+    try gather(e, dr.sums, bytes);
+    var a: cuda.Args = .{};
+    a.add(dr.sums);
+    a.add(dr.a);
+    a.add(@as(i32, @intCast(M)));
+    if (dr.world == 2) return go(dr.k.sum2, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
+    a.add(@as(i32, @intCast(dr.world)));
+    try go(dr.k.sumw, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
+}
+
 /// The block pass for `S` streams (tables uploaded): embed, 5 layers, norm, each rank's 16 best a row, gathered.
 pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
     const M = S * BLOCK;
@@ -136,31 +173,17 @@ pub fn pass(dr: *Drafter, e: anytype, S: usize, rank0: bool) !void {
         try glue.rmsnorm(set(e), e.stream, dr.x, D, l.post_norm, dr.y, D, null, df.EPS, M, D);
         try lin(dr, e, dr.y, l.m_proj, dr.dyn, M, false);
         try conv(dr, e, dr.y, 0, l.m_base, dr.y2, false, M);
-        try lin(dr, e, dr.y2, l.gu, dr.gu, M, false);
-        {
-            var a: cuda.Args = .{};
-            a.add(dr.gu);
-            a.add(dr.act);
-            a.add(@as(i32, @intCast(dr.ff)));
-            try go(dr.k.swiglu, .{ .x = @intCast(M), .y = @intCast(dr.ff / 1024) }, 256, e, &a);
-        }
-        if (dr.split) { // each rank's half of down's K as fp32 partials, gathered and summed
-            const bytes = M * D * 4;
-            try linB(dr, e, dr.act, l.down, dr.sums + e.share.rank * bytes, M, true);
-            try gather(e, dr.sums, bytes);
-            var a: cuda.Args = .{};
-            a.add(dr.sums);
-            a.add(dr.a);
-            a.add(@as(i32, @intCast(M)));
-            try go(dr.k.sum2, .{ .x = @intCast(M), .y = D / 1024 }, 256, e, &a);
-        } else try linB(dr, e, dr.act, l.down, dr.a, M, false);
+        const sliced = dr.sff != 0 and S <= dr.knobs.mlpsplit; // MLPSPLIT: S is the step's, so every rank agrees
+        if (sliced) try mlp(dr, e, l.sgu, l.sdown, dr.sff, true, M) else try mlp(dr, e, l.gu, l.down, dr.ff, dr.split, M);
         try conv(dr, e, dr.a, 1, l.m_base + 2 * D * 2, dr.x, true, M);
     }
     // every row through the drafts' 4-bit head (this rank's vocabulary), its 16 best, gathered; rank 0's projections
     try glue.rmsnorm(set(e), e.stream, dr.x, D, dr.norm, dr.hn, D, dr.xs, df.EPS, M, D);
     const head = e.w.mtp.?.draft;
     var r0: usize = 0;
-    while (r0 < M) : (r0 += 16) {
+    if (dr.knobs.onepass) {
+        try many(e, null, dr.hn, dr.xs, head, dr.logits, M);
+    } else while (r0 < M) : (r0 += 16) {
         const rows = @min(16, M - r0);
         try q4.matmul(&e.m.q4, e.stream, dr.hn + r0 * D * 2, D, dr.xs + r0 * (D / 64) * 4, head, dr.logits + r0 * head.n * 2, rows);
     }

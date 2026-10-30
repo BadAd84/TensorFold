@@ -349,3 +349,7 @@ template __global__ void tf_qmm_group::group_kernel<64, 64, 64, 1, 4, 4, false, 
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
 template __global__ void tf_qmm_group::group_kernel<64, 128, 64, 1, 4, 3, false, false, false, false>(
     const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);
+
+// Tile 2 with fp32 out: the GLM drafter's 4-bit down K slices (TF_GLM_OVN_DRAFT_DOWN4 with a split MLP), gathered.
+template __global__ void tf_qmm_group::group_kernel<64, 16, 64, 1, 4, 8, true, false, false, false>(
+    const __nv_bfloat16* __restrict__, const float* __restrict__, const __grid_constant__ tf_qmm_group::Parts, int, int, int, int, int);

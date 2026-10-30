@@ -503,7 +503,8 @@ pub const Lanes = struct {
         }
         shared_mod.commitEnd(self, prof);
         try self.x.block(reqs[0..requests.len]);
-        const cut = confidence();
+        const cuts = self.x.e.drafter.?.knobs.cuts; // TF_GLM_OVN_DRAFT_CUTS: the cut by streams in this pass
+        const cut = (if (cuts) |c| c.at(requests.len) else null) orelse confidence();
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);
             var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut

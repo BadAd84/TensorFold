@@ -52,6 +52,7 @@ pub const Kernels = struct {
     attn_part: cuda.Function,
     attn_merge: cuda.Function,
     sum2: cuda.Function,
+    sumw: cuda.Function, // TF_GLM_OVN_DRAFT_MLPSPLIT's rank-ordered sum (looked up, launched only with the knob)
     top16_part: cuda.Function,
     top16_merge: cuda.Function,
     gsum: cuda.Function,
@@ -66,8 +67,8 @@ pub const Kernels = struct {
 /// A drafter linear: 4 bits (--drafter-bits 4, the default; they only propose) or bf16 tiled for glm_mm.
 pub const Lin = union(enum) { q4: q4.Q4, bf16: mm.Tiled };
 
-/// down and the selector's projection stay bf16 (their fp32 outputs are gathered or read on the host).
-pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: mm.Tiled, a_proj: Lin, m_proj: Lin };
+/// The selector's projection stays bf16 (read on the host), down too unless DOWN4; sgu, sdown: MLPSPLIT's rank slices.
+pub const LayerW = struct { in_norm: u64, post_norm: u64, qn: u64, kn: u64, a_base: u64, m_base: u64, qkv: Lin, kv: Lin, o: Lin, gu: Lin, down: Lin, a_proj: Lin, m_proj: Lin, sgu: Lin, sdown: Lin };
 
 /// A stream's drafter state by slot: its ring, where its context starts, and its last verify's tap rows.
 pub const Slot = struct {
@@ -77,10 +78,20 @@ pub const Slot = struct {
     v_row0: usize = 0,
     v_rows: usize = 0,
     v_pos0: i64 = 0,
+    lo: i64 = 0, // TF_GLM_OVN_DRAFT_KEEPWIN: [lo, hi), the positions the ring holds for this sequence, in order
+    hi: i64 = 0,
 };
 
 /// One stream's request: `n` rows of its last verify into its context first (0: none), the anchor, rank 0's `out`.
-pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null };
+pub const Req = struct { slot: u32, pos: i64, n: usize, anchor: u32, out: ?[]u32 = null, probs: ?[]f64 = null, sampling: ?@import("lanes").Sampling = null };
+
+/// `q` at its sequence's position, with the sequence's sampling rule (TF_GLM_OVN_DRAFT_NOISE's pick reads it).
+pub fn located(q: Req, seq: anytype) Req {
+    var r = q;
+    r.pos = @intCast(seq.st.pos);
+    r.sampling = seq.sampling;
+    return r;
+}
 
 /// Context runs: `n` tap rows at `taps` (consecutive), positions pos0.., into `ring`.
 pub const Run = struct { ring: u64, taps: u64, n: usize, pos0: i64 };
@@ -105,6 +116,9 @@ pub const Drafter = struct {
     world: usize,
     temp: f64 = 1.0, // the selector's softmax temperature for the drafts' chances
     win: i64 = WIN, // TF_GLM_DFLASH2_WIN: the context positions a draft attends to at most (drafts only, never replies)
+    knobs: @import("dflash_ovn.zig").Knobs = .{}, // TF_GLM_OVN_DRAFT_*: unset, the drafter as it runs without them
+    sff: usize = 0, // MLPSPLIT: the MLP width of this rank's slice (sgu, sdown); 0: no slices
+    wide4: ?cuda.Function = null, // DOWN4 on a split MLP: the fp32-out 4-bit tile for down's K slices
     scratch: cuda.DeviceBuffer = undefined,
     slots: std.ArrayList(Slot) = .empty,
     verifies: u64 = 0, // verifies so far: a slot's rows are still in taps_step while its v_step is the latest
@@ -132,7 +146,7 @@ pub const Drafter = struct {
     logits: u64 = 0,
     part: u64 = 0, // the linears' K-slice partials
     gs: u64 = 0, // a 4-bit linear's input group sums [MAX_CTX][5 * D / 64]
-    sums: u64 = 0, // the split down's gathered fp32 partials [2][MAX_M][D]
+    sums: u64 = 0, // the split down's gathered fp32 partials [2, or world with MLPSPLIT][MAX_M][D]
     cin: u64 = 0,
     c1: u64 = 0,
     ctx: u64 = 0,
@@ -205,13 +219,45 @@ pub const Drafter = struct {
         const s = try dr.slot(i);
         s.from = @intCast(from);
         s.v_rows = 0;
+        if (dr.knobs.keepwin) {
+            s.lo = s.from;
+            s.hi = s.from;
+        }
+    }
+
+    /// KEEPWIN: slot `i` resumed at `at` with its kept window, rows [from, at) back in its ring.
+    pub fn restartKept(dr: *Drafter, i: u32, from: i64, at: usize) !void {
+        const s = try dr.slot(i);
+        s.* = .{ .ring = s.ring, .from = from, .lo = from, .hi = @intCast(at) };
+    }
+
+    /// KEEPWIN: slot `i`'s ring and the first row a state kept at `at` carries (null: no rows ending at `at`).
+    pub fn window(dr: *const Drafter, i: u32, at: usize) ?struct { ring: u64, from: i64 } {
+        if (!dr.knobs.keepwin or i >= dr.slots.items.len) return null;
+        const s = dr.slots.items[i];
+        const ring = s.ring orelse return null;
+        if (s.hi != @as(i64, @intCast(at)) or s.hi <= s.lo) return null;
+        return .{ .ring = ring.ptr, .from = @max(@max(s.lo, s.from), s.hi - WIN) };
+    }
+
+    /// KEEPWIN: slot `i`'s ring (made if it has none).
+    pub fn ringOf(dr: *Drafter, i: u32) !u64 {
+        return (try dr.slot(i)).ring.?.ptr;
+    }
+
+    /// KEEPWIN: a run ingested into its slot's ring: the held span grows, or restarts at a gap.
+    fn noteRun(dr: *Drafter, r: Run) void {
+        for (dr.slots.items) |*s| if (s.ring != null and s.ring.?.ptr == r.ring) {
+            if (r.pos0 < s.lo or r.pos0 > s.hi) s.lo = r.pos0;
+            s.hi = r.pos0 + @as(i64, @intCast(r.n));
+        };
     }
 
     /// A verify on slot `i` wrote `rows` tap rows at row `row0` of taps_step, for positions pos0...
     pub fn noteVerify(dr: *Drafter, i: u32, row0: usize, rows: usize, pos0: usize, first: bool) !void {
         if (first) dr.verifies += 1; // a shared verify's parts share one
         const s = try dr.slot(i);
-        s.* = .{ .ring = s.ring, .from = s.from, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0) };
+        s.* = .{ .ring = s.ring, .from = s.from, .v_step = dr.verifies, .v_row0 = row0, .v_rows = rows, .v_pos0 = @intCast(pos0), .lo = s.lo, .hi = s.hi };
     }
 
     /// A prompt chunk on slot `i` (rows start.. of a `len`-id prompt): its rows within the last window into the ring.
@@ -230,6 +276,7 @@ pub const Drafter = struct {
         if (N > MAX_CTX) return error.DrafterContextTooWide;
         var row: usize = 0;
         for (runs) |r| {
+            if (dr.knobs.keepwin) dr.noteRun(r);
             try block.copy(e, dr.cin + row * TAP_ROW, r.taps, r.n * TAP_ROW);
             for (0..r.n) |j| {
                 dr.h_cpos[row + j] = r.pos0 + @as(i64, @intCast(j));
@@ -254,6 +301,10 @@ pub const Drafter = struct {
             if (q.n == 0) continue;
             if (s.v_step != dr.verifies or q.n > s.v_rows or s.v_pos0 + @as(i64, @intCast(q.n)) != q.pos) {
                 s.from = q.pos; // its verify rows were overwritten (or never written): its context restarts here
+                if (dr.knobs.keepwin) {
+                    s.lo = q.pos;
+                    s.hi = q.pos;
+                }
                 dr.lost += 1;
                 continue;
             }

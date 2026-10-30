@@ -112,6 +112,31 @@ fn layerName(b: *[96]u8, li: usize, s: []const u8) ![]const u8 {
     return std.fmt.bufPrint(b, "layers.{d}.{s}", .{ li, s });
 }
 
+/// Device bytes a 4-bit [n][k] takes in the loader's buffer: its words, scales and biases, each 256-aligned.
+fn q4Bytes(n: usize, k: usize) u64 {
+    var t: u64 = 0;
+    for (q4.bytes(n, k)) |b| t += std.mem.alignForward(u64, b, 256);
+    return t;
+}
+
+/// Device bytes of a linear [n][k] at `bits` (4, or bf16 for 0), as the loader takes it.
+fn linBytes(n: usize, k: usize, bits: u8) u64 {
+    return if (bits == 4) q4Bytes(n, k) else std.mem.alignForward(u64, n * k * 2, 256);
+}
+
+/// TF_GLM_OVN_DRAFT_MLPSPLIT=n's slice width at `world` ranks: 0 when off or below world 3 (world 2 splits already).
+fn mlpSlice(n: usize, world: usize) !usize {
+    if (n == 0 or world < 3) return 0;
+    if (FF % (world * 1024) != 0) return error.BadOvnKnob; // swiglu's 1024-column blocks a row
+    return FF / world;
+}
+
+/// Down's columns col0.. (`n` of them) as fp32-out K slices: bf16 for glm_mm, or 4 bits for the fp32 tile (DOWN4).
+fn downSlice(l: *Loader, name: []const u8, col0: usize, n: usize, four: bool) !df.Lin {
+    if (four) return l.linear(&.{name}, &.{D}, FF, .{ 0, 0, col0, n });
+    return .{ .bf16 = try l.linearB(&.{name}, &.{D}, FF, .{ 0, 0, col0, n }) };
+}
+
 /// The drafter from `dir` (config.json and model.safetensors, bf16) for rank `rank` of `world`, on engine `e`.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, rank: usize, world: usize, bits: u8) !*Drafter {
     if (bits != 0 and bits != 4) return error.BadDrafterBits;
@@ -140,12 +165,20 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
         const offs = x.value_ptr.object.get("data_offsets").?.array.items;
         try ents.put(x.key_ptr.*, .{ .off = 8 + hlen + @as(u64, @intCast(offs[0].integer)), .n = @intCast(offs[1].integer - offs[0].integer) });
     }
+    var temp: f64 = 1.0;
+    const knobs = try @import("dflash_ovn.zig").Knobs.read(&temp);
     const split = world == 2;
     const ff: usize = if (split) FF / 2 else FF;
+    const down4 = knobs.down4 and bits == 4; // DOWN4: every down form at 4 bits (production's dflash2.py:403)
+    const sff = try mlpSlice(knobs.mlpsplit, world); // MLPSPLIT: this rank's MLP slice at world 3+ (0: none)
+    const full = sff == 0 or knobs.mlpsplit < df.MAX_S; // the whole MLP too, unless every pass runs the slices
     const small: u64 = 6 * 4096 * 2 + 2 * 128 * 2 + 2 * 2 * 2 * D * 2 + 16 * 256;
     const per: u64 = if (bits == 4) 1 else 4; // quarter-bytes a weight: 4 bits (plus scales and biases below) or bf16
-    const lin_elems: u64 = df.QKV * D + 2 * KVW * D + D * D + 2 * ff * D + 2 * KVW * D + 5 * D * D / df.LAYERS;
-    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + D * ff * 2 + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
+    const gu_elems: u64 = if (full) 2 * ff * D else 0;
+    const lin_elems: u64 = df.QKV * D + 2 * KVW * D + D * D + gu_elems + 2 * KVW * D + 5 * D * D / df.LAYERS;
+    const down_bytes: u64 = if (!full) 0 else if (down4) q4Bytes(D, ff) else D * ff * 2;
+    const slice_bytes: u64 = if (sff == 0) 0 else linBytes(2 * sff, D, bits) + linBytes(D, sff, if (down4) 4 else 0);
+    const total: u64 = df.LAYERS * (lin_elems * per / 2 + lin_elems / 16 + down_bytes + slice_bytes + small + 32 * 256) + df.RANK * D * 2 + 2 * D * 2 + 64 * 256;
     var wbuf = try cuda.DeviceBuffer.alloc(d, total);
     errdefer wbuf.free();
     var tmp = try cuda.DeviceBuffer.alloc(d, 2 * FF * D * 2); // the largest linear as stored
@@ -161,7 +194,8 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     }
     const dr = try gpa.create(Drafter);
     errdefer gpa.destroy(dr);
-    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.load(module), .weights = wbuf, .split = split, .ff = ff, .rank = rank, .world = world };
+    dr.* = .{ .gpa = gpa, .d = d, .module = module, .k = try df.Kernels.load(module), .weights = wbuf, .split = split, .ff = ff, .rank = rank, .world = world, .knobs = knobs, .temp = temp, .sff = sff };
+    if (down4 and (split or sff != 0)) dr.wide4 = try e.m.q4.loadF32();
     defer @import("cuda_load_owner.zig").drain(e.stream, d);
     var nb: [4][96]u8 = undefined;
     for (&dr.layers, 0..) |*lw, i| {
@@ -182,10 +216,22 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
         const down = try layerName(&nb[3], i, "mlp.down_proj.weight");
         if (split) { // this rank's half of the MLP width: gate and up rows, down columns
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * ff, ff, 0, D });
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, .{ 0, 0, rank * ff, ff });
-        } else {
+            lw.down = try downSlice(&l, down, rank * ff, ff, down4);
+        } else if (full) {
             lw.gu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, null);
-            lw.down = try l.linearB(&.{down}, &.{D}, FF, null);
+            lw.down = if (down4) try l.linear(&.{down}, &.{D}, FF, null) else .{ .bf16 = try l.linearB(&.{down}, &.{D}, FF, null) };
+        }
+        if (sff != 0) { // MLPSPLIT: this rank's slice, cut as the world-2 split cuts its half
+            lw.sgu = try l.linear(&.{ gate, up }, &.{ FF, FF }, D, .{ rank * sff, sff, 0, D });
+            lw.sdown = try downSlice(&l, down, rank * sff, sff, down4);
+        }
+        if (!full) { // every pass runs the slices: the whole forms are never loaded (carve reads these)
+            lw.gu = lw.sgu;
+            lw.down = lw.sdown;
+        }
+        if (sff == 0) { // no slices: never read
+            lw.sgu = lw.gu;
+            lw.sdown = lw.down;
         }
         lw.a_proj = try l.linear(&.{try layerName(&nb[1], i, "attention_conv.kernel_projection.weight")}, &.{KVW}, D, null);
         lw.m_proj = try l.linear(&.{try layerName(&nb[1], i, "mlp_conv.kernel_projection.weight")}, &.{KVW}, D, null);
@@ -194,6 +240,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, e: anytype, dir: []const u8, ran
     dr.hproj = try l.linearB(&.{"candidate_selector.hidden_projection.weight"}, &.{df.RANK}, D, null);
     dr.hnorm = try l.raw("hidden_norm.weight", D * 2);
     dr.norm = try l.raw("norm.weight", D * 2);
+    if (sff != 0) std.log.info("dflash2: MLP slices of {d} a rank while at most {d} streams draft (TF_GLM_OVN_DRAFT_MLPSPLIT)", .{ sff, knobs.mlpsplit });
     if (l.at > total) return error.DrafterLayout;
     var tail: Tail = .{ .loader = &l, .head_n = head.n };
     const candidates = @import("dflash_candidates.zig").Layout.init(world, df.MAX_M, df.CW);
@@ -231,19 +278,19 @@ fn carve(dr: *Drafter, d: *const cuda.Driver, head_n: usize) !void {
     const chunks: u64 = (head_n + 4095) / 4096;
     var part: u64 = 16;
     for (dr.layers) |l| {
-        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.a_proj, l.m_proj }) |w| if (w == .bf16) {
+        for ([_]df.Lin{ l.qkv, l.kv, l.o, l.gu, l.down, l.a_proj, l.m_proj, l.sgu, l.sdown }) |w| if (w == .bf16) {
             part = @max(part, mm.partBytes(64, w.bf16));
         };
-        part = @max(part, mm.partBytes(64, l.down));
     }
     if (dr.fc == .bf16) part = @max(part, mm.partBytes(64, dr.fc.bf16));
     part = @max(part, mm.partBytes(64, dr.hproj));
+    const ranks: u64 = if (dr.sff != 0) dr.world else 2; // the split down's gathered partials: 2 ranks, or MLPSPLIT's
     const fields = .{
         .{ "x", M * D * 2 },                                                                     .{ "y", M * D * 2 },                        .{ "y2", M * D * 2 },                .{ "dyn", M * KVW * 2 },
         .{ "qkv", M * df.QKV * 2 },                                                              .{ "q", M * D * 2 },                        .{ "kb", M * KVW * 2 },              .{ "vb", M * KVW * 2 },
         .{ "att", M * D * 2 },                                                                   .{ "a", M * D * 2 },                        .{ "gu", M * 2 * FF * 2 },           .{ "act", M * FF * 2 },
         .{ "hn", M * D * 2 },                                                                    .{ "xs", M * (D / 64) * 4 },                .{ "g", M * df.RANK * 4 },           .{ "logits", M * head_n * 2 },
-        .{ "part", part },                                                                       .{ "gs", C * 5 * (D / 64) * 4 },            .{ "sums", 2 * M * D * 4 },          .{ "cin", C * df.TAP_ROW },
+        .{ "part", part },                                                                       .{ "gs", C * 5 * (D / 64) * 4 },            .{ "sums", ranks * M * D * 4 },      .{ "cin", C * df.TAP_ROW },
         .{ "c1", C * D * 2 },                                                                    .{ "ctx", C * D * 2 },                      .{ "ckv", C * 2 * KVW * 2 },         .{ "taps_step", df.STEP_ROWS * df.TAP_ROW },
         .{ "taps_prefill", df.TAP_ROWS * df.TAP_ROW },                                           .{ "ids", M * 4 },                          .{ "bpos", M * 4 },                  .{ "rings", df.MAX_S * 8 },
         .{ "starts", df.MAX_S * 8 },                                                             .{ "froms", df.MAX_S * 8 },                 .{ "cpos", C * 8 },                  .{ "crings", C * 8 },
