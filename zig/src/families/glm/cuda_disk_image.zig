@@ -92,9 +92,9 @@ fn cache(sh: Shape, n: u64) [5]u64 {
     };
 }
 
-/// The image at `at` (a chunk start): the words, the prefix, each DSA layer's rows, the head's caches, the tail.
+/// The image at `at` (any row, as layout.Plan keeps it): words, prefix, each DSA layer's rows, the head, the tail.
 pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator) !void {
-    if (at == 0 or at % sparse.pool != 0 or at > sh.capacity) return error.SnapshotShape;
+    if (at == 0 or at > sh.capacity) return error.SnapshotShape;
     try out.appendSlice(a, &.{ .{ .bytes = Words.bytes }, .{ .bytes = sh.prefix } });
     const pooled: u64 = at / sparse.pool;
     for (0..sh.layers) |_| {
@@ -102,7 +102,7 @@ pub fn parts(sh: Shape, at: u32, out: *std.ArrayList(Part), a: std.mem.Allocator
         try out.append(a, .{ .bytes = c[0], .row = sh.latent });
         if (sh.scales) try out.append(a, .{ .bytes = c[1], .row = 4 });
         try out.appendSlice(a, &.{ .{ .bytes = c[2] }, .{ .bytes = c[3] } });
-        // whole pools are rows by position; the pool past them and the spare row stay the state's own
+        // whole pools are rows by position; the partial pool (at % pool rows in) and the spare row stay the state's own
         try out.appendSlice(a, &.{ .{ .bytes = pooled * sh.pooled_row, .row = sh.pooled_row, .per = sparse.pool }, .{ .bytes = c[4] - pooled * sh.pooled_row } });
     }
     if (sh.head) for (cache(sh, sh.headRows(at))) |n| if (n > 0) try out.append(a, .{ .bytes = n });

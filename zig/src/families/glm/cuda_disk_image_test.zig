@@ -70,6 +70,9 @@ const H = struct {
 /// Past the index rings' rows, so a state at the end holds a full ring.
 const capacity = @import("cuda_state.zig").index_ring + 2048;
 
+/// Kept rows on and off the 4-row pool grid: 1-3 into a pool, row 9, past a KV page, a block, the index rings.
+const rows_kept = [_]u32{ 2048, 4096, 6144, 9, 2049, 2050, 2051, 2563, 4353, capacity - 1021 };
+
 /// TP=2 rank 0's shapes on KDA, DSA, KDA, DSA layers.
 const Model = struct {
     layers: [4]weights.Layer,
@@ -93,7 +96,7 @@ test "GLM disk image: the lease bytes the image counts are the snapshot plan's, 
         defer st.deinit();
         for ([_]bool{ false, true }) |head| {
             const sh = try image.Shape.of(&st, &m.w.config, capacity, head);
-            for ([_]u32{ 2048, 4096, 6144 }) |at| {
+            for (rows_kept) |at| {
                 for ([_]u64{ at - 1, at, sh.headRows(at) }) |mtp| {
                     const plan = try Plan.init(&st, &m.w.config, at, if (head) mtp else null);
                     try expectEqual(@as(u64, plan.len), image.leaseBytes(sh, at, if (head) mtp else 0));
@@ -115,23 +118,29 @@ test "GLM disk image: the store's rows are by position from 0 in whole blocks; r
     defer list.deinit(a);
     var segs: std.ArrayList(image.Seg) = .empty;
     defer segs.deinit(a);
-    const at: u32 = 6144;
-    try image.parts(sh, at, &list, a);
-    try image.segments(sh, at, at, &segs, a);
-    var total: u64 = 0;
-    var rows: usize = 0;
-    for (list.items) |p| {
-        total += p.bytes;
-        if (p.row == 0) continue;
-        rows += 1;
-        try expect(256 % p.per == 0);
-        try expectEqual(@as(u64, at / p.per) * p.row, p.bytes); // a pooled part counts the whole pools alone
+    for (rows_kept) |at| {
+        list.clearRetainingCapacity();
+        segs.clearRetainingCapacity();
+        try image.parts(sh, at, &list, a);
+        try image.segments(sh, at, at, &segs, a);
+        var total: u64 = 0;
+        var rows: usize = 0;
+        for (list.items) |p| {
+            total += p.bytes;
+            if (p.row == 0) continue;
+            rows += 1;
+            try expect(256 % p.per == 0);
+            try expectEqual(@as(u64, at / p.per) * p.row, p.bytes); // a pooled part counts the whole pools alone
+        }
+        try expectEqual(@as(usize, 3 * 2), rows); // each DSA layer's latent rows, scales and whole pools
+        const last = segs.items[segs.items.len - 1];
+        try expectEqual(total, last.img + last.len);
+        try expectEqual(image.imageBytes(sh, at), total);
+        try expectEqual(@as(u64, 2) * sh.pooled_row, list.items[7].bytes); // layer 0's partial pool and spare row
+        try expectError(error.SnapshotShape, image.segments(sh, at, sh.headRows(at) + 1, &segs, a));
     }
-    try expectEqual(@as(usize, 3 * 2), rows); // each DSA layer's latent rows, scales and whole pools
-    const last = segs.items[segs.items.len - 1];
-    try expectEqual(total, last.img + last.len);
-    try expectEqual(@as(u64, 2 * 256), list.items[7].bytes); // layer 0's pools past `at`: the spare rows
-    try expectError(error.SnapshotShape, image.segments(sh, at, sh.headRows(at) + 1, &segs, a));
+    try expectError(error.SnapshotShape, image.parts(sh, 0, &list, a));
+    try expectError(error.SnapshotShape, image.parts(sh, capacity + 1, &list, a));
 }
 
 test "GLM disk image: a kept state's image read out of its lease restores every planned byte into another sequence" {
@@ -143,44 +152,47 @@ test "GLM disk image: a kept state's image read out of its lease restores every 
     var st = try State.initFormat(a, &d, &m.w, capacity, false);
     defer st.deinit();
     for (H.bytes(st.arena.buf.ptr, st.arena.buf.len), 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
-    var pool = try pages.Pool.init(a, &d, 64 << 20);
+    var pool = try pages.Pool.init(a, &d, 256 << 20);
     defer pool.deinit();
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
-    const at: u32 = 2048;
-    const mtp: u64 = at - 1; // a head one row behind: its last image row is not in the lease
     const sh = try image.Shape.of(&st, c, capacity, true);
-    const plan = try Plan.init(&st, c, at, mtp);
-    var kept = try pool.take(plan.len);
-    defer pool.give(&kept);
-    try pool.move(stream, &kept, &plan, true);
-    var segs: std.ArrayList(image.Seg) = .empty;
-    defer segs.deinit(a);
-    try image.segments(sh, at, mtp, &segs, a);
-    const last = segs.items[segs.items.len - 1];
-    const img = try a.alloc(u8, @intCast(last.img + last.len));
-    defer a.free(img);
-    var words = (image.Words{ .at = at, .mtp_len = mtp, .base = 0, .mtp_base = 0, .cur = 0b10 }).encode();
-    const out: image.Copy = .{ .d = &d, .pool = &pool, .lease = &kept, .segs = segs.items, .words = &words };
-    const cut = [_]u64{ 0, 1000, plan.len / 2, img.len }; // the store asks for ranges, not the whole image
-    for (cut[0..3], cut[1..]) |lo, hi| try out.run(lo, img[@intCast(lo)..@intCast(hi)], true);
-    for (segs.items) |s| if (s.from == .zeros) for (img[@intCast(s.img)..][0..@intCast(s.len)]) |b| try expectEqual(@as(u8, 0), b);
-    // a blank state as a disk read takes it (room for the head's whole window), filled from the image
-    var blank = try pool.take(@intCast(image.leaseBytes(sh, at, sh.headRows(at))));
-    defer pool.give(&blank);
-    var back: [6]u64 = undefined;
-    const in: image.Copy = .{ .d = &d, .pool = &pool, .lease = &blank, .segs = segs.items, .words = &back };
-    try in.run(0, img, false);
-    const w = try image.Words.decode(back, at);
-    try expectEqual(mtp, w.mtp_len);
-    try expectEqual(@as(u64, 0b10), w.cur);
-    try expectError(error.DiskWords, image.Words.decode(back, at + 2048));
     var fresh = try State.initFormat(a, &d, &m.w, capacity, false);
     defer fresh.deinit();
-    const into = try Plan.init(&fresh, c, at, w.mtp_len);
-    try expectEqual(plan.len, into.len);
-    try pool.move(stream, &blank, &into, false);
-    for (plan.parts[0..plan.count], into.parts[0..into.count]) |x, y| {
-        try std.testing.expectEqualSlices(u8, H.bytes(x.live, x.len), H.bytes(y.live, y.len));
+    var segs: std.ArrayList(image.Seg) = .empty;
+    defer segs.deinit(a);
+    for (rows_kept) |at| {
+        const mtp: u64 = at - 1; // a head one row behind: its last image row is not in the lease
+        const plan = try Plan.init(&st, c, at, mtp);
+        var kept = try pool.take(plan.len);
+        defer pool.give(&kept);
+        try pool.move(stream, &kept, &plan, true);
+        segs.clearRetainingCapacity();
+        try image.segments(sh, at, mtp, &segs, a);
+        const last = segs.items[segs.items.len - 1];
+        const img = try a.alloc(u8, @intCast(last.img + last.len));
+        defer a.free(img);
+        var words = (image.Words{ .at = at, .mtp_len = mtp, .base = 0, .mtp_base = 0, .cur = 0b10 }).encode();
+        const out: image.Copy = .{ .d = &d, .pool = &pool, .lease = &kept, .segs = segs.items, .words = &words };
+        const cut = [_]u64{ 0, 1000, plan.len / 2, img.len }; // the store asks for ranges, not the whole image
+        for (cut[0..3], cut[1..]) |lo, hi| try out.run(lo, img[@intCast(lo)..@intCast(hi)], true);
+        for (segs.items) |s| if (s.from == .zeros) for (img[@intCast(s.img)..][0..@intCast(s.len)]) |b| try expectEqual(@as(u8, 0), b);
+        // a blank state as a disk read takes it (room for the head's whole window), filled from the image
+        var blank = try pool.take(@intCast(image.leaseBytes(sh, at, sh.headRows(at))));
+        defer pool.give(&blank);
+        var back: [6]u64 = undefined;
+        const in: image.Copy = .{ .d = &d, .pool = &pool, .lease = &blank, .segs = segs.items, .words = &back };
+        try in.run(0, img, false);
+        const w = try image.Words.decode(back, at);
+        try expectEqual(mtp, w.mtp_len);
+        try expectEqual(@as(u64, 0b10), w.cur);
+        try expectError(error.DiskWords, image.Words.decode(back, at + 1)); // a state one row on is another state
+        @memset(H.bytes(fresh.arena.buf.ptr, fresh.arena.buf.len), 0); // no earlier row's restore stands in
+        const into = try Plan.init(&fresh, c, at, w.mtp_len);
+        try expectEqual(plan.len, into.len);
+        try pool.move(stream, &blank, &into, false);
+        for (plan.parts[0..plan.count], into.parts[0..into.count]) |x, y| {
+            try std.testing.expectEqualSlices(u8, H.bytes(x.live, x.len), H.bytes(y.live, y.len));
+        }
     }
 }
 
@@ -287,4 +299,28 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
         snaps.free(&e, &held);
     }
     try snaps.seal(&e, 9, 0, .{ back, 0 }, 0); // no head rows yet (as without drafts): the main ring holds the state's rows
+}
+
+test "GLM disk image: a disk read's blank state seals at rows off the pool grid with the image's lease bytes" {
+    const snaps = @import("cuda_snapshots.zig");
+    var m: Model = undefined;
+    try m.init();
+    var d = H.driver();
+    const a = std.testing.allocator;
+    var e: Fake = .{ .gpa = a, .d = &d, .stream = .{ .d = &d, .handle = null }, .c = m.w.config, .cur = .{ .st = try State.initFormat(a, &d, &m.w, capacity, false) } };
+    defer e.cur.st.deinit();
+    e.snap_pages = try pages.Pool.init(a, &d, 256 << 20);
+    defer e.snap_pages.?.deinit();
+    try e.snaps.ensureTotalCapacity(a, 2);
+    defer e.snaps.deinit(a);
+    const sh = try image.Shape.of(&e.cur.st, &e.c, capacity, true);
+    for (rows_kept, 20..) |at, id| {
+        try snaps.blankAs(&e, id, at);
+        const rows: u32 = @intCast(e.cur.st.ring_rows);
+        try snaps.seal(&e, id, at - 1, .{ at -| rows, (at - 1) -| rows }, 0); // the least bases holding the rows
+        var s = e.snaps.fetchRemove(id).?.value;
+        defer snaps.free(&e, &s);
+        try expectEqual(image.leaseBytes(sh, at, at - 1), @as(u64, s.len));
+        try expect(s.lease.ids.items.len * pages.page >= image.leaseBytes(sh, at, sh.headRows(at)));
+    }
 }
