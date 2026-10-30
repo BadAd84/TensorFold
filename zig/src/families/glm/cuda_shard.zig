@@ -72,7 +72,7 @@ pub const Share = struct {
 };
 
 /// Rank `rank`'s [lo, hi) of `total` elements taken in whole `per`s.
-fn span(total: usize, per: usize, rank: usize, world: usize) !Span {
+pub fn span(total: usize, per: usize, rank: usize, world: usize) !Span {
     if (total % per != 0 or world > 256) return error.BadSplit;
     const ones: [256]u64 = @splat(1);
     var out: [256]canon.Range = undefined;

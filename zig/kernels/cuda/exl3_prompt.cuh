@@ -45,10 +45,11 @@ __device__ __forceinline__ void ttile(int q, int cb, int& mat, int& nt) {
 }
 
 // Main loop: acc[i][nb] = warp tile i x members nb * 8 .. + 7 over K; XR rows a stage (TPM if X0 == X1, else 2 TPM).
-template <int MATS, int XR>
+// XK: member rows `xk` halves apart (a TF_GLM_OVN_X3_ROTEXPERT narrow down share reads K of each row), else K.
+template <int MATS, int XR, bool XK = false>
 __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
         const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
-        half* stage, float (&acc)[TMT][TNB][4]) {
+        half* stage, float (&acc)[TMT][TNB][4], int xk = 0) {
     constexpr int SH = tstage_halves<XR>();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     int mat, nt_unused;
@@ -70,7 +71,7 @@ __device__ __forceinline__ void tmain(const half* __restrict__ X0, const half* _
             const int m = idx / (TPM * (TBK / 8)), rem = idx % (TPM * (TBK / 8)), i = rem / (TBK / 8), j = rem % (TBK / 8);
             if (i >= nblocks * 16) continue;   // a 16-member block without a member: never read
             const int r = rows_sh[i];
-            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + j * 8;
+            const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * (XK ? xk : K) + k0 + j * 8;
             cp_async16(dst + ((size_t)m * TPM + i) * TXS + j * 8, src, r >= 0);
         }
         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)XR * TXS);

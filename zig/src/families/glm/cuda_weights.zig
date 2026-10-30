@@ -432,10 +432,10 @@ const Loader = struct {
         try L.whole(try L.get("layers.{d}.mlp.gate.e_score_correction_bias", .{i}), .f32);
         const bias = try L.put("layers.{d}.moe.bias", .{i});
         const count: usize = c.experts;
-        var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
+        var routed: cuda.experts.Layer = .{ .format = .nvfp4, .up = 0, .down = 0, .width = if (c.exl3) try exl3.routedWidth(L.w.share, c.moe_inter) else ni, .dims = d, .experts = count, .limit = c.swiglu_limit };
         var x3: ?exl3.Experts = null;
         if (c.exl3) { // the MTP layer's experts too
-            x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
+            x3 = try exl3.load(L, i, count, d, c.moe_inter, L.w.share);
             if (!x3.?.shx) L.w.exl3_shx = false;
         } else routed = try L.nvfp4Experts(i);
         const sh = L.w.share.shared;

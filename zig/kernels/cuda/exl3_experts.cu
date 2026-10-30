@@ -109,7 +109,7 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     const int k2 = mat ? a.k2_1[e] : a.k2_0[e];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
-    const int NTILES = a.ns > 0 ? a.ns : (a.n >> 4); // row stride of the trellis, in tiles
+    const int NTILES = a.ns > 0 ? a.ns : ((OVN && ot.rm && !ot.rk ? rot_cols(ot, e, a.n) : a.n) >> 4); // trellis row stride, tiles
 
     __shared__ int rows_sh[16];
     if (threadIdx.x < 16) {
@@ -121,10 +121,11 @@ __device__ __forceinline__ void grouped_body(const GroupedArgs a, int u, int nbl
     }
     __syncthreads();
     if (rows_sh[0] < 0) return; // members come first, so this tile is empty
+    if (OVN && ot.rm && !ot.rk && nblock * NT * 16 >= rot_cols(ot, e, a.n)) return rot_zero<NT>(a, rows_sh, mat, split, nblock * NT);
     const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
     const half* x0 = X + (size_t)(r0 < 0 ? 0 : (OVN && ot.xrow ? r0 / a.slots : r0)) * a.k + 2 * t;
     const half* x1 = X + (size_t)(r1 < 0 ? 0 : (OVN && ot.xrow ? r1 / a.slots : r1)) * a.k + 2 * t;
-    const int per_warp = (a.k >> 4) / a.sk / W;
+    const int per_warp = ((OVN && ot.rm && ot.rk ? rot_cols(ot, e, a.k) : a.k) >> 4) / a.sk / W; // ROTEXPERT: the share's K
     const int kt0 = split * (per_warp * W) + warp * per_warp;
     const int nt0 = nblock * NT;
 

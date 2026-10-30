@@ -30,10 +30,11 @@ __device__ __forceinline__ void kdecode(uint32_t w, int lane, uint32_t (&b0)[2],
 }
 
 // tmain over 64-k stages (exl3.cu:648-722, FST: ots0127's addressing hoisted): the same mma chains in the same k order.
-template <int MATS, int XR, bool FST>
+// XK: member rows `xk` halves apart, as tmain's.
+template <int MATS, int XR, bool FST, bool XK = false>
 __device__ __forceinline__ void kmain(const half* __restrict__ X0, const half* __restrict__ X1, const uint64_t* __restrict__ tp0,
         const uint64_t* __restrict__ tp1, const int* rows_sh, int cnt, int e, int K, int NTILES, int cb, int xdiv,
-        half* stage, float (&acc)[TMT][TNB][4]) {
+        half* stage, float (&acc)[TMT][TNB][4], int xk = 0) {
     constexpr int NST = kstages<XR>(), SH = kstage_halves<XR>();
     constexpr int XP = XR * (KBK / 8), WP = 16 * KKT * 8;   // a stage's 16-byte pieces: member rows, trellis words
     constexpr int RPT = (XP + TT - 1) / TT, WPT = (WP + TT - 1) / TT;
@@ -62,7 +63,7 @@ __device__ __forceinline__ void kmain(const half* __restrict__ X0, const half* _
             const int m = idx / (TPM * (KBK / 8)), rem = idx % (TPM * (KBK / 8)), i = rem / (KBK / 8), j = rem % (KBK / 8);
             xon[p] = idx < XP && i < nblocks * 16;   // a 16-member block without a member: never read
             const int r = xon[p] ? rows_sh[i] : -1;
-            xsrc[p] = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + j * 8;
+            xsrc[p] = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * (XK ? xk : K) + j * 8;
             xoff[p] = (m * TPM + i) * KXS + kswz(i, j) * 8;
             xok[p] = r >= 0;
         }
@@ -93,7 +94,7 @@ __device__ __forceinline__ void kmain(const half* __restrict__ X0, const half* _
                 const int m = idx / (TPM * (KBK / 8)), rem = idx % (TPM * (KBK / 8)), i = rem / (KBK / 8), j = rem % (KBK / 8);
                 if (i >= nblocks * 16) continue;   // a 16-member block without a member: never read
                 const int r = rows_sh[i];
-                const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * K + k0 + j * 8;
+                const half* src = (m ? X1 : X0) + (size_t)(r < 0 ? 0 : (r / xdiv)) * (XK ? xk : K) + k0 + j * 8;
                 cp_async16(dst + ((size_t)m * TPM + i) * KXS + kswz(i, j) * 8, src, r >= 0);
             }
             for (int idx = threadIdx.x; idx < WP; idx += TT) {   // 16-byte pieces of the 128-byte tile words
@@ -155,20 +156,24 @@ __device__ __forceinline__ int kitem(const int* __restrict__ counts, const int* 
 }
 
 // tgateup with V: 0 tmain and scalar stores, 1 ots0106's kmain and packed stores, 2 plus ots0127's hoisting.
+// rm, rr, rwn, rwx: TF_GLM_OVN_X3_ROTEXPERT (exl3_ovn.cuh rot_share; rm 0: every expert N columns).
 template <int XR, int V>
 __device__ __forceinline__ void ogateup(const half* __restrict__ Xg, const half* __restrict__ Xu, const uint64_t* __restrict__ Tg,
         const uint64_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts, const int* __restrict__ members,
         const half* __restrict__ svh_g, const half* __restrict__ svh_u, const half* __restrict__ suh_d, half* __restrict__ xd,
-        int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ order, unsigned char* smem_raw, int* rows_sh) {
+        int K, int N, int xdiv, float limit, int act_mode, const int* __restrict__ order, int rm, int rr, int rwn, int rwx,
+        unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = kitem(counts, order);
     if (item < 0) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    const int ncols = rot_share(e, N, rm, rr, rwn, rwx); // this expert's share; N its row stride in xd and the scales
+    if (cb * 128 >= ncols) return; // a narrow share has no such column block (the down kernel never reads one)
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
-    if constexpr (V == 0) tmain<2, XR>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
-    else kmain<2, XR, V == 2>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, N >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+    if constexpr (V == 0) tmain<2, XR>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, ncols >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
+    else kmain<2, XR, V == 2>(Xg, Xu, Tg, Tu, rows_sh, cnt, e, K, ncols >> 4, cb, xdiv, reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
     ttile<2>(warp * TMT, cb, mat, nt);
@@ -236,19 +241,22 @@ __device__ __forceinline__ void ogateup(const half* __restrict__ Xg, const half*
 }
 
 // The down epilogue: pair p to row p / slots, slot p % slots of `ys` slots a row (fp32, or bf16 when `bf16`).
+// rm, rr, rwn, rwx: TF_GLM_OVN_X3_ROTEXPERT, the share's K of each Xd row K halves long (rm 0: every expert K).
 template <int V>
 __device__ __forceinline__ void odown(const half* __restrict__ Xd, const uint64_t* __restrict__ Td, const int* __restrict__ items,
         const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d, void* __restrict__ y,
-        int K, int D, int slots, int ys, int bf16, const int* __restrict__ order, unsigned char* smem_raw, int* rows_sh) {
+        int K, int D, int slots, int ys, int bf16, const int* __restrict__ order, int rm, int rr, int rwn, int rwx,
+        unsigned char* smem_raw, int* rows_sh) {
     const int cb = blockIdx.x, item = kitem(counts, order);
     if (item < 0) return;
     const int e = items[3 * item], first = items[3 * item + 1], cnt = items[3 * item + 2];
+    const int kcols = rot_share(e, K, rm, rr, rwn, rwx);
     if (threadIdx.x < TPM) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[TMT][TNB][4];
-    if constexpr (V == 0) tmain<1, TPM>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
-    else kmain<1, TPM, V == 2>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc);
+    if constexpr (V == 0) tmain<1, TPM, true>(Xd, Xd, Td, Td, rows_sh, cnt, e, kcols, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc, K);
+    else kmain<1, TPM, V == 2, true>(Xd, Xd, Td, Td, rows_sh, cnt, e, kcols, D >> 4, cb, 1, reinterpret_cast<half*>(smem_raw), acc, K);
     float* Ed = reinterpret_cast<float*>(smem_raw);
     for (int hf = 0; hf < 2 && hf * TPH < cnt; ++hf) {
         if (hf) __syncthreads();
@@ -366,18 +374,18 @@ extern "C" __global__ void __launch_bounds__(1024) tf_exl3_ovn_order(const int* 
     const half *__restrict__ Xg, const half *__restrict__ Xu, const uint64_t *__restrict__ Tg, const uint64_t *__restrict__ Tu, \
         const int *__restrict__ items, const int *__restrict__ counts, const int *__restrict__ members,                        \
         const half *__restrict__ svh_g, const half *__restrict__ svh_u, const half *__restrict__ suh_d, half *__restrict__ xd,  \
-        int K, int N, int xdiv, float limit, int act_mode, const int *__restrict__ order
+        int K, int N, int xdiv, float limit, int act_mode, const int *__restrict__ order, int rm, int rr, int rwn, int rwx
 #define TF_EXL3_OVN_GU_CALL(V, smem)                                                                                    \
     if (xdiv > 1) tf_exl3_ovn::ogateup<TPM, V>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N,    \
-                                              xdiv, limit, act_mode, order, smem, rows_sh);                            \
+                                              xdiv, limit, act_mode, order, rm, rr, rwn, rwx, smem, rows_sh);          \
     else tf_exl3_ovn::ogateup<2 * TPM, V>(Xg, Xu, Tg, Tu, items, counts, members, svh_g, svh_u, suh_d, xd, K, N, 1, limit, \
-                                         act_mode, order, smem, rows_sh)
+                                         act_mode, order, rm, rr, rwn, rwx, smem, rows_sh)
 #define TF_EXL3_OVN_DN_ARGS                                                                                                \
     const half *__restrict__ Xd, const uint64_t *__restrict__ Td, const int *__restrict__ items,                          \
         const int *__restrict__ counts, const int *__restrict__ members, const half *__restrict__ svh_d, void *__restrict__ y, \
-        int K, int D, int slots, int ys, int bf16, const int *__restrict__ order
+        int K, int D, int slots, int ys, int bf16, const int *__restrict__ order, int rm, int rr, int rwn, int rwx
 #define TF_EXL3_OVN_DN_CALL(V, smem) \
-    tf_exl3_ovn::odown<V>(Xd, Td, items, counts, members, svh_d, y, K, D, slots, ys, bf16, order, smem, rows_sh)
+    tf_exl3_ovn::odown<V>(Xd, Td, items, counts, members, svh_d, y, K, D, slots, ys, bf16, order, rm, rr, rwn, rwx, smem, rows_sh)
 
 extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_ovn_gu_0(TF_EXL3_OVN_GU_ARGS) {
     __shared__ __align__(16) unsigned char smem_raw[tsmem_bytes()];
