@@ -64,18 +64,18 @@ pub fn mlaLayers(w: *const weights.Weights) usize {
     return nd;
 }
 
-/// One cache's part of a page: its latent rows (BF16, or E4M3 codes then a FP32 scale a row), then their pools' keys.
+/// One cache's part of a page: its latent rows (BF16, or E4M3 codes then scales), then its pools' keys (pooledRow).
 fn pageCacheBytes(c: anytype, kv8: bool) usize {
-    return latentPageBytes(c, kv8) + page_rows / sparse.pool * c.i_dim * 2;
+    return latentPageBytes(c, kv8) + page_rows / sparse.pool * sparse.pooledRow(c.i_dim);
 }
 
 fn latentPageBytes(c: anytype, kv8: bool) usize {
     return if (kv8) page_rows * (c.kv_lora + 4) else page_rows * c.kv_lora * 2;
 }
 
-/// A page's bytes: every DSA layer's part, then the MTP layer's (13,056 a row on GLM-5.3-Flash, 6,960 with FP8 KV).
+/// A page's bytes: every cache's part (13,056 a row, 6,960 with FP8 KV), in whole 1,024-byte bf16 latent rows (PK8).
 pub fn pageBytes(w: *const weights.Weights, kv8: bool) u64 {
-    return (mlaLayers(w) + mtpCaches()) * pageCacheBytes(&w.config, kv8);
+    return std.mem.alignForward(u64, (mlaLayers(w) + mtpCaches()) * pageCacheBytes(&w.config, kv8), 1024);
 }
 
 /// TF_GLM_OVN_DROP_MTP beside a drafter, set once at engine init (as cuda_kda_block's pad_to): no MTP layer or caches.
@@ -150,7 +150,7 @@ fn stateSizes(gpa: std.mem.Allocator, w: *const weights.Weights, capacity: usize
     const lc_bytes = try latent.cacheBytes(capacity, c.kv_lora, kv8);
     for (0..nd + 1) |j| {
         const z = if (j < nd) 1 else mtpCaches(); // a dropped MTP layer's fields stay in place at no bytes
-        try sizes.appendSlice(gpa, &.{ z * rows * lc_bytes, z * ring_rows * c.i_dim * 2, z * ring_rows * c.i_dim * 2, z * rows * pk_rows * c.i_dim * 2 });
+        try sizes.appendSlice(gpa, &.{ z * rows * lc_bytes, z * ring_rows * c.i_dim * 2, z * ring_rows * c.i_dim * 2, z * rows * pk_rows * sparse.pooledRow(c.i_dim) });
     }
     try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
     if (table) |t| try sizes.append(gpa, t * 4);

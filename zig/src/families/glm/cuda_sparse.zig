@@ -19,6 +19,19 @@ fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
 }
 
+/// TF_GLM_OVN_PK8 (TRADE), set once at engine init (as cuda_state's drop_mtp): pooled keys as kv8 rows (codes, scale).
+pub var pk8 = false;
+
+/// A pooled key's bytes: bf16 values, or with pk8 its `d` E4M3 codes and FP32 scale (glm_pk8_row.cuh's ROW).
+pub fn pooledRow(d: usize) usize {
+    return if (pk8) d + 4 else d * 2;
+}
+
+/// tf_glm_scores' function for the pooled keys' format.
+pub fn scoresFn(set: glue.Set) cuda.Function {
+    return if (pk8) set.glue.scores_pk8 else set.glue.scores;
+}
+
 /// At most wide_rows rows (one wave on 48 SMs) over wide_pools pools or more: 1,024 threads a row, the same bytes.
 const wide_rows = 48;
 const wide_pools = 4096;
@@ -34,7 +47,7 @@ pub fn indexUpdate(set: glue.Set, stream: cuda.Stream, k_raw: u64, k_stride: usi
     try cuda.launch.launch(set.glue.index_write, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 32 } }, stream, &a);
     var b: cuda.Args = .{};
     inline for (.{ ik, ig, ape, pk, pos, @as(i64, @intCast(rows)), t.pt, @as(i64, @intCast(t.ps)) }) |v| b.add(v);
-    try cuda.launch.launch(set.glue.pool_keys, .{ .grid = .{ .x = @intCast(rows / 4 + 2) }, .block = .{ .x = 32 } }, stream, &b);
+    try cuda.launch.launch(if (pk8) set.glue.pool_keys_pk8 else set.glue.pool_keys, .{ .grid = .{ .x = @intCast(rows / 4 + 2) }, .block = .{ .x = 32 } }, stream, &b);
 }
 
 /// sparse.pool_bucket: visible pools for rows pos .. pos + rows - 1, a power of two (at least 1024), at most `np_max`.
@@ -112,7 +125,7 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
         if (d != 128 or heads > 32) return error.IndexShape;
         const quick = if (set.index) |k| if (k.takes(rows, np_max, pk, t.ps)) k else null else null;
         var stamp = prof.span(profile, stream, .index_score);
-        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
+        if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else try cuda.launch.launch(scoresFn(set), .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
         stamp.end();
         stamp = prof.span(profile, stream, .index_select);
         if (quick) |k| {

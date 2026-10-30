@@ -38,7 +38,8 @@ pub const Layer = struct {
     dense_limit: usize, // the largest context whose top-k selection keeps every visible key (Config.keyWidth)
 };
 
-/// The caches: latent bf16 [capacity][lw], index keys/gates bf16 [capacity][128], pooled keys bf16 [pk_rows][128].
+/// The caches: latent bf16 [capacity][lw], index keys/gates bf16 [capacity][128], pooled keys [pk_rows] of
+/// sparse.pooledRow bytes (bf16 [128], or TF_GLM_OVN_PK8's 128 E4M3 codes and an FP32 scale).
 pub const Caches = struct {
     lc: u64,
     ls: u64 = 0,

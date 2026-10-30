@@ -103,6 +103,8 @@ pub const Kernels = struct {
     split_fn: ?cuda.Function = null,
     /// TF_GLM_OVN_INDEX_SCHED (read at load): prompt-sized launches score with tf_glm_index_scores_sched.
     sched_fn: ?cuda.Function = null,
+    /// TF_GLM_OVN_PK8 (sparse.pk8, read at load): every launch scores kv8 pooled keys with tf_glm_index_scores_pk8.
+    pk8_fn: ?cuda.Function = null,
 
     /// `image`: cuda.kernels.glm_index.
     pub fn load(d: *const cuda.Driver, image: []const u8, mode: Mode) !Kernels {
@@ -120,6 +122,7 @@ pub const Kernels = struct {
             .split_rows = sr,
             .split_fn = if (sr > 0) try m.function("tf_glm_index_split") else null,
             .sched_fn = if (cuda.ovn.on("INDEX_SCHED")) try m.function("tf_glm_index_scores_sched") else null,
+            .pk8_fn = if (sparse.pk8) try m.function("tf_glm_index_scores_pk8") else null,
         };
     }
 
@@ -147,7 +150,8 @@ pub const Kernels = struct {
         const g = scoresGrid(rows, nb);
         var a: cuda.Args = .{};
         inline for (.{ qi, wts, @as(i64, @intCast(w_stride)), pk, out, at, @as(i64, @intCast(rows)), @as(i64, @intCast(np)), @as(i64, @intCast(nb)), scale, wscale, @as(i64, @intCast(heads)), @as(c_int, @intCast(tileLoop(rows))), pt, @as(i64, @intCast(ps)) }) |v| a.add(v);
-        const f = if (k.sched_fn) |x| (if (rows >= rows_from) x else k.scores_fn) else k.scores_fn;
+        const plain = if (k.sched_fn) |x| (if (rows >= rows_from) x else k.scores_fn) else k.scores_fn;
+        const f = k.pk8_fn orelse plain; // kv8 keys: one scorer for every size (INDEX_SCHED's schedule is bf16 only)
         try cuda.launch.launch(f, .{ .grid = .{ .x = g[0], .y = g[1] }, .block = .{ .x = threads } }, s, &a);
     }
 
