@@ -45,6 +45,7 @@ pub const Modules = struct {
     exl3: exl3.Kernels, // an EXL3 checkpoint's routed experts
     mm: mm_mod.Kernels, // glm_mm: the bf16 linears on tiled weights
     index: ?index_mod.Kernels, // TF_GLM_INDEX_CUDA: a prompt chunk's indexer scores and pools (glm_index)
+    pools32: bool = false, // TF_GLM_OVN_POOLS32: a split prompt indexer gathers its picks as int32
     tiled: bool = false, // eligible bf16 linears are tiled; KDA inputs with uneven strides retain their row-major path
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     copy_rows: cuda.Function,
@@ -87,6 +88,7 @@ pub const Modules = struct {
         m.mla = try glue.Mla.read();
         errdefer if (m.index) |*x| x.unload();
         const mode = index_mod.Mode.read() catch return error.BadIndexSetting;
+        _ = index_mod.splitRows() catch return error.BadIndexSetting; // TF_GLM_OVN_DECODE_INDEX: a typo is refused
         if (mode != .off) m.index = index_mod.Kernels.load(d, k.glm_index, mode) catch |err| blk: {
             std.log.warn("TF_GLM_INDEX_CUDA: the indexer kernels are not used ({t}); prompt chunks use tf_glm_scores", .{err});
             break :blk null;
@@ -95,6 +97,7 @@ pub const Modules = struct {
         m.pdl_early = try cuda.ovn.int("PDL_EARLY", 0);
         m.moe_ovn = moe.Ovn.read();
         m.tiled = false;
+        m.pools32 = cuda.ovn.on("POOLS32");
         m.packs = null; // `m` starts undefined: the field default does not apply
         m.side = try moe_side.Side.init(d); // last: nothing after it fails
         return m;
@@ -303,7 +306,7 @@ pub const Forward = struct {
         if (!f.index_split or !r.b.prefill) return null;
         return switch (f.exchange) {
             .local => null,
-            .nccl => |x| .{ .lib = x.lib, .comm = x.comm, .rank = r.w.share.rank, .world = r.w.share.world },
+            .nccl => |x| .{ .lib = x.lib, .comm = x.comm, .rank = r.w.share.rank, .world = r.w.share.world, .int32 = f.m.pools32 },
         };
     }
 

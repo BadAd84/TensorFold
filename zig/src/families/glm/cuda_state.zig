@@ -260,7 +260,7 @@ pub const Buffers = struct {
             partial_rows * HL * 4,
             4, // dummy
             @min(seg, sparse.select_rows) * np_max * 4,
-            rows * sparse.select_list * 4,
+            @max(rows * sparse.select_list * 4, try sparse.ovnListBytes(rows, seg, prefill, s.world, np_max)),
             rows * sparse.select_list * 4,
             (if (prefill) rows + s.world else rows) * sparse.topk_pools * 8, // pools; a split's equal blocks end at most world - 1 rows past them
             4,

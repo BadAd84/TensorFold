@@ -5,10 +5,10 @@ const check = @import("check.zig");
 const glm = @import("glm_cuda");
 const sp = glm.sparse;
 
-const d = 128;
-const page_bytes = 65536; // a page's stride: 128 pools of keys in its first half, as a page that also holds other rows
+pub const d = 128;
+pub const page_bytes = 65536; // a page's stride: 128 pools of keys in its first half, as pages holding other rows
 
-const Case = struct { cap: usize, pos: usize, rows: usize, heads: usize = 32, paged: bool = false, bits: bool = false };
+pub const Case = struct { cap: usize, pos: usize, rows: usize, heads: usize = 32, paged: bool = false, bits: bool = false };
 const cases = [_]Case{
     .{ .cap = 4096, .pos = 300, .rows = 512 }, // few visible pools: the rows select over their first 512
     .{ .cap = 1024, .pos = 4 * 1024 - 520, .rows = 512 },
@@ -31,15 +31,15 @@ const cases = [_]Case{
     .{ .cap = 262144, .pos = 4 * 262144 - 20, .rows = 16 }, // 1M tokens
 };
 
-fn bf16(x: f32) u16 {
+pub fn bf16(x: f32) u16 {
     const b: u32 = @bitCast(x);
     return @intCast((b + 0x7FFF + ((b >> 16) & 1)) >> 16);
 }
 
-const Bufs = std.ArrayList(cuda.DeviceBuffer);
+pub const Bufs = std.ArrayList(cuda.DeviceBuffer);
 
 /// n zeroed device bytes, freed with the case.
-fn zeros(gpu: check.Gpu, bufs: *Bufs, n: usize) !u64 {
+pub fn zeros(gpu: check.Gpu, bufs: *Bufs, n: usize) !u64 {
     var b = try cuda.DeviceBuffer.alloc(gpu.d, n);
     errdefer b.free();
     try b.fill8(0, null);
@@ -48,7 +48,7 @@ fn zeros(gpu: check.Gpu, bufs: *Bufs, n: usize) !u64 {
     return b.ptr;
 }
 
-fn fromHost(gpu: check.Gpu, bufs: *Bufs, bytes: []const u8) !u64 {
+pub fn fromHost(gpu: check.Gpu, bufs: *Bufs, bytes: []const u8) !u64 {
     var b = try cuda.DeviceBuffer.fromHost(gpu.d, bytes);
     errdefer b.free();
     try bufs.append(gpu.gpa, b);
@@ -212,7 +212,7 @@ fn blocks(gpu: check.Gpu, bufs: *Bufs, set: glm.glue.Set, idx: *const glm.index.
 }
 
 /// Two device buffers of n bytes compared; 1 if any 4-byte word differs.
-fn same(gpu: check.Gpu, what: []const u8, a: u64, b: u64, n: usize, np: usize, c: Case) !usize {
+pub fn same(gpu: check.Gpu, what: []const u8, a: u64, b: u64, n: usize, np: usize, c: Case) !usize {
     const ha = try gpu.gpa.alloc(u8, n);
     defer gpu.gpa.free(ha);
     const hb = try gpu.gpa.alloc(u8, n);

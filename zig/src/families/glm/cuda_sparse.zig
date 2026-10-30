@@ -54,11 +54,22 @@ pub fn headScale(heads: usize) f32 {
     return @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(heads))));
 }
 
-/// The scratch of one selectTokens: scores fp32 [min(rows, 512)][np], and with np past select_list the list rows.
+/// The scratch of one selectTokens: scores fp32 [min(rows, 512)][np], and with np past select_list the list rows
+/// (ls, li; ls at least ovnListBytes: TF_GLM_OVN_DECODE_INDEX's split tables, TF_GLM_OVN_POOLS32's int32 pools).
 pub const Scratch = struct { scores: u64, ls: u64, li: u64, pools: u64, at: u64 };
 
-/// A prompt chunk's indexer rows split across the ranks (TF_GLM_INDEX_SPLIT): a block each, the picks all-gathered.
-pub const Split = struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize };
+/// The bytes the TF_GLM_OVN_ knobs need at Scratch.ls (0 with them off): `seg` the most rows one selectTokens
+/// takes, np_max the most pools a row scores; a prefill buffer's `rows` gather world - 1 rows more (Split.int32).
+pub fn ovnListBytes(rows: usize, seg: usize, prefill: bool, world: usize, np_max: usize) !usize {
+    const index = @import("cuda_index.zig");
+    const sr = try index.splitRows();
+    const tables = if (sr > 0) index.splitBytes(@min(seg, sr - 1), np_max) else 0;
+    return @max(tables, if (prefill and cuda.ovn.on("POOLS32")) (rows + world) * topk_pools * 4 else 0);
+}
+
+/// A prompt chunk's indexer rows split across the ranks (TF_GLM_INDEX_SPLIT): a block each, the picks all-gathered;
+/// `int32` (TF_GLM_OVN_POOLS32, read at load) gathers them as int32 at Scratch.ls.
+pub const Split = struct { lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, int32: bool = false };
 
 /// Whether rank 0 splits a prompt chunk's indexer rows at `start`: from `from` on (0: never), over two ranks or more.
 pub fn splitAt(start: usize, from: usize, world: usize) bool {
@@ -102,11 +113,18 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
         if (quick) |k| try k.scores(stream, qi + a * heads * d * 2, wts + a * w_stride * 2, w_stride, pk, s.scores, at, n, np_max, nb, scale, headScale(heads), heads, t.pt, t.ps) else try cuda.launch.launch(set.glue.scores, .{ .grid = .{ .x = @intCast(n), .y = @intCast(cdiv(nb, loop)) }, .block = .{ .x = 128 } }, stream, &sa);
         stamp.end();
         stamp = prof.span(profile, stream, .index_select);
-        if (quick) |k| if (k.select) {
-            try k.pools(stream, s.scores, s.pools + a * topk_pools * 8, at, n, np_max, 0);
-            stamp.end();
-            continue;
-        };
+        if (quick) |k| {
+            if (split == null and k.splits(rows, np_max)) { // TF_GLM_OVN_DECODE_INDEX: the window's tokens directly
+                try k.selectSplit(stream, s.scores, at, n, np_max, s.ls, tokens, counts, t.pt, t.page_rows);
+                stamp.end();
+                return;
+            }
+            if (k.select or k.decodeSelect(rows)) {
+                try k.pools(stream, s.scores, s.pools + a * topk_pools * 8, at, n, np_max, 0);
+                stamp.end();
+                continue;
+            }
+        }
         var sel: cuda.Args = .{};
         inline for (.{ s.scores, s.pools + a * topk_pools * 8, @as(i64, @intCast(np_max)), at, @as(c_int, topk_pools) }) |v| sel.add(v);
         const wide = wideSelect(n, np_max);
@@ -115,13 +133,24 @@ pub fn selectTokensProfile(set: glue.Set, ops: cuda.Module, stream: cuda.Stream,
     }
     const stamp = prof.span(profile, stream, .index_select);
     defer stamp.end();
+    var picks = s.pools; // the pools the tokens are read from: int64, or the int32 ones gathered at s.ls
+    var assemble = try ops.function("tf_glm_dsa_tokens");
     if (split) |x| { // in place: each rank's equal block (the prefill buffers' pools hold world rows more), rank order
-        const bytes = per * topk_pools * 8;
-        try x.lib.check(x.lib.api.ncclAllGather(s.pools + x.rank * bytes, s.pools, bytes, .u8, x.comm, stream.handle), "ncclAllGather");
+        if (x.int32) { // this rank's block packed to int32 at its place in s.ls, gathered there: half the bytes
+            const n32 = per * topk_pools;
+            var pa: cuda.Args = .{};
+            inline for (.{ s.pools + x.rank * n32 * 8, s.ls + x.rank * n32 * 4, @as(i64, @intCast(n32)) }) |v| pa.add(v);
+            try cuda.launch.launch(try ops.function("tf_glm_pools_i32"), .{ .grid = .{ .x = @intCast(cdiv(n32, 256)) }, .block = .{ .x = 256 } }, stream, &pa);
+            try x.lib.check(x.lib.api.ncclAllGather(s.ls + x.rank * n32 * 4, s.ls, n32 * 4, .u8, x.comm, stream.handle), "ncclAllGather");
+            picks = s.ls;
+            assemble = try ops.function("tf_glm_dsa_tokens_i32");
+        } else {
+            const bytes = per * topk_pools * 8;
+            try x.lib.check(x.lib.api.ncclAllGather(s.pools + x.rank * bytes, s.pools, bytes, .u8, x.comm, stream.handle), "ncclAllGather");
+        }
     }
-    const assemble = try ops.function("tf_glm_dsa_tokens");
     var args: cuda.Args = .{};
-    args.add(s.pools);
+    args.add(picks);
     args.add(pos);
     args.add(@as(c_int, topk_pools));
     args.add(tokens);
