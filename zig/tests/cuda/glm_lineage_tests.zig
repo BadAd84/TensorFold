@@ -119,8 +119,8 @@ const Run = struct {
         const words = try disk.Words.decode(std.mem.bytesToValue([6]u64, imgs[0][0..disk.Words.bytes]), at);
         e.dropState(id);
         const back = try ranks.blank(e, at);
+        try ranks.seal(e, back, words); // the reader's order (cuda_glm_disk.zig scatter): sealed from the words, then filled
         for (imgs, 0..) |img, rank| try ranks.put(e, @intCast(rank), back, 0, img);
-        try ranks.seal(e, back, words);
         return back;
     }
 };
