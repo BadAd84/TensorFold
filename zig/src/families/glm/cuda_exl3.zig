@@ -155,12 +155,19 @@ fn picksBytes(rows: usize) usize {
     const cap: usize = @min(rows, chunk_rows);
     return std.mem.alignForward(usize, cap * top_k * 4, 256);
 }
-pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
+/// The prompt path's TF_GLM_OVN_* switches (EY_DIRECT, X3_PROMPT_K64, X3_PROMPT_ORDER, X3_YBF16); all off by default.
+pub const Ovn = common.prompt.Ovn;
+/// `o`: the switches the kernels run with (Kernels' `prompt.ovn`; Ovn.fromEnv() before they load).
+pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, o: Ovn) [4]usize {
     const n: usize = @min(rows, chunk_rows);
     var l = shape(dims, width);
     l.shared_input = shx;
-    if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
+    if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k, o) catch unreachable), 4, 4, 4 };
     return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
+}
+/// TF_GLM_OVN_X3_YBF16 (a numerics trade): a fused EXL3 prompt chunk's slot rows in bf16, as an NVFP4 chunk's.
+pub fn bf16Slots(k: *const Kernels, dims: usize, width: usize) bool {
+    return k.prompt.ovn.ybf16 and common.prompt.eligible(shape(dims, width));
 }
 /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
 fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
@@ -175,6 +182,8 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     const cap: usize = @min(rows, chunk_rows);
     const arena = sc.picks + picksBytes(rows);
     const fused = prompt and common.prompt.eligible(l);
+    const o = k.prompt.ovn;
+    const eb: usize = if (fused and o.ybf16) 2 else 4; // a slot value's bytes (bf16Slots)
     var at: usize = 0;
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
@@ -184,15 +193,17 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
         }
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
         const output = if (fused) blk: {
-            const scratch = try common.prompt.scratch(arena, l, cap, top_k);
-            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf);
+            const scratch = try common.prompt.scratch(arena, l, cap, top_k, o);
+            const to: common.prompt.Out = if (o.ey_direct) .{ .y = ey + at * slots * dims * eb, .slots = slots } else .{ .y = scratch.y, .slots = top_k };
+            try k.prompt.run(k, ek.router, stream, l, x + at * x_stride * 2, x_stride, sc.picks, n, scratch, plan_buf, to);
             break :blk scratch.y;
         } else blk: {
             const scratch = try common.scratch(arena, l, cap, top_k);
             try k.runSlots(stream, l, x + at * x_stride * 2, x_stride, .bf16, sc.picks, n, scratch);
             break :blk scratch.y;
         };
-        try copyRows(stream, ey + at * slots * dims * 4, slots * dims * 4, output, top_k * dims * 4, top_k * dims * 4, n, "EXL3 routed output slots");
+        if (fused and o.ey_direct) continue; // EY_DIRECT: the down kernel wrote ey's routed slots in place
+        try copyRows(stream, ey + at * slots * dims * eb, slots * dims * eb, output, top_k * dims * eb, top_k * dims * eb, n, "EXL3 routed output slots");
     }
 }
 

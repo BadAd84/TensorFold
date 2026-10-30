@@ -593,3 +593,6 @@ extern "C" __global__ void __launch_bounds__(256, 2) tf_exl3_prompt_down(const h
         }
     }
 }
+
+// TF_GLM_OVN_* prompt variants (exl3_prompt.zig selects them only when a switch is on).
+#include "exl3_prompt_ovn.cuh"

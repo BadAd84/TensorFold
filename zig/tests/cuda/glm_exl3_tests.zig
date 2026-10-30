@@ -111,7 +111,7 @@ fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: S
         .rank = try r.zeros((if (wide) P else 1) * 4),
         .hist = try r.zeros((if (wide) (P + 1023) / 1024 * E else 1) * 4),
     };
-    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx);
+    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx, k.prompt.ovn);
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * D * 4);
     const xd = try r.zeros(P * N * 2);
@@ -184,6 +184,41 @@ fn expect(r: *Rig, name: []const u8, out: Run, s: Set, x: []const u16, pk: []con
     try check.expect(most <= 1, "{s} within its float64 tolerance", .{name});
 }
 
+/// TF_GLM_OVN_* prompt switches against every switch off: equal bytes (X3_YBF16: each value rounded once to bf16).
+fn switches(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: Set, x: []const u16, pk: []const i32, rows: usize) !void {
+    const n = rows * slots * D;
+    var k0 = k.*;
+    k0.prompt.ovn = .{};
+    try k0.prompt.prepare(k0.mod);
+    const want = try r.back((try run(r, &k0, ek, s, x, pk, rows, true)).ey, n * 4);
+    const cases = [_]glm.exl3.Ovn{
+        .{ .ey_direct = true },
+        .{ .k64 = 1 },
+        .{ .k64 = 2 },
+        .{ .order = true },
+        .{ .ey_direct = true, .k64 = 2, .order = true },
+        .{ .ybf16 = true },
+        .{ .ybf16 = true, .ey_direct = true, .k64 = 1, .order = true },
+    };
+    for (cases, 0..) |o, c| {
+        var kv = k.*;
+        kv.prompt.ovn = o;
+        try kv.prompt.prepare(kv.mod);
+        const got = try run(r, &kv, ek, s, x, pk, rows, true);
+        if (!o.ybf16) {
+            try check.sameBytes(try std.fmt.allocPrint(r.a, "glm-exl3 prompt switches case {d} ({d} rows)", .{ c, rows }), try r.back(got.ey, n * 4), want);
+            continue;
+        }
+        const raw = try r.back(got.ey, n * 2);
+        for (0..n) |i| {
+            const u = std.mem.readInt(u32, want[i * 4 ..][0..4], .little);
+            const rounded: u16 = if (u == 0xffffffff) 0xffff else @intCast((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+            const g = std.mem.readInt(u16, raw[i * 2 ..][0..2], .little);
+            try check.expect(g == rounded, "glm-exl3 prompt switches case {d} ({d} rows): element {d} is {x}, want {x}", .{ c, rows, i, g, rounded });
+        }
+    }
+}
+
 pub fn run_(gpu: Gpu) !void {
     var arena: std.heap.ArenaAllocator = .init(gpu.gpa);
     defer arena.deinit();
@@ -223,6 +258,7 @@ pub fn run_(gpu: Gpu) !void {
             const pk = try picks(&r, rows);
             const got = try run(&r, &k, &ek, s, x, pk, rows, true);
             try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
+            try switches(&r, &k, &ek, s, x, pk, rows);
             if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
                 const all = try r.back(got.ey, rows * slots * D * 4);
                 for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
