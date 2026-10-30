@@ -76,7 +76,8 @@ pub fn fill(k: Kernels, stream: cuda.Stream, l: Layer, s: Scratch, x: u64, x_str
     const d = l.routed.dims;
     const slots = l.top_k + 1;
     const n = hi - lo;
-    const bf16_slots = prompt and l.exl3 == null; // the slot rows: bf16 in an NVFP4 prompt chunk, else fp32
+    // the slot rows: bf16 in an NVFP4 prompt chunk (an EXL3 one under TF_GLM_OVN_X3_YBF16), else fp32
+    const bf16_slots = prompt and (l.exl3 == null or exl3.bf16Slots(k.exl3, d, l.routed.width));
     const eb: usize = if (bf16_slots) 2 else 4;
     try projection.matmul(k.set, stream, l.shared_gu, x + lo * x_stride * 2, x_stride, s.sgu + lo * 2 * l.shared * 2, s.mm_part, n, 2 * l.shared, d, false);
     try glue.swiglu(k.set, stream, s.sgu + lo * 2 * l.shared * 2, s.sact + lo * l.shared * 2, s.sxs + lo * (l.shared / 64) * 4, l.routed.limit, n, l.shared);
