@@ -85,6 +85,15 @@ pub const Kernels = struct {
     merge: cuda.Function,
     scores: cuda.Function,
     router16: ?cuda.Function, // TF_GLM_OVN_ROUTER16=<stages, 3 or 4>: 16-row router tiles for up to 16 rows (else null)
+    // TF_GLM_OVN_HC_ROWS=16|32 (prompt rows) and TF_GLM_OVN_HC_DEC (rows under 64): glm_glue_hc_rows.cuh (hcLoad)
+    hc_partial16: ?cuda.Function,
+    hc_partial32: ?cuda.Function,
+    hc_row16: ?cuda.Function,
+    hc_row16_f32w: ?cuda.Function,
+    hc_row32: ?cuda.Function,
+    hc_row32_f32w: ?cuda.Function,
+    hc_partial48: ?cuda.Function,
+    hc_partial48_pdl: ?cuda.Function,
     // TF_GLM_OVN_GLUE_FUSE (hcGlue), TF_GLM_OVN_GLUE_ROW (hcRow) and TF_GLM_OVN_PDL_EARLY's variants (Set.pdl_early)
     hc_glue: cuda.Function,
     hc_glue_f32w: cuda.Function,
@@ -140,6 +149,7 @@ pub const Kernels = struct {
         }
         const router16 = try cuda.ovn.int("ROUTER16", 0);
         k.router16 = if (router16 == 0) null else try m.function(if (router16 == 4) "tf_glm_router16_s4" else "tf_glm_router16_s3");
+        try hcLoad(&k, m, try hcRows(), cuda.ovn.on("HC_DEC"));
         try k.bmm_tile.allowDynamicShared(bmm_tile_smem);
         try k.bmm_tile1.allowDynamicShared(bmm_tile1_smem[1]);
         try k.chunks_16.allowDynamicShared(chunksSmem(16));
@@ -321,18 +331,67 @@ pub fn hcPartBytes(rows: usize) usize {
     return rows * hc_blocks * 32 * 4;
 }
 
+/// TF_GLM_OVN_HC_ROWS: unset or 0 off, else 16 or 32 prompt rows a block; any other value is refused.
+pub fn hcRows() error{BadOvnKnob}!u32 {
+    const n = try cuda.ovn.int("HC_ROWS", 0);
+    return switch (n) {
+        0, 16, 32 => @intCast(n),
+        else => error.BadOvnKnob,
+    };
+}
+
+/// HC_ROWS' row kernels' dynamic shared memory: a block's partials, rows x hc_blocks x 32 fp32.
+pub fn hcRowSmem(rows: u32) u32 {
+    return rows * hc_blocks * 32 * 4;
+}
+
+/// HC_ROWS' kernels for `rows` (16 or 32, 0 none) and HC_DEC's when `dec` into `k`, every other of them null.
+pub fn hcLoad(k: *Kernels, m: cuda.Module, rows: u32, dec: bool) !void {
+    inline for (.{ 16, 32 }) |n| {
+        const p = std.fmt.comptimePrint("{d}", .{n});
+        @field(k, "hc_partial" ++ p) = if (rows == n) try m.function("tf_glm_hc_partial" ++ p) else null;
+        inline for (.{ "", "_f32w" }) |w| {
+            const f = if (rows == n) try m.function("tf_glm_hc_row" ++ p ++ w) else null;
+            if (f) |x| try x.allowDynamicShared(hcRowSmem(n));
+            @field(k, "hc_row" ++ p ++ w) = f;
+        }
+    }
+    k.hc_partial48 = if (dec) try m.function("tf_glm_hc_partial48") else null;
+    k.hc_partial48_pdl = if (dec) try m.function("tf_glm_hc_partial48_pdl") else null;
+}
+
+/// HC_ROWS' kernel for prompt rows (`prompt`: the forward's b.prefill, as production's prompt=), and its rows a block.
+const RowsForm = struct { f: cuda.Function, n: u32 };
+fn rowsForm(prompt: bool, by16: ?cuda.Function, by32: ?cuda.Function) ?RowsForm {
+    if (!prompt) return null;
+    if (by32) |f| return .{ .f = f, .n = 32 };
+    if (by16) |f| return .{ .f = f, .n = 16 };
+    return null;
+}
+
 /// glue.hc_pre: streams [rows][s d] -> the collapsed RMS-normed row and its 64-sums `xs`; `post`, `comb` (Sinkhorn).
 pub fn hcPre(set: Set, stream: cuda.Stream, x: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, part: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize) !void {
     if (d != 4096 or s != 4) return error.HcShape;
+    const k = set.glue;
     var a: cuda.Args = .{};
     inline for (.{ x, fn_w, part, i64of(s * d), @as(c_int, hc_blocks) }) |v| a.add(v);
-    // Decode windows (16 blocks a row) take each block's 8 steps at once; prompt rows 4 rows a 128-thread block.
-    if (rows < 64) {
-        const p8 = if (set.pdl_early) set.glue.hc_partial8_pdl else set.glue.hc_partial8; // _pdl: launched dependent
-        try cuda.launch.launch(p8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_early }, stream, &a);
+    // Prompt rows: HC_ROWS' R-row blocks; under 64 rows: HC_DEC's hc.cu layout or 16 blocks a row; else 4 rows a block.
+    if (rowsForm(set.prompt, k.hc_partial16, k.hc_partial32)) |r| {
+        a.add(i64of(rows));
+        try cuda.launch.launch(r.f, .{ .grid = .{ .x = cdiv(rows, r.n), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
+    } else if (rows < 64) {
+        if (k.hc_partial48) |plain| {
+            const f = if (set.pdl_early) (k.hc_partial48_pdl orelse return error.HcDecUnloaded) else plain;
+            var c: cuda.Args = .{};
+            inline for (.{ x, fn_w, part, i64of(rows) }) |v| c.add(v);
+            try cuda.launch.launch(f, .{ .grid = .{ .x = hc_blocks, .y = 3, .z = cdiv(rows, 4) }, .block = .{ .x = 288 }, .pdl = set.pdl_early }, stream, &c);
+        } else {
+            const p8 = if (set.pdl_early) k.hc_partial8_pdl else k.hc_partial8; // _pdl: launched dependent
+            try cuda.launch.launch(p8, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 1024 }, .pdl = set.pdl_early }, stream, &a);
+        }
     } else {
         a.add(i64of(rows));
-        try cuda.launch.launch(set.glue.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
+        try cuda.launch.launch(k.hc_partial, .{ .grid = .{ .x = cdiv(rows, 4), .y = hc_blocks }, .block = .{ .x = 128 } }, stream, &a);
     }
     const e = set.pdl_early;
     const f, const w = switch (norm) {
@@ -369,16 +428,18 @@ pub fn hcGlue(set: Set, stream: cuda.Stream, x: u64, xout: u64, g: u64, fn_w: u6
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = hc_blocks }, .block = .{ .x = 256 } }, stream, &a);
 }
 
-/// TF_GLM_OVN_GLUE_ROW: hcPost in place then hcPre of `rows` rows, one kernel of 4 rows a block, their bytes.
+/// TF_GLM_OVN_GLUE_ROW: hcPost in place then hcPre, one kernel of 4 rows a block (prompt rows: HC_ROWS' 16 or 32).
 pub fn hcRow(set: Set, stream: cuda.Stream, x: u64, g: u64, fn_w: u64, base: u64, scale: u64, norm: Norm, out: u64, xs: u64, post: u64, comb: u64, eps: f32, hc_eps: f32, iters: usize, rows: usize, d: usize, s: usize, world: usize) !void {
     if (d != 4096 or s != 4) return error.HcShape;
     inline for (.{ x, g }) |p| if (p % 16 != 0) return error.RowsUnaligned;
-    const f, const w = switch (norm) {
-        .bf16 => |p| .{ set.glue.hc_row, p },
-        .f32 => |p| .{ set.glue.hc_row_f32w, p },
+    const k = set.glue;
+    const f, const w, const r = switch (norm) {
+        .bf16 => |p| .{ k.hc_row, p, rowsForm(set.prompt, k.hc_row16, k.hc_row32) },
+        .f32 => |p| .{ k.hc_row_f32w, p, rowsForm(set.prompt, k.hc_row16_f32w, k.hc_row32_f32w) },
     };
     var a: cuda.Args = .{};
     inline for (.{ x, g, i64of(rows * d), cint(world), fn_w, base, scale, w, out, xs, post, comb, eps, hc_eps, cint(iters), i64of(rows) }) |v| a.add(v);
+    if (r) |h| return cuda.launch.launch(h.f, .{ .grid = .{ .x = cdiv(rows, h.n) }, .block = .{ .x = 256 }, .shared = hcRowSmem(h.n) }, stream, &a);
     try cuda.launch.launch(f, .{ .grid = .{ .x = cdiv(rows, 4) }, .block = .{ .x = 256 } }, stream, &a);
 }
 

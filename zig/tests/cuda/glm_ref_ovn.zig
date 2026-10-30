@@ -125,6 +125,22 @@ fn row(r: *Rig, set: glue.Set) !void {
     check.pass("TF_GLM_OVN_GLUE_ROW: hcRow's residual, normed rows, sums, post and comb equal hcPost + hcPre", .{});
 }
 
+/// HC_ROWS with GLUE_ROW: hcRow on `forms` (prompt sets, 16 and 32 rows a block) equals hcPost then knobs-off hcPre.
+pub fn rowForms(r: *Rig, off: glue.Set, forms: []const glue.Set, sizes: []const usize) !void {
+    for ([_]bool{ false, true }) |f32w| for (sizes) |rows| {
+        const w = try site(r, f32w);
+        const h = try host(r, rows);
+        const a = try dev(r, h, rows);
+        try split(r, off, a, a.g, w, rows);
+        for (forms) |set| {
+            const b = try dev(r, h, rows);
+            try glue.hcRow(set, r.s, b.x, b.g, w.w[0], w.w[1], w.w[2], w.norm, b.out, b.xs, b.post, b.comb, eps, eps, iters, rows, d, s, world);
+            try same(r, if (set.glue.hc_row32 != null) "row glue, 32 rows a block" else "row glue, 16 rows a block", rows, a, a.x, b, b.x, false);
+        }
+    };
+    check.pass("TF_GLM_OVN_HC_ROWS with GLUE_ROW: hcRow's 16- and 32-row blocks equal hcPost + hcPre at every row count", .{});
+}
+
 /// PDL_EARLY: the glue chain on the _pdl kernels (dependent launches included) gives the plain chain's bytes.
 fn early(r: *Rig, set: glue.Set) !void {
     var on = set;

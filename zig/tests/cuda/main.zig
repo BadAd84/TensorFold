@@ -39,6 +39,7 @@ const glm_vision_tests = @import("glm_vision_tests.zig");
 const glm_mm_fixed = @import("glm_mm_fixed_tests.zig");
 const glm_draft_onepass = @import("glm_draft_onepass_tests.zig");
 const glm_mm_bench = @import("glm_mm_bench.zig");
+const glm_hc_bench = @import("glm_hc_bench.zig");
 const glm_mm_ovn = @import("glm_mm_ovn_tests.zig");
 const glm_index_check = @import("glm_index_check.zig");
 const glm_draw1_check = @import("glm_draw1_check.zig");
@@ -268,6 +269,7 @@ const usage =
     \\  glm-mm-fixed              Prompt K policies: FP64, every row alone/batched, offsets and guarded tails
     \\  glm-draft-onepass         TF_GLM_OVN_DRAFT_ONEPASS: the drafter's 4-bit rows in one launch against 16-row launches, byte for byte
     \\  glm-mm-bench              GLM's bf16 linears: b16.matmul against glm_mm, by rows (one GPU)
+    \\  glm-hc-bench              hc_pre's mixing partials (today's, TF_GLM_OVN_HC_ROWS=16/32, _HC_DEC) and the prompt glue forms by rows, warm and cold L2 (one GPU)
     \\  glm-mm-ovn                TF_GLM_OVN_MM_* / SWIGLU_REDUCE / ROUTER16 kernels against today's, byte for byte
     \\  glm-index-check           GLM's indexer with glm_index against tf_glm_scores and tf_glm_select_rows, byte for byte (one GPU)
     \\  glm-draw1                 TF_GLM_OVN_DRAW1's batched greedy picks and top-k candidate draws against the full gather's (one GPU)
@@ -435,6 +437,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return glm_mm_fixed.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-draft-onepass")) return glm_draft_onepass.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-hc-bench")) return glm_hc_bench.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-ovn")) return glm_mm_ovn.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-index-check")) return glm_index_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-draw1")) return glm_draw1_check.run(gpu);
