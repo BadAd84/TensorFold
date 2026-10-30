@@ -38,7 +38,26 @@ pub const Layer = struct {
     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
     limit: f32 = 0, // the SwiGLU clamp (0: none)
     act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
+    gate_base: u64 = 0, // every expert's gate trellis back to back, expert e at e * expertWords (0: not known)
+    up_base: u64 = 0,
+    down_base: u64 = 0,
 };
+
+/// The TF_GLM_OVN_X3_* decode variants (GLM's loader reads them; all off is run() itself). Every one keeps the bits.
+pub const Ovn = struct {
+    loads: Loads = .off, // X3_NC: 1, 2 (16-byte staged loads 1 or 2 k steps ahead), w (one word a lane plus a shuffle)
+    fuse_down: bool = false, // X3_FUSEDOWN: the down kernel writes the slot rows itself (fusedScratch, slots 9)
+    xrow: bool = false, // X3_XROW: one gate/up input rotation a row when every expert shares it
+    pub const Loads = enum { off, nc1, nc2, word };
+    pub fn any(o: Ovn) bool {
+        return o.loads != .off or o.fuse_down or o.xrow;
+    }
+};
+
+/// Words of one expert's trellis of a K x N projection (the loader's contiguous [K/16][N/16][32] layout).
+fn expertWords(k: usize, n: usize) i64 {
+    return @intCast((k / 16) * (n / 16) * 32);
+}
 
 /// What one projection launches (experts.py default_config): the 8-tile 4-warp K splits, shape-fixed; n % 128 required.
 pub fn plan(k: usize, n: usize, gateup: bool) !u32 {
@@ -103,12 +122,26 @@ pub const Scratch = struct {
 
 /// The byte size of the scratch buffers for a layer and row capacity, or error.TileNotBuilt when plan() fails.
 pub fn scratchBytes(l: Layer, rows: usize, slots: usize) !usize {
+    return layoutBytes(l, rows, slots, l.dims * 4);
+}
+
+/// TF_GLM_OVN_X3_FUSEDOWN's scratch: scratchBytes() without y, which the fused down kernel never writes.
+pub fn fusedBytes(l: Layer, rows: usize, slots: usize) !usize {
+    return layoutBytes(l, rows, slots, 0);
+}
+
+/// Whether the down projection takes TF_GLM_OVN_X3_FUSEDOWN: mcg and one K split (TF_EXL3_SPLITK may force more).
+pub fn fusable(l: Layer) bool {
+    return l.codebook == .mcg and (plan(l.width, l.dims, false) catch return false) == 1;
+}
+
+fn layoutBytes(l: Layer, rows: usize, slots: usize, y_pair: usize) !usize {
     const g_sk = try plan(l.dims, l.width, true);
     const d_sk = try plan(l.width, l.dims, false);
     const p = rows * slots;
     const maxu = @min(p, l.experts);
     return align256(p * l.dims * 2) + align256(p * l.dims * 2) + align256(p * l.width * 2) +
-        align256(@max(2 * g_sk * l.width, d_sk * l.dims) * p * 4) + align256(p * l.dims * 4) +
+        align256(@max(2 * g_sk * l.width, d_sk * l.dims) * p * 4) + align256(p * y_pair) +
         align256(maxu * 4) + 256 + align256(maxu * rows * 4);
 }
 
@@ -118,6 +151,17 @@ fn align256(n: usize) usize {
 
 /// The pointers into one allocation of scratchBytes(), or error.TileNotBuilt when plan() fails.
 pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
+    return carve(base, l, rows, slots, l.dims * 4);
+}
+
+/// The pointers into one allocation of fusedBytes(); y is 0 (the fused down writes the caller's slot rows).
+pub fn fusedScratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
+    var sc = try carve(base, l, rows, slots, 0);
+    sc.y = 0;
+    return sc;
+}
+
+fn carve(base: u64, l: Layer, rows: usize, slots: usize, y_pair: usize) !Scratch {
     const p = rows * slots;
     const g_sk = try plan(l.dims, l.width, true);
     const d_sk = try plan(l.width, l.dims, false);
@@ -134,7 +178,7 @@ pub fn scratch(base: u64, l: Layer, rows: usize, slots: usize) !Scratch {
     const xu = take(&at, p * l.dims * 2);
     const xd = take(&at, p * l.width * 2);
     const z = take(&at, @max(2 * g_sk * l.width, d_sk * l.dims) * p * 4);
-    const y = take(&at, p * l.dims * 4);
+    const y = take(&at, p * y_pair);
     const ids = take(&at, maxu * 4);
     const count = take(&at, 4);
     const members = take(&at, maxu * rows * 4);
@@ -153,6 +197,9 @@ pub const Experts = struct {
     prompt: prompt.Kernels = undefined,
     plan_rotate: Function = undefined,
     plan_finish: Function = undefined,
+    ovn_walk: [2]Function = undefined, // TF_GLM_OVN_X3_*: the mcg walker with the variants' tail; [1] one word a lane
+    ovn_nc: [2]Function = undefined, // TF_GLM_OVN_X3_NC=1|2: 16-byte staged trellis loads 1 or 2 k steps ahead
+    ovn_rot_rows: Function = undefined, // TF_GLM_OVN_X3_XROW: rot_in once a row
 
     pub fn load(d: *const Driver) !Experts {
         if (!kernels.available) return error.BuiltWithoutKernels;
@@ -184,6 +231,9 @@ pub const Experts = struct {
         };
         e.gateup = try e.mod.function("tf_exl3_gateup_epilogue");
         e.down_combine = try e.mod.function("tf_exl3_down_combine");
+        e.ovn_walk = .{ try e.mod.function("tf_exl3_ovn_walk"), try e.mod.function("tf_exl3_ovn_walkw") };
+        e.ovn_nc = .{ try e.mod.function("tf_exl3_ovn_nc1"), try e.mod.function("tf_exl3_ovn_nc2") };
+        e.ovn_rot_rows = try e.mod.function("tf_exl3_ovn_rot_rows");
         return e;
     }
 
@@ -198,6 +248,26 @@ pub const Experts = struct {
 
     /// The routed experts of `rows` rows: group, rotate in, grouped gate/up, SwiGLU, grouped down, wts-weighted sum.
     pub fn run(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch) !void {
+        try e.runWith(s, l, x, x_stride, x_dtype, pick, wts, rows, out, sc, .{}, 0);
+    }
+
+    /// The TF_GLM_OVN_X3_* kernel of one grouped launch, or null for run()'s own (the variants are mcg only).
+    fn ovnKernel(e: *const Experts, l: Layer, loads: Ovn.Loads, xrow: bool, fuse: bool, k: usize, sk: u32, ns: usize, b0: u64, b1: u64) ?Function {
+        const four = l.uniform_k2 == 8;
+        const steps = k / 16 / sk / 4; // k steps a warp
+        switch (loads) {
+            .nc1, .nc2 => {
+                const pd: usize = if (loads == .nc1) 1 else 2;
+                if (four and ns == 0 and b0 != 0 and b1 != 0 and steps % pd == 0) return e.ovn_nc[pd - 1];
+            },
+            .word => if (four) return e.ovn_walk[1],
+            .off => {},
+        }
+        return if (xrow or fuse) e.ovn_walk[0] else null;
+    }
+
+    /// run() with the TF_GLM_OVN_X3_* variants `o` (all off: run()'s launches); a fused down writes `ey` [P][D].
+    pub fn runWith(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch, o: Ovn, ey: u64) !void {
         const d = l.dims;
         const w = l.width;
         const slots = sc.slots;
@@ -214,6 +284,10 @@ pub const Experts = struct {
                 return @intCast(v);
             }
         }.f;
+        if (o.fuse_down and (!fusable(l) or ey == 0 or wts != 0)) return error.TileNotBuilt;
+        const ov: Ovn = if (l.codebook == .mcg) o else .{}; // the variants' kernels are mcg only
+        const xrow = ov.xrow and l.shared_input;
+        const fuse = ov.fuse_down;
 
         var a: launch_.Args = .{};
         a.add(pick);
@@ -234,15 +308,17 @@ pub const Experts = struct {
         r.add(l.suh_g);
         r.add(l.suh_u);
         r.add(sc.xg);
-        r.add(sc.xu);
+        r.add(if (xrow) sc.xg else sc.xu);
         r.add(i32d(d));
         r.add(i32d(slots));
         r.add(i32d(l.experts));
-        try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &r);
+        if (xrow) {
+            try launch_.launch(e.ovn_rot_rows, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(d / 128), .z = 1 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &r);
+        } else try launch_.launch(e.rot_in, .{ .grid = .{ .x = @intCast(p), .y = @intCast(d / 128), .z = 2 }, .block = .{ .x = 32, .y = 1, .z = 1 } }, s, &r);
 
         var g: launch_.Args = .{};
         g.add(sc.xg);
-        g.add(sc.xu);
+        g.add(if (xrow) sc.xg else sc.xu);
         g.add(l.gate);
         g.add(l.up);
         g.add(l.gate_k2);
@@ -263,10 +339,12 @@ pub const Experts = struct {
         g.add(@as(i32, 0));
         g.add(@as(i32, -1));
         g.add(i32d(decOrder()));
+        const gk = e.ovnKernel(l, ov.loads, xrow, false, d, g_sk, l.gu_stride, l.gate_base, l.up_base);
+        if (gk != null) addTail(&g, l.gate_base, l.up_base, expertWords(d, w), 0, 0, xrow, false);
         const ord_g: u32 = decOrder();
         const gx: u32 = @intCast(if (ord_g == 1) w / 128 else maxu);
         const gy: u32 = @intCast(if (ord_g == 1) maxu else w / 128);
-        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = gx, .y = gy, .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        try launch_.launch(if (gk) |f| f else if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = gx, .y = gy, .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -306,10 +384,13 @@ pub const Experts = struct {
         dn.add(@as(i32, 0));
         dn.add(@as(i32, -1));
         dn.add(i32d(decOrder()));
+        const dk = e.ovnKernel(l, ov.loads, false, fuse, w, d_sk, 0, l.down_base, l.down_base);
+        if (dk != null) addTail(&dn, l.down_base, l.down_base, expertWords(w, d), l.svh_d, ey, false, fuse);
         const ord_d: u32 = decOrder();
         const dx: u32 = @intCast(if (ord_d == 1) d / 128 else maxu);
         const dy: u32 = @intCast(if (ord_d == 1) maxu else d / 128);
-        try launch_.launch(if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = dx, .y = dy, .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        try launch_.launch(if (dk) |f| f else if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = dx, .y = dy, .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        if (fuse) return; // the down kernel wrote ey's slot rows: no Z, no down_combine
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);
@@ -326,6 +407,17 @@ pub const Experts = struct {
         try launch_.launch(e.down_combine, .{ .grid = .{ .x = @intCast(rows), .y = @intCast(d / 128), .z = 1 }, .block = .{ .x = @intCast(32 * slots), .y = 1, .z = 1 } }, s, &cb);
     }
 };
+
+/// OvnTail (exl3_ovn.cuh) after a grouped launch's GroupedArgs, in its field order.
+fn addTail(a: *launch_.Args, tb0: u64, tb1: u64, ew: i64, svh: u64, y: u64, xrow: bool, fuse: bool) void {
+    a.add(tb0);
+    a.add(tb1);
+    a.add(ew);
+    a.add(svh);
+    a.add(y);
+    a.add(@as(i32, @intFromBool(xrow)));
+    a.add(@as(i32, @intFromBool(fuse)));
+}
 
 test "the plan matches experts.py's for known shapes" {
     try std.testing.expectEqual(@as(u32, 4), try plan(4096, 2048, true)); // GLM_GATEUP
@@ -367,4 +459,17 @@ test "the scratch layout is 256-aligned and covered by scratchBytes" {
     try std.testing.expectEqual(@as(u64, 0), sc.count % 256);
     try std.testing.expectEqual(@as(u64, 0), sc.members % 256);
     try std.testing.expectEqual(@as(usize, @intFromPtr(&buf) + bytes), sc.members + @as(usize, 9) * 64 * 4);
+}
+
+test "TF_GLM_OVN_X3_FUSEDOWN: nine slots without y fit in the eight-slot scratch, and y is never handed out" {
+    for ([_][2]usize{ .{ 4096, 768 }, .{ 4096, 640 }, .{ 512, 256 } }) |shape| {
+        var l: Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .experts = 288, .dims = shape[0], .width = shape[1], .codebook = .mcg, .uniform_k2 = 8 };
+        try std.testing.expect(fusable(l));
+        for (1..65) |rows| try std.testing.expect(try fusedBytes(l, rows, 9) <= try scratchBytes(l, rows, 8));
+        const sc = try fusedScratch(0x10000, l, 4, 9);
+        try std.testing.expectEqual(@as(u64, 0), sc.y);
+        try std.testing.expectEqual(@as(u64, 0x10000 + try fusedBytes(l, 4, 9)), sc.members + align256(36 * 4 * 4));
+        l.codebook = .mul1;
+        try std.testing.expect(!fusable(l));
+    }
 }
