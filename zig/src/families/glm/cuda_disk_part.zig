@@ -57,9 +57,24 @@ pub fn layout(e: *const Engine, at: u32, a: Allocator) ![]rimg.Part {
 /// The image ranges of file `f` of a state at `at` in this rank's layout `parts`, appended to `out`.
 pub fn ranges(parts: []const rimg.Part, at: u32, block: u32, f: File, out: *std.ArrayList(rimg.Range), a: Allocator) !void {
     if (f.kind == .block) return rimg.blockRanges(parts, block, f.window, f.k, out, a);
+    const first = out.items.len; // `out` may already hold earlier files' ranges (Part.readAll lists them all)
     try rimg.ownRanges(parts, at, block, out, a);
     // the words lead the own file: the state is sealed from them before its head and tail are copied in
-    if (out.items.len == 0 or out.items[0].off != 0 or out.items[0].len != image.Words.bytes) return error.SnapshotShape;
+    const mine = out.items[first..];
+    if (mine.len == 0 or mine[0].off != 0 or mine[0].len != image.Words.bytes) return error.SnapshotShape;
+}
+
+test "glm disk part: a state file's words are checked in its own ranges, after blocks listed in the same list" {
+    const a = std.testing.allocator;
+    const at: u32 = 600;
+    const parts = [_]rimg.Part{ .{ .bytes = image.Words.bytes }, .{ .bytes = 100 }, .{ .bytes = at * 8, .row = 8 } };
+    var out: std.ArrayList(rimg.Range) = .empty;
+    defer out.deinit(a);
+    // Part.readAll's shape: every block first, the state's own file last, all into one list
+    for (0..2) |k| try ranges(&parts, at, 256, .{ .name = @splat(1), .kind = .block, .k = @intCast(k) }, &out, a);
+    const first = out.items.len;
+    try ranges(&parts, at, 256, .{ .name = @splat(2), .kind = .state }, &out, a);
+    try std.testing.expectEqual(rimg.Range{ .off = 0, .len = image.Words.bytes }, out.items[first]);
 }
 
 /// TF_IMPRINT_VERIFY=1 on this rank: whether kept states `a` and `b` at `at` hold the same image (16 MiB a pass).

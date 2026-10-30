@@ -20,8 +20,9 @@ pub const Key = struct { stem: Stem, kind: file.Kind };
 /// What the other ranks do when rank 0's store acts (a family's: GLM sends each as a disk step on its link).
 pub const Mirror = struct {
     ctx: *anyopaque,
-    /// A file rank 0 staged of `saved` at `at`: every other rank stages its own part of it and writes it behind.
-    file: *const fn (ctx: *anyopaque, saved: pc.Saved, at: u32, f: File) anyerror!void,
+    /// Files rank 0 staged of `saved` at `at`: every other rank stages its own part of each and writes it behind (a
+    /// batch, so the other ranks wake for a save once, not once a file).
+    file: *const fn (ctx: *anyopaque, saved: pc.Saved, at: u32, files: []const File) anyerror!void,
     /// A file rank 0's store forgot: every other rank removes its part (after any write of it queued before).
     unlink: *const fn (ctx: *anyopaque, k: Key) void,
     /// Another identity's directory rank 0 removed for room: every other rank removes its own.

@@ -72,6 +72,14 @@ pub fn idle(h: *LaneHost) bool {
     return true;
 }
 
+/// The idle loop's wait: 100 ms, but 1 ms while a pumped save (TF_GLM_OVN_DISK_PUMP, DISK_LOCAL) waits for ring slots
+/// the writer frees without waking this thread (at 100 ms a 1,044-block save took 5.4-6.9 s against 2.4 s staged whole).
+pub fn idleMs(h: *const LaneHost) i64 {
+    const store = h.cache orelse return 100;
+    const r = store.disk orelse return 100;
+    return if (r.pump != null) 1 else 100;
+}
+
 /// The engine thread's last act on a stop: what waits is written under `stop_ns`, and --learn's half-made cut settled.
 pub fn flush(h: *LaneHost) void {
     const store = h.cache orelse return;
