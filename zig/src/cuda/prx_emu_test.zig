@@ -1,122 +1,12 @@
-//! TF_GLM_OVN_PRX on the host: real plans and proxies, emulated NICs and streams; bytes must land as NCCL's.
+//! TF_GLM_OVN_PRX on the host (prx_emu): random exchanges' bytes land as NCCL's, and the channel fails stop.
 
 const std = @import("std");
 const plan = @import("prx_plan.zig");
-const proxy_mod = @import("prx_proxy.zig");
-
-const max_q = 512;
-
-/// A queued work request on one queue pair.
-const Wr = struct { to_rank: usize, from: usize, to: usize, n: usize, flag_at: ?usize, value: u32, id: u64 };
-
-const World = struct {
-    regions: [plan.max_world][]align(64) u8 = undefined,
-    nics: [plan.max_world]Nic = undefined,
-    proxies: [plan.max_world]*Proxy = undefined,
-    l: plan.Layout,
-    world: usize,
-};
-
-const Nic = struct {
-    w: *World,
-    rank: usize,
-    q: [plan.max_peers][plan.max_stripes][max_q]Wr = undefined,
-    head: [plan.max_peers][plan.max_stripes]usize = @splat(@splat(0)),
-    tail: [plan.max_peers][plan.max_stripes]usize = @splat(@splat(0)),
-    polls: u64 = 0,
-    lag: u64 = 3, // the second stripe moves one write every `lag` polls
-    slow: u64 = 1, // this rank's NIC moves anything every `slow` polls
-    fail_call: ?u64 = null, // the completion of this call's first stripe reports an error
-
-    fn push(n: *Nic, link: usize, i: usize, wr: Wr) !void {
-        if (n.tail[link][i] - n.head[link][i] == max_q) return error.QueueFull;
-        n.q[link][i][n.tail[link][i] % max_q] = wr;
-        n.tail[link][i] += 1;
-    }
-    pub fn data(n: *Nic, link: usize, i: usize, from: usize, to: usize, len: usize, flag_at: usize, v: u32, id: u64) !void {
-        try n.push(link, i, .{ .to_rank = plan.linkPeer(n.rank, link), .from = from, .to = to, .n = len, .flag_at = flag_at, .value = v, .id = id });
-    }
-    pub fn word(n: *Nic, link: usize, i: usize, at: usize, v: u32, id: u64) !void {
-        try n.push(link, i, .{ .to_rank = plan.linkPeer(n.rank, link), .from = 0, .to = at, .n = 0, .flag_at = null, .value = v, .id = id });
-    }
-    pub fn poll(n: *Nic, out: []proxy_mod.Done) !usize {
-        n.polls += 1;
-        var k: usize = 0;
-        if (n.polls % n.slow != 0) return 0;
-        for (0..n.w.world - 1) |link| for (0..plan.max_stripes) |i| {
-            if (n.head[link][i] == n.tail[link][i] or k == out.len) continue;
-            if (i == 1 and n.polls % n.lag != 0) continue;
-            const wr = n.q[link][i][n.head[link][i] % max_q];
-            n.head[link][i] += 1;
-            const dst = n.w.regions[wr.to_rank];
-            if (wr.n > 0) @memcpy(dst[wr.to .. wr.to + wr.n], n.w.regions[n.rank][wr.from .. wr.from + wr.n]);
-            const at = wr.flag_at orelse wr.to;
-            @atomicStore(u32, @as(*u32, @ptrCast(@alignCast(dst.ptr + at))), wr.value, .release);
-            const bad = n.fail_call != null and wr.id & 0xf == 1 and wr.id >> 11 == n.fail_call.? and i == 0;
-            out[k] = .{ .id = wr.id, .ok = !bad, .status = if (bad) 12 else 0 };
-            k += 1;
-        };
-        if (k == 0) std.Thread.yield() catch {};
-        return k;
-    }
-};
-
-const Proxy = proxy_mod.Proxy(Nic);
-
-/// A stream's recorded GPU work, executed later in order (the host posts every call before the GPU reaches it).
-const Op = union(enum) { wait: [2]u64, write: [2]u64, stage: [3]u64, unstage: [3]u64 };
-
-const Stream = struct {
-    ops: std.ArrayList(Op) = .empty,
-    gpa: std.mem.Allocator,
-    region: []align(64) u8 = undefined,
-    pause_ns: u64 = 0, // a slow GPU: this long after every operation
-    hung: bool = false,
-    hung_at: [3]u64 = @splat(0), // the wait that never passed: its offset, its value and the word's last value
-
-    pub fn wait(s: *Stream, at: usize, v: u32) !void {
-        try s.ops.append(s.gpa, .{ .wait = .{ at, v } });
-    }
-    pub fn write(s: *Stream, at: usize, v: u32) !void {
-        try s.ops.append(s.gpa, .{ .write = .{ at, v } });
-    }
-    pub fn stage(s: *Stream, at: usize, src: u64, n: usize) !void {
-        try s.ops.append(s.gpa, .{ .stage = .{ at, src, n } });
-    }
-    pub fn unstage(s: *Stream, dst: u64, at: usize, n: usize) !void {
-        try s.ops.append(s.gpa, .{ .unstage = .{ dst, at, n } });
-    }
-
-    fn execute(s: *Stream) void {
-        const r = s.region;
-        for (s.ops.items) |o| {
-            switch (o) {
-                .wait => |a| {
-                    const w: *u32 = @ptrCast(@alignCast(r.ptr + a[0]));
-                    const io = std.testing.io;
-                    const give_up = std.Io.Clock.awake.now(io).toNanoseconds() + 10 * std.time.ns_per_s;
-                    var spins: u64 = 0;
-                    while (!plan.geq(@atomicLoad(u32, w, .acquire), @truncate(a[1]))) : (spins += 1) {
-                        if (spins % 64 == 0 and std.Io.Clock.awake.now(io).toNanoseconds() > give_up) {
-                            s.hung = true; // a wait nothing satisfies: the GPU would hang here
-                            s.hung_at = .{ a[0], a[1], @atomicLoad(u32, w, .acquire) };
-                            return;
-                        }
-                        std.Thread.yield() catch {};
-                    }
-                },
-                .write => |a| @atomicStore(u32, @as(*u32, @ptrCast(@alignCast(r.ptr + a[0]))), @truncate(a[1]), .release),
-                .stage => |a| @memcpy(r[a[0] .. a[0] + a[2]], @as([*]const u8, @ptrFromInt(a[1]))[0..a[2]]),
-                .unstage => |a| @memcpy(@as([*]u8, @ptrFromInt(a[0]))[0..a[2]], r[a[1] .. a[1] + a[2]]),
-            }
-            if (s.pause_ns > 0) std.Io.sleep(std.testing.io, .fromNanoseconds(s.pause_ns), .awake) catch {};
-        }
-    }
-};
+const emu = @import("prx_emu.zig");
+const pattern = emu.pattern;
 
 /// The exchanges every rank runs, alike: sizes[e][from][to] bytes (a shared exchange: alike for every `to`).
 const Script = struct {
-    n: usize,
     shared: []bool,
     sizes: [][plan.max_world][plan.max_world]usize,
 
@@ -129,17 +19,7 @@ const Script = struct {
     }
 };
 
-fn pattern(from: usize, e: usize, to: usize, i: usize) u8 {
-    const h = std.hash.Wyhash.hash(from << 40 | e << 20 | to, std.mem.asBytes(&i));
-    return @truncate(h);
-}
-
 const guard = 64;
-
-const Bufs = struct {
-    src: [][plan.max_world][]u8, // [e][peer] (shared: [e][0])
-    dst: [][plan.max_world][]u8, // [e][peer], guard bytes either side
-};
 
 const Opts = struct {
     world: usize,
@@ -151,21 +31,65 @@ const Opts = struct {
     slow_gpu_rank: ?usize = null,
     slow_nic_rank: ?usize = null,
     fail: ?[2]u64 = null, // rank, call: that rank's NIC fails the call's first stripe
+    freeze: ?[2]u64 = null, // rank, poll: that rank's proxy stops there (a hung process), until the others failed
+    stall: ?usize = null, // that rank's GPU starts only once the others failed (its proxy alive, its calls never staged)
+    dead: ?[2]u64 = null, // rank, call: from that call on, every write of that rank's NIC fails (a dead link)
     timeout_ns: u64 = 0,
+    peer_ns: u64 = 0,
+    exit_ns: u64 = 0,
+    phases: usize = 1, // the exchanges posted and run in this many batches, every rank caught up between
+    gap_ns: u64 = 0, // the idle time between batches
+
+    pub fn adjust(o: *const Opts, r: usize, p: *emu.Proxy, n: *emu.Nic) void {
+        p.timeout_ns = o.timeout_ns;
+        p.peer_ns = o.peer_ns;
+        p.exit_ns = o.exit_ns;
+        p.exit = countExit;
+        if (o.slow_nic_rank == r) n.slow = 7;
+        if (o.fail) |f| if (f[0] == r) {
+            n.fail_call = f[1];
+        };
+        if (o.freeze) |f| if (f[0] == r) {
+            n.freeze_after = f[1];
+        };
+        if (o.dead) |f| if (f[0] == r) {
+            n.dead_after = f[1];
+        };
+    }
 };
 
-const Outcome = struct { bad_bytes: usize = 0, bad_guards: usize = 0, hung: bool = false, failures: usize = 0, refused: usize = 0 };
+var exits: std.atomic.Value(usize) = .init(0);
+fn countExit() void {
+    _ = exits.fetchAdd(1, .acq_rel);
+}
+
+const Why = enum { none, abort, silent, other };
+
+const Outcome = struct {
+    bad_bytes: usize = 0,
+    bad_guards: usize = 0,
+    hung: bool = false,
+    failures: usize = 0,
+    refused: usize = 0,
+    aborted: usize = 0, // ranks failed by a peer's abort
+    silent: usize = 0, // ranks failed by a peer's silent heartbeat
+    why: [plan.max_world]Why = @splat(.none),
+    silent_of: [plan.max_world]usize = @splat(0), // the ranks the silent-heartbeat failures name
+    detect_ms: u64 = 0, // a frozen rank: from the streams' start until every other rank failed
+    exits: usize = 0,
+};
+
+fn now() u64 {
+    return @intCast(std.Io.Clock.awake.now(std.testing.io).toNanoseconds());
+}
 
 fn runWorld(o: Opts) !Outcome {
-    const gpa = std.heap.page_allocator;
-    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    var arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena_state.deinit();
     const a = arena_state.allocator();
-    const M = 4096;
-    var w: World = .{ .l = try plan.Layout.of(o.world, o.slots, M), .world = o.world };
     var prng = std.Random.DefaultPrng.init(o.seed);
     const rnd = prng.random();
-    const script: Script = .{ .n = o.exchanges, .shared = try a.alloc(bool, o.exchanges), .sizes = try a.alloc([plan.max_world][plan.max_world]usize, o.exchanges) };
+    const script: Script = .{ .shared = try a.alloc(bool, o.exchanges), .sizes = try a.alloc([plan.max_world][plan.max_world]usize, o.exchanges) };
     const lens = [_]usize{ 0, 4, 100, 4095, 4096, 4097, 5000, 8192, 9001, 12290 };
     for (0..o.exchanges) |e| {
         script.shared[e] = rnd.uintLessThan(u8, 4) == 0;
@@ -174,74 +98,96 @@ fn runWorld(o: Opts) !Outcome {
             for (0..o.world) |t| script.sizes[e][f][t] = if (script.shared[e]) one else lens[rnd.uintLessThan(usize, lens.len)];
         }
     }
-    var bufs: [plan.max_world]Bufs = undefined;
-    var streams: [plan.max_world][2]Stream = undefined;
+    const w = try a.create(emu.World);
+    w.* = .{ .l = try plan.Layout.of(o.world, o.slots, 4096), .world = o.world };
+    exits.store(0, .release);
+    try w.start(a, o.stripes, &o);
+    var stopped = false;
+    defer if (!stopped) w.stop();
+    var src: [plan.max_world][][plan.max_world][]u8 = undefined;
+    var dst: [plan.max_world][][plan.max_world][]u8 = undefined;
     for (0..o.world) |r| {
-        w.regions[r] = try a.alignedAlloc(u8, .@"64", w.l.total);
-        @memset(w.regions[r], 0);
-        w.nics[r] = .{ .w = &w, .rank = r, .slow = if (o.slow_nic_rank == r) 7 else 1 };
-        if (o.fail) |f| if (f[0] == r) {
-            w.nics[r].fail_call = f[1];
-        };
-        w.proxies[r] = try a.create(Proxy);
-        w.proxies[r].* = .{ .nic = &w.nics[r], .region = w.regions[r].ptr, .l = w.l, .rank = r, .stripes = o.stripes, .timeout_ns = o.timeout_ns };
-        for (&streams[r]) |*s| s.* = .{ .gpa = a, .region = w.regions[r], .pause_ns = if (o.slow_gpu_rank == r) 200_000 else 0 };
-        bufs[r] = .{ .src = try a.alloc([plan.max_world][]u8, o.exchanges), .dst = try a.alloc([plan.max_world][]u8, o.exchanges) };
+        src[r] = try a.alloc([plan.max_world][]u8, o.exchanges);
+        dst[r] = try a.alloc([plan.max_world][]u8, o.exchanges);
         for (0..o.exchanges) |e| for (0..o.world) |p| if (p != r) {
-            const out = script.sizes[e][r][p];
             const key = if (script.shared[e]) 0xff else p;
-            bufs[r].src[e][p] = try a.alloc(u8, out);
-            for (bufs[r].src[e][p], 0..) |*b, i| b.* = pattern(r, e, key, i);
-            bufs[r].dst[e][p] = try a.alloc(u8, script.sizes[e][p][r] + 2 * guard);
-            @memset(bufs[r].dst[e][p], 0xa5);
+            src[r][e][p] = try a.alloc(u8, script.sizes[e][r][p]);
+            for (src[r][e][p], 0..) |*b, i| b.* = pattern(r, e, key, i);
+            dst[r][e][p] = try a.alloc(u8, script.sizes[e][p][r] + 2 * guard);
+            @memset(dst[r][e][p], 0xa5);
         };
     }
-    var proxy_threads: [plan.max_world]std.Thread = undefined;
-    for (0..o.world) |r| proxy_threads[r] = try std.Thread.spawn(.{}, Proxy.loop, .{ w.proxies[r], std.testing.io });
-    defer for (0..o.world) |r| {
-        w.proxies[r].running.store(false, .release);
-        proxy_threads[r].join();
-    };
-    // the host: every rank posts every exchange in one order, each on its stream (alternating with two)
-    for (0..o.world) |r| for (0..o.exchanges) |e| {
-        var x: plan.Exchange = .{ .unit = script.unit(e, o.world), .shared = script.shared[e] };
-        for (0..o.world) |p| if (p != r) {
-            const shared_src = bufs[r].src[e][plan.linkPeer(r, 0)];
-            const src = if (script.shared[e]) shared_src else bufs[r].src[e][p];
-            x.parts[p] = .{ .src = @intFromPtr(src.ptr), .out = src.len, .dst = @intFromPtr(bufs[r].dst[e][p].ptr) + guard, .in = script.sizes[e][p][r] };
-        };
-        const s = &streams[r][e % o.streams];
-        plan.run(w.proxies[r], s, &w.l, r, o.stripes, &x) catch |err| switch (err) {
-            error.ProxyFailed => break,
-            else => return err,
-        };
-    };
-    var threads: [plan.max_world][2]std.Thread = undefined;
-    for (0..o.world) |r| for (0..o.streams) |k| {
-        threads[r][k] = try std.Thread.spawn(.{}, Stream.execute, .{&streams[r][k]});
-    };
     var out: Outcome = .{};
-    for (0..o.world) |r| for (0..o.streams) |k| {
-        threads[r][k].join();
-        out.hung = out.hung or streams[r][k].hung;
-        if (streams[r][k].hung) {
-            const p = w.proxies[r];
-            const h = streams[r][k].hung_at;
-            std.debug.print("rank {d} stream {d} hung at offset {d} for {d} (word {d}); proxy: {d} posted, {d} sent, {d} freed, failure {?s}\n", .{ r, k, h[0], h[1], h[2], p.posted.load(.acquire), p.next_send, p.freed, p.failure() });
+    const t0 = now();
+    for (0..o.phases) |ph| {
+        if (ph > 0) std.Io.sleep(std.testing.io, .fromNanoseconds(o.gap_ns), .awake) catch {}; // every rank caught up
+        var streams: [plan.max_world][2]emu.Stream = undefined;
+        for (0..o.world) |r| for (&streams[r]) |*s| {
+            s.* = .{ .gpa = a, .w = w, .rank = r, .pause_ns = if (o.slow_gpu_rank == r) 200_000 else 0 };
+        };
+        // the host: every rank posts every exchange in one order, each on its stream (alternating with two)
+        for (0..o.world) |r| for (ph * o.exchanges / o.phases..(ph + 1) * o.exchanges / o.phases) |e| {
+            var x: plan.Exchange = .{ .unit = script.unit(e, o.world), .shared = script.shared[e] };
+            for (0..o.world) |p| if (p != r) {
+                const s = if (script.shared[e]) src[r][e][plan.linkPeer(r, 0)] else src[r][e][p];
+                x.parts[p] = .{ .src = @intFromPtr(s.ptr), .out = s.len, .dst = @intFromPtr(dst[r][e][p].ptr) + guard, .in = script.sizes[e][p][r] };
+            };
+            plan.run(w.proxies[r], &streams[r][e % o.streams], &w.l, r, o.stripes, &x) catch |err| switch (err) {
+                error.ProxyFailed => break,
+                else => return err,
+            };
+        };
+        var threads: [plan.max_world][2]std.Thread = undefined;
+        for (0..o.world) |r| for (0..o.streams) |k| if (o.stall != r) {
+            threads[r][k] = try std.Thread.spawn(.{}, emu.Stream.execute, .{&streams[r][k]});
+        };
+        if (o.freeze orelse if (o.stall) |r| [2]u64{ r, 0 } else null) |f| { // the others fail while it is stopped
+            while (now() - t0 < 10 * std.time.ns_per_s) {
+                var all = true;
+                for (0..o.world) |r| if (r != f[0] and w.proxies[r].failure() == null) {
+                    all = false;
+                };
+                if (all) break;
+                std.Thread.yield() catch {};
+            }
+            out.detect_ms = (now() - t0) / std.time.ns_per_ms;
+            w.thawed.store(true, .release);
+            if (o.stall) |r| for (0..o.streams) |k| { // then its GPU runs, released
+                threads[r][k] = try std.Thread.spawn(.{}, emu.Stream.execute, .{&streams[r][k]});
+            };
         }
-    };
+        for (0..o.world) |r| for (0..o.streams) |k| {
+            threads[r][k].join();
+            out.hung = out.hung or streams[r][k].hung;
+            if (streams[r][k].hung) {
+                const h = streams[r][k].hung_at;
+                std.debug.print("rank {d} stream {d} hung at offset {d} for {d} (word {d}); failure {?s}\n", .{ r, k, h[0], h[1], h[2], w.proxies[r].failure() });
+            }
+        };
+    }
+    if (o.exit_ns > 0) while (exits.load(.acquire) < o.world and now() - t0 < 10 * std.time.ns_per_s) std.Thread.yield() catch {};
+    out.exits = exits.load(.acquire);
     for (0..o.world) |r| {
-        if (w.proxies[r].failure() != null) out.failures += 1;
-        if (w.proxies[r].post(.{})) |_| {} else |_| out.refused += 1; // a failed channel takes no more calls
-        for (0..o.exchanges) |e| for (0..o.world) |p| if (p != r) {
-            const d = bufs[r].dst[e][p];
+        const p = w.proxies[r];
+        if (p.failure()) |m| {
+            out.failures += 1;
+            out.why[r] = if (std.mem.indexOf(u8, m, "abort") != null) .abort else if (std.mem.indexOf(u8, m, "no heartbeat") != null) .silent else .other;
+            out.aborted += @intFromBool(out.why[r] == .abort);
+            out.silent += @intFromBool(out.why[r] == .silent);
+            if (std.mem.indexOf(u8, m, "no heartbeat from rank ")) |at| out.silent_of[m[at + 23] - '0'] += 1;
+        }
+        if (p.post(.{})) |_| {} else |_| out.refused += 1; // a failed channel takes no more calls
+        for (0..o.exchanges) |e| for (0..o.world) |q| if (q != r) {
+            const d = dst[r][e][q];
             const n = d.len - 2 * guard;
             const key = if (script.shared[e]) 0xff else r;
-            for (d[guard .. guard + n], 0..) |b, i| out.bad_bytes += @intFromBool(b != pattern(p, e, key, i));
+            for (d[guard .. guard + n], 0..) |b, i| out.bad_bytes += @intFromBool(b != pattern(q, e, key, i));
             for (d[0..guard]) |b| out.bad_guards += @intFromBool(b != 0xa5);
             for (d[guard + n ..]) |b| out.bad_guards += @intFromBool(b != 0xa5);
         };
     }
+    w.stop();
+    stopped = true;
     return out;
 }
 
@@ -266,9 +212,46 @@ test "PRX emulation: two streams sharing a channel with two slots, one rank's GP
     try expectClean(.{ .world = 3, .streams = 1, .slow_gpu_rank = 2, .exchanges = 24, .seed = 23 });
 }
 
-test "PRX emulation: a failed write fails that rank, the others by the timeout, and no GPU wait hangs" {
-    const got = try runWorld(.{ .world = 3, .exchanges = 12, .fail = .{ 1, 5 }, .timeout_ns = 300 * std.time.ns_per_ms, .seed = 31 });
+test "PRX emulation: a failed write fails that rank and its abort the others at once, with no timeout, and nothing hangs" {
+    const got = try runWorld(.{ .world = 3, .exchanges = 12, .fail = .{ 1, 5 }, .seed = 31 });
     try std.testing.expect(!got.hung);
     try std.testing.expectEqual(@as(usize, 3), got.failures);
+    try std.testing.expectEqual(@as(usize, 2), got.aborted); // ranks 0 and 2 learnt of it from rank 1's abort
     try std.testing.expectEqual(@as(usize, 3), got.refused);
+}
+
+test "PRX emulation: a peer that stops while its NIC still completes fails every other rank by its silent heartbeat" {
+    const got = try runWorld(.{ .world = 3, .exchanges = 16, .freeze = .{ 2, 40 }, .peer_ns = 300 * std.time.ns_per_ms, .seed = 41 });
+    try std.testing.expect(!got.hung);
+    try std.testing.expectEqual(@as(usize, 3), got.failures);
+    try std.testing.expect(got.silent >= 1); // the first to notice; the other may learn of it by that one's abort
+    try std.testing.expectEqual(got.silent, got.silent_of[2]); // and only the stopped rank is ever named
+    for (got.why[0..2]) |y| try std.testing.expect(y == .silent or y == .abort);
+    try std.testing.expect(got.detect_ms < 3000); // TF_GLM_OVN_PRX_PEER_S, not the 300 s timeout
+}
+
+test "PRX emulation: every failed rank exits after TF_GLM_OVN_PRX_EXIT_S, so the serve's watchdog restarts the ranks" {
+    const got = try runWorld(.{ .world = 3, .exchanges = 12, .fail = .{ 0, 3 }, .exit_ns = 100 * std.time.ns_per_ms, .seed = 51 });
+    try std.testing.expect(!got.hung);
+    try std.testing.expectEqual(@as(usize, 3), got.failures);
+    try std.testing.expectEqual(@as(usize, 3), got.exits);
+}
+
+test "PRX emulation: with the heartbeat and progress watched, a slow live world and an idle gap stay clean" {
+    try expectClean(.{ .world = 3, .streams = 2, .slow_gpu_rank = 1, .exchanges = 24, .peer_ns = 100 * std.time.ns_per_ms, .seed = 61 });
+    // caught up for longer than both limits between two batches: the watch restarts, nothing fails
+    try expectClean(.{ .world = 3, .exchanges = 16, .phases = 2, .gap_ns = 400 * std.time.ns_per_ms, .timeout_ns = 200 * std.time.ns_per_ms, .peer_ns = 200 * std.time.ns_per_ms, .seed = 62 });
+}
+
+test "PRX emulation: a peer whose GPU stops while its proxy lives fails every rank by TF_GLM_OVN_PRX_TIMEOUT_S" {
+    const got = try runWorld(.{ .world = 3, .exchanges = 12, .stall = 2, .timeout_ns = 300 * std.time.ns_per_ms, .peer_ns = 300 * std.time.ns_per_ms, .seed = 71 });
+    try std.testing.expect(!got.hung);
+    try std.testing.expectEqual(@as(usize, 3), got.failures);
+    try std.testing.expect(got.detect_ms < 3000);
+}
+
+test "PRX emulation: a dead link whose abort cannot leave still fails the other end, by its writes into the halted rank" {
+    const got = try runWorld(.{ .world = 2, .stripes = 1, .exchanges = 12, .dead = .{ 1, 4 }, .seed = 81 });
+    try std.testing.expect(!got.hung);
+    try std.testing.expectEqual(@as(usize, 2), got.failures);
 }

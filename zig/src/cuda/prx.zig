@@ -18,15 +18,23 @@ const cq_depth = 4 * proxy_mod.depth;
 pub const max_world = plan.max_world;
 
 pub const Settings = struct {
-    slots: usize = 4,
-    slot_mb: usize = 16,
+    slots: usize = 2, // a stream's calls run in lockstep with the peers': two in a peer's slots at most (prx_emu_sched)
+    slot_mb: usize = 8, // a 4,096-row chunk's piece (470 rows of fp32 partials, 7.3 MiB) in one call
     timeout_s: u64 = 300,
+    peer_s: u64 = 10, // TF_GLM_OVN_PRX_PEER_S: a peer's heartbeat still this long with calls outstanding fails (0: off)
+    exit_s: u64 = 10, // TF_GLM_OVN_PRX_EXIT_S: the process exits 70 this long after a failure (0: it stays, broken)
     relaxed: bool = true,
+    zc: bool = false, // TF_GLM_OVN_PRX_ZC: a split piece's partials read where the NICs land them
+
+    /// ZC's default slots: a site's three pieces held until their glue, and the next call (TF_GLM_OVERLAP_PIECES + 1).
+    pub const zc_slots = 4;
 
     /// The TF_GLM_OVN_PRX_* geometry and limits; a value out of range is refused.
     pub fn read() error{BadOvnKnob}!Settings {
-        const s: Settings = .{ .slots = try ovn.int("PRX_SLOTS", 4), .slot_mb = try ovn.int("PRX_SLOT_MB", 16), .timeout_s = try ovn.int("PRX_TIMEOUT_S", 300), .relaxed = !std.mem.eql(u8, ovn.text("PRX_RO") orelse "1", "0") };
-        if (s.slots < 2 or s.slots > plan.max_slots or s.slot_mb == 0 or s.slot_mb > 2048 or s.timeout_s > 86400) return error.BadOvnKnob;
+        const zc = ovn.on("PRX_ZC");
+        const s: Settings = .{ .slots = try ovn.int("PRX_SLOTS", if (zc) zc_slots else 2), .slot_mb = try ovn.int("PRX_SLOT_MB", 8), .timeout_s = try ovn.int("PRX_TIMEOUT_S", 300), .peer_s = try ovn.int("PRX_PEER_S", 10), .exit_s = try ovn.int("PRX_EXIT_S", 10), .relaxed = !std.mem.eql(u8, ovn.text("PRX_RO") orelse "1", "0"), .zc = zc };
+        if (s.slots < 2 or s.slots > plan.max_slots or s.slot_mb == 0 or s.slot_mb > 2048) return error.BadOvnKnob;
+        if (s.timeout_s > 86400 or s.peer_s > 86400 or s.exit_s > 86400) return error.BadOvnKnob;
         return s;
     }
 };
@@ -115,6 +123,14 @@ const Nic = struct {
         }
         return k;
     }
+
+    /// Every link's queue pairs to the error state: nothing more leaves, and the peers' writes here fail them.
+    pub fn halt(n: *Nic) void {
+        for (n.links) |*k| for (k.qp) |q| if (q) |qp| {
+            var a: verbs.QpAttr = .{ .qp_state = verbs.qps_err };
+            _ = n.api.ibv_modify_qp(qp, &a, verbs.qp_state);
+        };
+    }
 };
 
 const Proxy = proxy_mod.Proxy(Nic);
@@ -165,6 +181,9 @@ pub const Channel = struct {
     thread: ?std.Thread = null,
     opened: u8 = 0, // 1: verbs open, 2: and the driver's memory operations
     calls: u64 = 0, // exchanges this channel carried
+    zc: bool = false, // TF_GLM_OVN_PRX_ZC (Settings.zc; glm-prx-check sets it a pass)
+    zc_q: plan.ZcQueue = .{},
+    zc_calls: u64 = 0, // exchanges read in place
     err: [256]u8 = @splat(0),
 
     fn fail(ch: *Channel, comptime fmt: []const u8, args: anytype) void {
@@ -207,7 +226,8 @@ pub const Channel = struct {
             return null;
         };
         const p = try gpa.create(Proxy);
-        p.* = .{ .nic = &ch.nic, .region = ch.region.?.bytes.ptr, .l = ch.l, .rank = ch.rank, .stripes = ch.stripes, .timeout_ns = set.timeout_s * std.time.ns_per_s };
+        p.* = .{ .nic = &ch.nic, .region = ch.region.?.bytes.ptr, .l = ch.l, .rank = ch.rank, .stripes = ch.stripes, .timeout_ns = set.timeout_s * std.time.ns_per_s, .peer_ns = set.peer_s * std.time.ns_per_s, .exit_ns = set.exit_s * std.time.ns_per_s };
+        ch.zc = set.zc;
         ch.proxy = p;
         ch.thread = std.Thread.spawn(.{}, Proxy.loop, .{ p, io }) catch |e| {
             ch.deinit();
@@ -325,16 +345,53 @@ pub const Channel = struct {
         return st != .none;
     }
 
-    /// Exchange `x` on `s` (enqueued: the stream waits for the peers' bytes, the host does not).
-    pub fn exchange(ch: *Channel, s: Stream, x: *const plan.Exchange) !void {
+    fn ops(ch: *const Channel, s: Stream) Ops {
+        return .{ .d = ch.d, .s = s.handle, .dev = ch.region_dev, .host = ch.region.?.bytes.ptr, .wait_fn = ch.wait_fn, .write_fn = ch.write_fn };
+    }
+
+    fn live(ch: *const Channel) !*Proxy {
         const p = ch.proxy.?;
         if (p.failure()) |why| {
             std.log.err("TF_GLM_OVN_PRX failed: {s}", .{why});
             return error.ProxyFailed;
         }
-        const ops: Ops = .{ .d = ch.d, .s = s.handle, .dev = ch.region_dev, .host = ch.region.?.bytes.ptr, .wait_fn = ch.wait_fn, .write_fn = ch.write_fn };
-        try plan.run(p, &ops, &ch.l, ch.rank, ch.stripes, x);
+        return p;
+    }
+
+    /// Exchange `x` on `s` (enqueued: the stream waits for the peers' bytes, the host does not).
+    pub fn exchange(ch: *Channel, s: Stream, x: *const plan.Exchange) !void {
+        const p = try ch.live();
+        const o = ch.ops(s);
+        try plan.run(p, &o, &ch.l, ch.rank, ch.stripes, x);
         ch.calls += 1;
+    }
+
+    /// TF_GLM_OVN_PRX_ZC: `x` read in place (zcTake by `key`), `own` copied now or `later`; false: exchange it instead.
+    pub fn exchangeZc(ch: *Channel, s: Stream, x: *const plan.Exchange, own: plan.Part, later: plan.Part, key: u64) !bool {
+        const p = try ch.live();
+        if (ch.zc_q.full()) return false;
+        const o = ch.ops(s);
+        const c = (try plan.runZc(p, &o, &ch.l, ch.rank, ch.stripes, x, own)) orelse return false;
+        try ch.zc_q.push(.{ .key = key, .call = c, .own_src = later.src, .own_bytes = later.out });
+        ch.calls += 1;
+        ch.zc_calls += 1;
+        return true;
+    }
+
+    pub const ZcRead = struct { g: u64, rs: usize, call: u64 };
+
+    /// The ZC call of `key` (the oldest unread): its blocks' device address and rank stride in floats; null: none.
+    pub fn zcTake(ch: *Channel, s: Stream, key: u64) !?ZcRead {
+        const e = ch.zc_q.take(key) orelse return null;
+        const o = ch.ops(s);
+        if (e.own_bytes > 0) try o.stage(ch.l.recv(@intCast(e.call % ch.l.slots), ch.rank), e.own_src, e.own_bytes);
+        return .{ .g = ch.region_dev + plan.zcBlocks(&ch.l, e.call), .rs = ch.l.M / 4, .call = e.call };
+    }
+
+    /// On `s` after the glue read the ZC call's blocks: the peers may write its slot again.
+    pub fn zcDone(ch: *Channel, s: Stream, call: u64) !void {
+        const o = ch.ops(s);
+        try plan.zcDone(&o, &ch.l, call);
     }
 
     /// An error once the proxy failed (what the GPU computed since is garbage): after a synchronize, as the gather's.
@@ -368,10 +425,25 @@ pub const Channel = struct {
     }
 };
 
-test "PRX channel: the blob is the shape every rank gathers, and the knobs keep their defaults" {
+test "PRX channel: the blob is the shape every rank gathers; the region is 80 MiB a rank, ZC's 160, the knobs bounded" {
     try std.testing.expectEqual(@as(usize, 32 + 4 * 4 * 4 + 4 * 16 + plan.max_world * max_hcas * 4), @sizeOf(Blob));
-    const s: Settings = .{};
-    try std.testing.expectEqual(@as(usize, 4), s.slots);
-    const l = try plan.Layout.of(3, s.slots, s.slot_mb << 20);
-    try std.testing.expectEqual(@as(usize, 320), (l.total - l.data) >> 20);
+    ovn.fake("PRX_ZC", null);
+    ovn.fake("PRX_SLOTS", null);
+    ovn.fake("PRX_SLOT_MB", null);
+    defer ovn.fake("PRX_ZC", null);
+    defer ovn.fake("PRX_SLOTS", null);
+    const off = try Settings.read();
+    const l = try plan.Layout.of(3, off.slots, off.slot_mb << 20);
+    try std.testing.expectEqual(@as(usize, 80), (l.total - l.data) >> 20);
+    ovn.fake("PRX_ZC", "1");
+    const zc = try Settings.read();
+    try std.testing.expect(zc.zc);
+    const lz = try plan.Layout.of(3, zc.slots, zc.slot_mb << 20);
+    try std.testing.expectEqual(@as(usize, 160), (lz.total - lz.data) >> 20);
+    ovn.fake("PRX_SLOTS", "3"); // an explicit count wins
+    try std.testing.expectEqual(@as(usize, 3), (try Settings.read()).slots);
+    ovn.fake("PRX_SLOTS", "9");
+    try std.testing.expectError(error.BadOvnKnob, Settings.read());
+    // the slot holds a default piece's partials in one call: 470 rows of 4,096 floats (TF_GLM_OVERLAP_PIECES=3)
+    try std.testing.expect(470 * 4096 * 4 <= off.slot_mb << 20);
 }

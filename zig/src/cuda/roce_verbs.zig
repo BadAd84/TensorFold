@@ -79,6 +79,7 @@ pub const qpt_rc = 2;
 pub const qps_init = 1;
 pub const qps_rtr = 2;
 pub const qps_rts = 3;
+pub const qps_err = 6;
 pub const port_active = 4;
 pub const access_local_write = 1;
 pub const access_remote_write = 2;

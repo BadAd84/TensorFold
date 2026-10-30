@@ -52,6 +52,29 @@ pub fn glued(x: Relay, rows_of: u64, lo: usize, dims: usize) plan.Exchange {
     return e;
 }
 
+/// The channel a forward's split glue asks for a ZC call (zcTake: null when its partials were copied); null: none.
+pub fn channelOf(ex: anytype) ?*cuda.prx.Channel {
+    return switch (ex) {
+        .local => null,
+        .nccl => |x| if (x.group) |g| g.prx else null,
+    };
+}
+
+/// This rank's own rows for a ZC call, { now, later }: from `part` now, or (PEER_FIRST) the room's slot at the glue.
+pub fn zcOwn(x: Relay, room: u64, part: u64, lo: usize, dims: usize, own_later: bool) [2]plan.Part {
+    const mine = x.rows(x.rank);
+    const bytes = (mine[1] - mine[0]) * dims * 4;
+    if (own_later) return .{ .{}, .{ .src = room + x.rank * bytes, .out = bytes } };
+    return .{ .{ .src = part + (lo + mine[0]) * dims * 4, .out = bytes }, .{} };
+}
+
+/// TF_GLM_OVN_PRX_ZC: the split partials on `s` read in place by the glue (keyed by `room`); false: exchange them.
+pub fn partialsZc(ch: anytype, s: cuda.Stream, x: Relay, room: u64, part: u64, lo: usize, dims: usize, own_later: bool) !bool {
+    if (!ch.zc) return false;
+    const o = zcOwn(x, room, part, lo, dims, own_later);
+    return ch.exchangeZc(s, &partials(x, room, part, lo, dims), o[0], o[1], room);
+}
+
 /// NCCL that records each send and receive (peer, address, bytes), for comparing the exchanges with relay's.
 const Rec = struct {
     const Call = struct { send: bool, peer: usize, ptr: u64, bytes: usize };
@@ -145,4 +168,37 @@ test "TF_GLM_OVN_PRX: a split exchange takes the channel unless none is open, th
     try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &live, true, s));
     try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &captured, false, s));
     try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, null, false, s));
+}
+
+/// A channel that records its ZC call, for partialsZc.
+const ZcFake = struct {
+    zc: bool,
+    got: ?struct { x: plan.Exchange, own: plan.Part, later: plan.Part, key: u64 } = null,
+    fn exchangeZc(c: *ZcFake, _: cuda.Stream, x: *const plan.Exchange, own: plan.Part, later: plan.Part, key: u64) !bool {
+        c.got = .{ .x = x.*, .own = own, .later = later, .key = key };
+        return true;
+    }
+};
+
+test "TF_GLM_OVN_PRX_ZC: a split piece's partials go read in place with this rank's own rows now, or PEER_FIRST's later" {
+    const s: cuda.Stream = .{ .d = undefined, .handle = null };
+    const x: Relay = .{ .world = 3, .rank = 1, .n = 1408 };
+    const dims = 4096;
+    const mine = x.rows(1);
+    const bytes = (mine[1] - mine[0]) * dims * 4;
+    var off: ZcFake = .{ .zc = false };
+    try std.testing.expect(!try partialsZc(&off, s, x, 0x1000_0000, 0x4000_0000, 128, dims, false));
+    try std.testing.expect(off.got == null);
+    var on: ZcFake = .{ .zc = true };
+    try std.testing.expect(try partialsZc(&on, s, x, 0x1000_0000, 0x4000_0000, 128, dims, false));
+    const a = on.got.?;
+    try std.testing.expectEqual(@as(u64, 0x1000_0000), a.key);
+    try std.testing.expectEqualDeep(partials(x, 0x1000_0000, 0x4000_0000, 128, dims), a.x);
+    try std.testing.expectEqualDeep(plan.Part{ .src = 0x4000_0000 + (128 + mine[0]) * dims * 4, .out = bytes }, a.own);
+    try std.testing.expectEqual(@as(usize, 0), a.later.out);
+    try std.testing.expect(try partialsZc(&on, s, x, 0x1000_0000, 0x4000_0000, 128, dims, true));
+    const b = on.got.?;
+    try std.testing.expectEqual(@as(usize, 0), b.own.out);
+    // where PEER_FIRST fills this rank's rows: its slot of the room, as the copying path's partials leave them
+    try std.testing.expectEqualDeep(plan.Part{ .src = 0x1000_0000 + 1 * bytes, .out = bytes }, b.later);
 }

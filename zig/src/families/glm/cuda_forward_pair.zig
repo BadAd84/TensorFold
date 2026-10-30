@@ -56,7 +56,6 @@ pub fn pairBody(a: *const Forward, b: *const Forward, ra: usize, rb: usize) !voi
 /// A paired site: each piece filled on the main stream, then on the side stream its exchange, glue and (split) sharing.
 fn exchangeGlue(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: []const [2]usize) !void {
     const D = f.ranks[0].w.config.hidden;
-    const world = f.ranks[0].w.share.world;
     const last = site == .ffn and j + 1 == f.ranks[0].w.layers.len;
     var g = f.*; // the glue's launches go on the side stream
     g.stream = p.side;
@@ -69,10 +68,7 @@ fn exchangeGlue(f: *const Forward, p: *const Pieces, j: usize, site: Site, cut: 
         try p.side.wait(p.filled[q]);
         try pieces.partials(f, p, lo, n, split, false);
         if (split) {
-            for (f.ranks) |r| {
-                const mine = share(n, world, r.w.share.rank);
-                try g.glueRows(r, j, site, lo + mine[0], lo + mine[1], room(r, lo));
-            }
+            for (f.ranks) |r| try pieces.glueOwn(&g, r, j, site, lo, n); // g: the glue's launches on the side stream
             try pieces.shareGlued(f, p, lo, n, last);
         } else for (f.ranks) |r| try g.glueRows(r, j, site, lo, piece[1], room(r, lo));
         try p.shared[q].record(p.side);

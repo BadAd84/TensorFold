@@ -13,7 +13,9 @@ const ctrl_ready = 0; // [slot][link]: the payload for that link staged
 const ctrl_consumed = max_slots * max_peers; // [slot]: the GPU read the call's receive blocks
 const ctrl_send_done = ctrl_consumed + max_slots; // [slot]: the NICs read the call's send blocks
 const ctrl_credit = ctrl_send_done + max_slots; // [rank]: that rank's freed calls
-const ctrl_lines = ctrl_credit + max_world;
+const ctrl_beat = ctrl_credit + max_world; // [rank]: that rank's heartbeats, written by its NIC
+const ctrl_abort = ctrl_beat + max_world; // a failed peer's abort: the rank where the failure started, plus one
+const ctrl_lines = ctrl_abort + 1;
 
 pub const Layout = struct {
     world: usize,
@@ -48,6 +50,14 @@ pub const Layout = struct {
     pub fn credit(l: *const Layout, r: usize) usize {
         _ = l;
         return (ctrl_credit + r) * line;
+    }
+    pub fn beat(l: *const Layout, r: usize) usize {
+        _ = l;
+        return (ctrl_beat + r) * line;
+    }
+    pub fn abort(l: *const Layout) usize {
+        _ = l;
+        return ctrl_abort * line;
     }
     pub fn flag(l: *const Layout, s: usize, src: usize, stripe: usize) usize {
         return l.flags + ((s * max_world + src) * max_stripes + stripe) * line;
@@ -108,28 +118,86 @@ pub fn piece(n: usize, lo: usize, M: usize) usize {
 /// The GPU's side of `x`: per call (posted on `ch`) on `ops`: slot wait, staging, ready, flags, copies out, consumed.
 pub fn run(ch: anytype, ops: anytype, l: *const Layout, rank: usize, stripes: usize, x: *const Exchange) !void {
     if (!x.valid(rank, l.world) or stripes == 0 or stripes > max_stripes) return error.BadExchange;
-    const peers = l.world - 1;
     for (0..callCount(x.unit, l.M)) |k| {
         const lo = k * l.M;
-        var d: Desc = .{ .shared = x.shared };
-        for (0..peers) |link| d.bytes[link] = @intCast(piece(x.parts[linkPeer(rank, link)].out, lo, l.M));
-        const c: u64 = try ch.post(d);
+        const c = try sendCall(ch, ops, l, rank, x, lo);
         const s: usize = @intCast(c % l.slots);
-        const v: u32 = @truncate(c + 1);
-        if (c >= l.slots) try ops.wait(l.sendDone(s), @as(u32, @truncate(c - l.slots + 1))); // the NICs read it out
-        for (0..if (x.shared) 1 else peers) |link| {
-            if (d.bytes[link] > 0) try ops.stage(l.send(s, link), x.parts[linkPeer(rank, link)].src + lo, d.bytes[link]);
-            try ops.write(l.ready(s, link), v);
-        }
-        for (0..peers) |link| {
+        for (0..l.world - 1) |link| {
             const r = linkPeer(rank, link);
-            for (0..stripes) |i| try ops.wait(l.flag(s, r, i), v);
+            try arrived(ops, l, stripes, c, r);
             const n = piece(x.parts[r].in, lo, l.M);
             if (n > 0) try ops.unstage(x.parts[r].dst + lo, l.recv(s, r), n);
         }
-        try ops.write(l.consumed(s), v);
+        try ops.write(l.consumed(s), @as(u32, @truncate(c + 1)));
     }
 }
+
+/// Call c's bytes [lo, lo + M) of every part: posted, the slot's reuse wait, the staging and its ready words.
+fn sendCall(ch: anytype, ops: anytype, l: *const Layout, rank: usize, x: *const Exchange, lo: usize) !u64 {
+    const peers = l.world - 1;
+    var d: Desc = .{ .shared = x.shared };
+    for (0..peers) |link| d.bytes[link] = @intCast(piece(x.parts[linkPeer(rank, link)].out, lo, l.M));
+    const c: u64 = try ch.post(d);
+    const s: usize = @intCast(c % l.slots);
+    const v: u32 = @truncate(c + 1);
+    if (c >= l.slots) try ops.wait(l.sendDone(s), @as(u32, @truncate(c - l.slots + 1))); // the NICs read it out
+    for (0..if (x.shared) 1 else peers) |link| {
+        if (d.bytes[link] > 0) try ops.stage(l.send(s, link), x.parts[linkPeer(rank, link)].src + lo, d.bytes[link]);
+        try ops.write(l.ready(s, link), v);
+    }
+    return c;
+}
+
+/// The wait for every stripe of call c from rank r: its bytes are in r's receive block then.
+fn arrived(ops: anytype, l: *const Layout, stripes: usize, c: u64, r: usize) !void {
+    for (0..stripes) |i| try ops.wait(l.flag(@intCast(c % l.slots), r, i), @as(u32, @truncate(c + 1)));
+}
+
+/// TF_GLM_OVN_PRX_ZC: `x` in one call (else null), read in place; `own` copied into this rank's block, M apart.
+pub fn runZc(ch: anytype, ops: anytype, l: *const Layout, rank: usize, stripes: usize, x: *const Exchange, own: Part) !?u64 {
+    if (!x.valid(rank, l.world) or stripes == 0 or stripes > max_stripes or own.out > l.M) return error.BadExchange;
+    if (callCount(x.unit, l.M) != 1) return null;
+    const c = try sendCall(ch, ops, l, rank, x, 0);
+    for (0..l.world - 1) |link| try arrived(ops, l, stripes, c, linkPeer(rank, link));
+    // after the peers' data: they wrote call c here only once this rank freed call c - slots, whose reader is done
+    if (own.out > 0) try ops.stage(l.recv(@intCast(c % l.slots), rank), own.src, own.out);
+    return c;
+}
+
+/// A ZC call's receive blocks: the region offset of rank 0's block; rank r's is `r * M` past it.
+pub fn zcBlocks(l: *const Layout, c: u64) usize {
+    return l.recv(@intCast(c % l.slots), 0);
+}
+
+/// On the stream that read a ZC call's blocks, after the read: the peers may write the slot again.
+pub fn zcDone(ops: anytype, l: *const Layout, c: u64) !void {
+    try ops.write(l.consumed(@intCast(c % l.slots)), @as(u32, @truncate(c + 1)));
+}
+
+/// TF_GLM_OVN_PRX_ZC's calls waiting for their glue, oldest first, each keyed by its piece (the room it stands for).
+pub const ZcQueue = struct {
+    pub const Entry = struct { key: u64, call: u64, own_src: u64 = 0, own_bytes: usize = 0 };
+    q: [16]Entry = undefined, // a site's pieces (TF_GLM_OVERLAP_PIECES up to 8)
+    head: usize = 0,
+    n: usize = 0,
+
+    pub fn full(z: *const ZcQueue) bool {
+        return z.n == z.q.len;
+    }
+    pub fn push(z: *ZcQueue, e: Entry) error{ZcQueueFull}!void {
+        if (z.full()) return error.ZcQueueFull;
+        z.q[(z.head + z.n) % z.q.len] = e;
+        z.n += 1;
+    }
+    /// The oldest entry if it is `key`'s, removed; null otherwise (that piece went the copying way).
+    pub fn take(z: *ZcQueue, key: u64) ?Entry {
+        if (z.n == 0 or z.q[z.head].key != key) return null;
+        const e = z.q[z.head];
+        z.head = (z.head + 1) % z.q.len;
+        z.n -= 1;
+        return e;
+    }
+};
 
 // -- tests ------------------------------------------------------------------------------------------------------------
 
@@ -149,6 +217,9 @@ test "PRX plan: no two words, flags or blocks of the region overlap, at every ge
             };
         }
         for (0..max_world) |r| try std.testing.expect((try seen.fetchPut(l.credit(r), {})) == null);
+        for (0..max_world) |r| try std.testing.expect((try seen.fetchPut(l.beat(r), {})) == null);
+        try std.testing.expect((try seen.fetchPut(l.abort(), {})) == null);
+        try std.testing.expect(l.abort() + 4 <= l.flags); // the ctrl words sit before the flags
         var it = seen.keyIterator();
         while (it.next()) |k| try std.testing.expect(k.* % line == 0 and k.* < l.data);
         // the data blocks tile each slot: world - 1 send blocks then world receive blocks, M apart, inside the region
@@ -297,4 +368,53 @@ test "PRX plan: an exchange that breaks its rules is refused before anything is 
     y.parts[2] = .{ .src = 2, .out = 10 };
     try std.testing.expectError(error.BadExchange, run(&t, &t, &l, 0, 1, &y));
     try std.testing.expectEqual(@as(usize, 0), t.n);
+}
+
+test "PRX plan: a ZC call stages and waits as a copied one, copies this rank's rows in after, and leaves the slot held" {
+    const l = try Layout.of(3, 2, 4096);
+    var t: Tape = .{};
+    var x: Exchange = .{ .unit = 2000 };
+    x.parts[0] = .{ .src = 0x1000, .out = 2000, .dst = 0x9000, .in = 1500 };
+    x.parts[2] = .{ .src = 0x2000, .out = 1000, .dst = 0xa000, .in = 1500 };
+    const c = (try runZc(&t, &t, &l, 1, 1, &x, .{ .src = 0x5000, .out = 1500 })).?;
+    try std.testing.expectEqual(@as(u64, 0), c);
+    const O = Tape.Op;
+    const want = [_]O{
+        .{ .post = .{ .bytes = .{ 2000, 1000, 0 } } },
+        .{ .stage = .{ l.send(0, 0), 0x1000, 2000 } },
+        .{ .write = .{ l.ready(0, 0), 1 } },
+        .{ .stage = .{ l.send(0, 1), 0x2000, 1000 } },
+        .{ .write = .{ l.ready(0, 1), 1 } },
+        .{ .wait = .{ l.flag(0, 0, 0), 1 } },
+        .{ .wait = .{ l.flag(0, 2, 0), 1 } },
+        .{ .stage = .{ l.recv(0, 1), 0x5000, 1500 } },
+    };
+    try std.testing.expectEqual(want.len, t.n);
+    for (want, t.ops[0..t.n]) |a, b| try std.testing.expectEqualDeep(a, b);
+    // the blocks sit one block apart from rank 0's, and the reader's done frees the slot
+    try std.testing.expectEqual(l.recv(0, 2), zcBlocks(&l, c) + 2 * l.M);
+    try zcDone(&t, &l, c);
+    try std.testing.expectEqualDeep(Tape.Op{ .write = .{ l.consumed(0), 1 } }, t.ops[t.n - 1]);
+    // more than a block: nothing posted, the caller exchanges it the copying way
+    const n = t.n;
+    var big: Exchange = .{ .unit = 4097 };
+    big.parts[0] = .{ .out = 4097 };
+    try std.testing.expect((try runZc(&t, &t, &l, 1, 1, &big, .{})) == null);
+    try std.testing.expectEqual(n, t.n);
+}
+
+test "PRX plan: the ZC queue hands each piece's call to its own glue, oldest first, and refuses past its size" {
+    var z: ZcQueue = .{};
+    try z.push(.{ .key = 10, .call = 0 });
+    try z.push(.{ .key = 20, .call = 1, .own_src = 7, .own_bytes = 8 });
+    try std.testing.expect(z.take(20) == null); // not the oldest: that piece is not next
+    try std.testing.expectEqual(@as(u64, 0), z.take(10).?.call);
+    const e = z.take(20).?;
+    try std.testing.expectEqual(@as(u64, 1), e.call);
+    try std.testing.expectEqual(@as(usize, 8), e.own_bytes);
+    try std.testing.expect(z.take(20) == null);
+    for (0..z.q.len) |i| try z.push(.{ .key = i, .call = i });
+    try std.testing.expect(z.full());
+    try std.testing.expectError(error.ZcQueueFull, z.push(.{ .key = 99, .call = 99 }));
+    for (0..z.q.len) |i| try std.testing.expectEqual(@as(u64, i), z.take(i).?.call);
 }

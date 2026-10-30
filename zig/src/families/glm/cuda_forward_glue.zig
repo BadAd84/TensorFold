@@ -31,38 +31,43 @@ pub fn fused(f: *const Forward, r: Rank, alt: bool, hc: weights.Hc, norm: glue.N
 
 /// One piece's glue after a site: hc_post, then the next layer's hc_pre or (after the last layer) the stream mean.
 pub fn glueRows(f: *const Forward, r: Rank, j: usize, site: Forward.Site, lo: usize, hi: usize, g: u64) !void {
+    return glueRowsAt(f, r, j, site, lo, hi, g, (hi - lo) * r.w.config.hidden);
+}
+
+/// glueRows with rank k's partial rows at g + k * rs floats (TF_GLM_OVN_PRX_ZC: the pinned region's blocks).
+pub fn glueRowsAt(f: *const Forward, r: Rank, j: usize, site: Forward.Site, lo: usize, hi: usize, g: u64, rs: usize) !void {
     const stamp = prof.span(f.prof, f.stream, .glue);
     defer stamp.end();
     const c = &r.w.config;
     const layers = r.w.layers;
-    if (site == .mixer) return postPre(f, r, layers[j].ffn_hc, layers[j].post_norm, lo, hi, g, 0);
+    if (site == .mixer) return postPre(f, r, layers[j].ffn_hc, layers[j].post_norm, lo, hi, g, rs, 0);
     const first = rotlayer.first(&r.w.share, j); // a rotated MoE layer's partials from its first share's rank
-    if (j + 1 < layers.len) try postPre(f, r, layers[j + 1].attn_hc, layers[j + 1].in_norm, lo, hi, g, first) else try postRows(f, r, lo, hi, g, first);
+    if (j + 1 < layers.len) try postPre(f, r, layers[j + 1].attn_hc, layers[j + 1].in_norm, lo, hi, g, rs, first) else try postRows(f, r, lo, hi, g, rs, first);
     if (rotlayer.capture) |cap| try cap.at(f.stream, r.w.share.rank, j, r.b.x, lo, hi, c.hc * c.hidden * 2);
     if (j + 1 == layers.len) try glue.streamMean(f.set(), f.stream, r.b.x + lo * c.hc * c.hidden * 2, r.b.hidden + lo * c.hidden * 2, hi - lo, c.hidden, c.hc);
 }
 
 /// hc_post then hc_pre of rows lo..hi; TF_GLM_OVN_GLUE_ROW=N: one kernel (hcRow) for N rows or more.
-fn postPre(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, lo: usize, hi: usize, g: u64, first: usize) !void {
+fn postPre(f: *const Forward, r: Rank, hc: weights.Hc, norm: glue.Norm, lo: usize, hi: usize, g: u64, rs: usize, first: usize) !void {
     if (f.m.glue_row == 0 or hi - lo < f.m.glue_row) {
-        try postRows(f, r, lo, hi, g, first);
+        try postRows(f, r, lo, hi, g, rs, first);
         return preRows(f, r, hc, norm, lo, hi);
     }
     const c = &r.w.config;
     const b = r.b;
     const S: usize = c.hc;
     const D: usize = c.hidden;
-    try glue.hcRow(f.set(), f.stream, b.x + lo * S * D * 2, g, hc.fn_w, hc.base, hc.scale, norm, b.normed + lo * D * 2, b.xs + lo * (D / 64) * 4, b.post + lo * S * 4, b.comb + lo * S * S * 4, c.eps, c.hc_eps, c.sinkhorn, hi - lo, D, S, rotlayer.word(r.w.share.world, first));
+    try glue.hcRowAt(f.set(), f.stream, b.x + lo * S * D * 2, g, rs, hc.fn_w, hc.base, hc.scale, norm, b.normed + lo * D * 2, b.xs + lo * (D / 64) * 4, b.post + lo * S * 4, b.comb + lo * S * S * 4, c.eps, c.hc_eps, c.sinkhorn, hi - lo, D, S, rotlayer.word(r.w.share.world, first));
 }
 
-/// hc_post of rows lo..hi from partials `g` [world][hi - lo][D] (a gathered room or a split one's own rows).
-fn postRows(f: *const Forward, r: Rank, lo: usize, hi: usize, g: u64, first: usize) !void {
+/// hc_post of rows lo..hi from partials `g`, rank k's at g + k * rs floats (a gathered room or a split one's own rows).
+fn postRows(f: *const Forward, r: Rank, lo: usize, hi: usize, g: u64, rs: usize, first: usize) !void {
     const c = &r.w.config;
     const b = r.b;
     const S: usize = c.hc;
     const D: usize = c.hidden;
     const x = b.x + lo * S * D * 2;
-    try glue.hcPost(f.set(), f.stream, x, x, g, b.post + lo * S * 4, b.comb + lo * S * S * 4, hi - lo, D, S, rotlayer.word(r.w.share.world, first));
+    try glue.hcPostAt(f.set(), f.stream, x, x, g, rs, b.post + lo * S * 4, b.comb + lo * S * S * 4, hi - lo, D, S, rotlayer.word(r.w.share.world, first));
 }
 
 /// forward._pre of rows lo..hi.
