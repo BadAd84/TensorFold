@@ -4,12 +4,14 @@ const platform = @import("sys");
 const builtin = @import("builtin");
 const pc = @import("prompt_cache.zig");
 const modes = @import("cache_modes.zig");
-pub const image = @import("rows_image.zig");
+pub const image = @import("lanes").rows_image;
 pub const chain = @import("rows_chain.zig");
-pub const file = @import("rows_file.zig");
+pub const file = @import("lanes").rows_file;
 pub const write = @import("rows_write.zig");
 pub const read = @import("rows_read.zig");
+pub const local = @import("rows_local.zig");
 const dirs = @import("lanes").learned_dirs;
+const readers = @import("lanes").disk_readers;
 const Admission = @import("lanes").learned_disk.Admission;
 const Allocator = std.mem.Allocator;
 const Name = chain.Name;
@@ -117,20 +119,24 @@ pub const Rows = struct {
     fetch: ?*@import("rows_prefetch.zig").Prefetch = null, // states read ahead for queued requests (a lane host's)
     pump: ?*@import("rows_pump.zig").Pump = null, // TF_GLM_OVN_DISK_PUMP: the job whose payloads stage a few a round
     pump_blocks: u32 = 0, // TF_GLM_OVN_DISK_PUMP: pieces staged a round (0: a state staged in one step)
+    mirror: ?*const @import("rows_local.zig").Mirror = null, // TF_GLM_OVN_DISK_LOCAL: the other ranks' own parts
+    readers: u32 = 1, // TF_GLM_OVN_DISK_READERS: threads a restore reads its files on (1: one file after another)
+    readers_stage: readers.Staging = .{}, // their slots, made by the first read that uses them
 
     /// The store under `o.root` for `o.identity` (made 0700 when missing); its files are read, unreferenced blocks go.
     pub fn open(gpa: Allocator, family: pc.Snapshots, o: Options) !*Rows {
         const r = try init(gpa, family, o);
         errdefer r.deinit();
         try makePath(gpa, r.dir);
-        try r.scan();
-        r.settle();
+        try @import("rows_scan.zig").scan(r);
+        @import("rows_scan.zig").settle(r);
         r.stamp();
         r.sync_writes = o.sync_writes or (if (platform.c.getenv("TENSORFOLD_ROWS_SYNC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false);
         r.staging_bytes = stagingBytes(o.staging_bytes, if (platform.c.getenv("TENSORFOLD_ROWS_STAGING_GIB")) |v| std.mem.span(v) else null);
         r.next_job = @truncate(@as(u128, @intCast(write.nowNs())));
         r.verify = if (platform.c.getenv("TF_IMPRINT_VERIFY")) |v| v[0] == '1' else false;
         r.pump_blocks = try @import("rows_pump.zig").knob();
+        r.readers = try readers.knob(1);
         return r;
     }
 
@@ -159,12 +165,13 @@ pub const Rows = struct {
         r.blocks.deinit(r.gpa);
         r.queue.deinit(r.gpa);
         if (r.stage.len > 0) r.gpa.free(r.stage);
+        r.readers_stage.deinit();
         r.gpa.free(r.dir);
         r.gpa.free(r.root);
         r.gpa.destroy(r);
     }
 
-    fn freeState(gpa: Allocator, s: *State) void {
+    pub fn freeState(gpa: Allocator, s: *State) void {
         gpa.free(s.tokens);
         gpa.free(s.spans);
         gpa.free(s.starts);
@@ -243,7 +250,7 @@ pub const Rows = struct {
         write.fence(r);
         var s = r.states.orderedRemove(i);
         defer freeState(r.gpa, &s);
-        unlinkName(r.dir, s.name, ".st");
+        r.unlink(s.name, .state);
         var wants: std.ArrayList(write.Want) = .empty;
         defer wants.deinit(r.gpa);
         r.wantsOf(r.gpa, &s, &wants) catch {};
@@ -259,9 +266,15 @@ pub const Rows = struct {
         while (it.next()) |kv| if (kv.value_ptr.refs == 0 and !write.wanted(r, kv.key_ptr.*)) gone.append(r.gpa, kv.key_ptr.*) catch {};
         if (gone.items.len > 0) write.fence(r);
         for (gone.items) |n| {
-            unlinkName(r.dir, n, ".blk");
+            r.unlink(n, .block);
             _ = r.blocks.remove(n);
         }
+    }
+
+    /// A file of the store removed (`n` a Name or a Stem), and with TF_GLM_OVN_DISK_LOCAL every other rank's part.
+    pub fn unlink(r: *Rows, n: anytype, kind: file.Kind) void {
+        unlinkName(r.dir, n, if (kind == .block) ".blk" else ".st");
+        if (r.mirror) |m| m.unlink(m.ctx, .{ .stem = n[0..16].*, .kind = kind });
     }
 
     /// The disk state reaching furthest into `prompt` past `longer_than`: its tokens a prefix, spans and starts equal.
@@ -312,6 +325,7 @@ pub const Rows = struct {
             const b = dirs.otherBytes(r.root, r.dir, o.id) catch continue;
             write.fence(r);
             dirs.removeOther(r.root, r.dir, o.id) catch continue;
+            if (r.mirror) |m| m.other(m.ctx, o.id);
             over -|= b;
         }
         while (over > 0) {
@@ -397,88 +411,14 @@ pub const Rows = struct {
         r.queue.clearRetainingCapacity();
         const before = r.held();
         for (r.states.items) |*s| {
-            unlinkName(r.dir, s.name, ".st");
+            r.unlink(s.name, .state);
             freeState(r.gpa, s);
         }
         r.states.clearRetainingCapacity();
         var it = r.blocks.keyIterator();
-        while (it.next()) |n| unlinkName(r.dir, n.*, ".blk");
+        while (it.next()) |n| r.unlink(n.*, .block);
         r.blocks.clearRetainingCapacity();
         return before;
-    }
-
-    /// The files under the store's directory: states read back and checked by name, blocks by size; leftovers go.
-    fn scan(r: *Rows) !void {
-        const d = platform.c.opendir(r.dir) orelse return error.RowsDir;
-        defer _ = platform.c.closedir(d);
-        while (platform.c.readdir(d)) |ent| {
-            if (ent.type != platform.c.DT.REG) continue;
-            const name = std.mem.sliceTo(&ent.name, 0);
-            var buf: [1200]u8 = undefined;
-            const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ r.dir, name }, 0) catch continue;
-            if (std.mem.endsWith(u8, name, ".part")) {
-                _ = platform.c.unlink(p);
-                continue;
-            }
-            const n = parseName(name) orelse continue;
-            if (std.mem.endsWith(u8, name, ".blk")) {
-                const bytes = dirs.fileBytes(p) catch continue;
-                try r.blocks.put(r.gpa, n, .{ .bytes = bytes });
-            } else if (std.mem.endsWith(u8, name, ".st")) {
-                r.readState(p) catch {
-                    _ = platform.c.unlink(p);
-                };
-            }
-        }
-    }
-
-    /// A state file's metadata checked against its name, kept for lookups (its payload is checked when read).
-    fn readState(r: *Rows, p: [:0]const u8) !void {
-        var o = try file.open(p, .state, null);
-        defer o.close();
-        const m = try file.meta(&o, r.gpa);
-        defer r.gpa.free(m);
-        if (m.len < 12) return error.RowsRead;
-        const counts = std.mem.bytesAsSlice(u32, m[0..12]);
-        const nt: usize = counts[0];
-        const ns: usize = counts[1];
-        const nst: usize = counts[2];
-        if (m.len != 12 + 4 * (nt + 2 * ns + nst) or nt == 0) return error.RowsRead;
-        var s: State = .{ .name = o.trailer.name, .at = o.trailer.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer), .rows = 0, .used = 0, .shared = o.trailer.flags & 1 != 0 };
-        errdefer freeState(r.gpa, &s);
-        s.tokens = try r.gpa.dupe(u32, @alignCast(std.mem.bytesAsSlice(u32, m[12..][0 .. 4 * nt])));
-        s.spans = try r.gpa.dupe(Span, @alignCast(std.mem.bytesAsSlice(Span, m[12 + 4 * nt ..][0 .. 8 * ns])));
-        s.starts = try r.gpa.dupe(u32, @alignCast(std.mem.bytesAsSlice(u32, m[12 + 4 * nt + 8 * ns ..][0 .. 4 * nst])));
-        if (s.at == 0 or s.tokens.len != s.at + r.keying.lookahead or o.trailer.block != r.keying.block) return error.RowsRead;
-        if (!std.mem.eql(u8, &chain.state(r.keying, s.tokens, s.spans, s.starts, s.at), &s.name)) return error.RowsRead;
-        modes.validate(s.spans) catch return error.RowsRead;
-        r.clock += 1;
-        s.used = r.clock;
-        try r.states.append(r.gpa, s);
-    }
-
-    /// Each state's blocks counted; a state missing one, or that its family cannot lay out, goes; then idle blocks.
-    fn settle(r: *Rows) void {
-        var i: usize = 0;
-        while (i < r.states.items.len) {
-            const s = &r.states.items[i];
-            var wants: std.ArrayList(write.Want) = .empty;
-            defer wants.deinit(r.gpa);
-            const whole = if (r.wantsOf(r.gpa, s, &wants)) |_| for (wants.items) |w| {
-                if (!r.blocks.contains(chain.stem(w.name))) break false;
-            } else true else |_| false;
-            if (!whole) {
-                var gone = r.states.orderedRemove(i);
-                unlinkName(r.dir, gone.name, ".st");
-                freeState(r.gpa, &gone);
-                continue;
-            }
-            r.ref(wants.items, 1);
-            s.rows = 0;
-            for (wants.items) |w| s.rows += w.bytes;
-            i += 1;
-        }
-        r.collect();
     }
 
     /// This identity was opened (and wrote): the newest under the root for every identity's sweep.
@@ -532,14 +472,6 @@ fn dayNow() u64 {
     var t: platform.c.timespec = undefined;
     if (platform.c.clock_gettime(platform.c.CLOCK.REALTIME, &t) != 0 or t.sec < 0) return 0;
     return @as(u64, @intCast(t.sec)) / 86400;
-}
-
-/// A file's stem: the first 16 bytes of its name in hex (32 digits), then `.blk` or `.st`.
-fn parseName(name: []const u8) ?chain.Stem {
-    if (name.len < 33 or name[32] != '.') return null;
-    var n: chain.Stem = undefined;
-    _ = std.fmt.hexToBytes(&n, name[0..32]) catch return null;
-    return n;
 }
 
 /// The file of name `n` (a Name or a Stem) with extension `ext` removed (a missing one is fine).
@@ -599,6 +531,7 @@ test {
     _ = @import("rows_prefetch.zig");
     _ = @import("rows_prefetch_stack_test.zig");
     _ = @import("rows_pump_test.zig");
+    _ = @import("rows_local_test.zig");
 }
 
 /// TENSORFOLD_ROWS_STAGING_GIB: the host bytes the write worker stages at once (a save larger than that is skipped, so a

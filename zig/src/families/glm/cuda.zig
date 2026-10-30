@@ -46,6 +46,7 @@ pub const snapshots = @import("cuda_snapshots.zig");
 pub const disk_image = @import("cuda_disk_image.zig");
 pub const disk_ranks = @import("cuda_disk_ranks.zig");
 pub const one_chunk = @import("cuda_one_chunk.zig");
+pub const disk_local = @import("cuda_disk_local.zig"); // TF_GLM_OVN_DISK_LOCAL: each rank's part on its own disk
 
 test {
     _ = @import("cuda_tile.zig");
@@ -62,6 +63,7 @@ test {
     _ = @import("cuda_lanes_test.zig");
     _ = prompt_pair;
     _ = @import("cuda_disk_image.zig");
+    _ = @import("cuda_disk_part.zig");
     _ = experts;
     _ = exl3;
     _ = vision;

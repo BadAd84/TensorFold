@@ -73,3 +73,6 @@ test {
 
 pub const learned_disk = @import("learned_disk.zig");
 pub const learned_dirs = @import("learned_dirs.zig");
+pub const rows_file = @import("rows_file.zig"); // the disk tier's file format: rank 0's store and every rank's own part
+pub const rows_image = @import("rows_image.zig");
+pub const disk_readers = @import("disk_readers.zig");

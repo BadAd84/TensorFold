@@ -1,7 +1,7 @@
 //! One disk worker owns staged images; it never sees a cache entry, family, device buffer or store.
 const std = @import("std");
 const platform = @import("sys");
-const file = @import("rows_file.zig");
+const file = @import("lanes").rows_file;
 const chain = @import("rows_chain.zig");
 const Span = @import("cache_modes.zig").Span;
 const Want = @import("rows_write_sync.zig").Want;

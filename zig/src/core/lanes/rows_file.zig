@@ -2,7 +2,8 @@
 const std = @import("std");
 const platform = @import("sys");
 const builtin = @import("builtin");
-const Name = @import("rows_chain.zig").Name;
+/// A file's name in its trailer (the store's chain.Name: 32 bytes; its first 16, in hex, name the file).
+pub const Name = [32]u8;
 
 const MAGIC: u32 = 0x42524654; // "TFRB"
 const VERSION: u32 = 1;
@@ -38,6 +39,13 @@ extern "c" fn posix_fadvise(fd: c_int, offset: i64, len: i64, advice: c_int) c_i
 /// A file's path: `dir`/`stem``ext` (and `.part` while it is written).
 pub fn path(buf: []u8, dir: []const u8, stem: []const u8, ext: []const u8, part: bool) ![:0]const u8 {
     return std.fmt.bufPrintSentinel(buf, "{s}/{s}{s}{s}", .{ dir, stem, ext, if (part) ".part" else "" }, 0);
+}
+
+/// TF_GLM_OVN_DISK_LOCAL: rank `rank`'s extension for its file of kind `ext`; rank 0's is `ext` itself, another rank's
+/// is `ext` then `.r<rank>`, so rank 0's scan (`.blk`, `.st`) never takes it and ranks on one filesystem never collide.
+pub fn rankExt(buf: *[24]u8, ext: []const u8, rank: u32) ![]const u8 {
+    if (rank == 0) return ext;
+    return std.fmt.bufPrint(buf, "{s}.r{d}", .{ ext, rank });
 }
 
 /// The filesystem calls for one writer; tests supply per-store faults without a process-wide hook.
@@ -326,4 +334,24 @@ test "a state file's metadata reads back checked, and an aborted write leaves no
     gone.abort();
     var part: [128]u8 = undefined;
     try std.testing.expectError(error.RowsMissing, open(try path(&part, dir, "g", ".st", true), .state, null));
+}
+
+test "rows_file per-rank names: rank 0 keeps the store's names, each other rank its own that rank 0's scan skips" {
+    var b: [24]u8 = undefined;
+    try std.testing.expectEqualStrings(".blk", try rankExt(&b, ".blk", 0));
+    try std.testing.expectEqualStrings(".st", try rankExt(&b, ".st", 0));
+    try std.testing.expectEqualStrings(".st.r2", try rankExt(&b, ".st", 2));
+    var names: [6][64]u8 = undefined;
+    var lens: [6]usize = undefined;
+    for ([_][]const u8{ ".blk", ".st" }, 0..) |ext, e| for (1..4) |r| {
+        var p: [64]u8 = undefined;
+        const n = try path(&p, "d", "00112233445566778899aabbccddeeff", try rankExt(&b, ext, @intCast(r)), false);
+        // rank 0's scan keys on these endings: a rank's part is never taken for a file of rank 0's store
+        for ([_][]const u8{ ".blk", ".st", ".part" }) |end| try std.testing.expect(!std.mem.endsWith(u8, n, end));
+        try std.testing.expect(std.mem.indexOf(u8, n, ext) != null);
+        const i = e * 3 + (r - 1);
+        @memcpy(names[i][0..n.len], n);
+        lens[i] = n.len;
+    };
+    for (0..6) |i| for (i + 1..6) |j| try std.testing.expect(!std.mem.eql(u8, names[i][0..lens[i]], names[j][0..lens[j]]));
 }

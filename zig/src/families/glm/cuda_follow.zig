@@ -537,7 +537,10 @@ pub fn follow(e: *Engine, link: *Link) !void {
             .drop => for (step.ids) |id| e.dropState(id),
             .release => e.release(h.slot),
             .idle => cuda.tp_watch.sleep(e.io),
-            .end => return cuda.tp_watch.ended(), // rank 0 ends on purpose: its line closing from here is expected
+            .end => { // rank 0 ends on purpose: its line closing from here is expected
+                @import("cuda_disk_local.zig").close(); // TF_GLM_OVN_DISK_LOCAL: this rank's queued writes land first
+                return cuda.tp_watch.ended();
+            },
         }
     }
 }
