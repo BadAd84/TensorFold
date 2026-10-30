@@ -10,6 +10,7 @@ const cuts = @import("prompt_cuts.zig");
 const interior = @import("prompt_interior.zig");
 const index = @import("prompt_cache_index.zig");
 const forks = @import("prompt_cache_fork.zig");
+pub const prefix = @import("prompt_prefix.zig"); // every kept-state walk's prefix compare (TF_GLM_OVN_KEPT_WALK)
 pub const rows = @import("rows_store.zig");
 
 /// A family's copy of one state.
@@ -123,6 +124,7 @@ pub const Entry = struct {
     borrowers: u32 = 0, // outstanding lookups: released by resumed or release, never evicted while borrowed
     ext: std.ArrayList(*Entry) = .empty, // entries extending its tokens, born later (policy.link): `extended` reads them
     own: []u32 = &.{}, // the kept prompt's one copy, which `tokens` and at first `last` slice (empty: they own theirs)
+    seen: u64 = 0, // TF_GLM_OVN_KEPT_WALK: the link walk (Store.walks) that proved its tokens begin the new entry's
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
@@ -153,6 +155,7 @@ pub const Store = struct {
     disk: ?*rows.Rows = null, // --learn-conversations: every kept state written behind to disk, read back where it pays
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
     links_lost: bool = false, // an allocation failure left the extension links incomplete: `extended` scans
+    walks: u64 = 0, // TF_GLM_OVN_KEPT_WALK: link walks so far, each marking the entries it proved (Entry.seen)
     hold: bool = false, // memory pressure: lookups plan no marks and keeps refuse, so no new state is kept
 
     repeat_log: @import("prompt_cache_repeat.zig").Log = .{},
@@ -252,7 +255,7 @@ pub const Store = struct {
         var best: ?u32 = null;
         for (s.entries.items) |e| {
             if (e.expired or e.at > at or at - e.at >= s.rules.min_gap or e.tokens.len > prompt.len or !s.usable(e.at, starts)) continue;
-            if (!std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens) or !modes.equal(e.decode_spans, spans, e.at)) continue;
+            if (!prefix.starts(prompt, e.tokens) or !modes.equal(e.decode_spans, spans, e.at)) continue;
             if (best == null or e.at > best.?) best = e.at;
         }
         return best;
@@ -262,7 +265,7 @@ pub const Store = struct {
     pub fn wouldServe(s: *const Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, kept: []const u32, kept_spans: []const modes.Span, at: u32) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at >= prompt.len or n > prompt.len or n > kept.len or !s.usable(at, starts)) return false;
-        return std.mem.eql(u32, prompt[0..n], kept[0..n]) and modes.equal(kept_spans, spans, at);
+        return prefix.starts(prompt, kept[0..n]) and modes.equal(kept_spans, spans, at);
     }
 
     /// The longest kept token prefix with matching canonical spans through its position, leaving at least one row.
@@ -339,7 +342,7 @@ pub const Store = struct {
         for (marks_) |at| {
             const n = @as(usize, at) + s.rules.lookahead;
             const exists = for (s.entries.items) |e| {
-                if (!e.expired and e.at == at and e.tokens.len == n and n <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) break true;
+                if (!e.expired and e.at == at and e.tokens.len == n and prefix.starts(prompt, e.tokens) and modes.equal(e.decode_spans, spans, at)) break true;
             } else false;
             if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
             new += @intFromBool(!exists);
@@ -364,7 +367,7 @@ pub const Store = struct {
 
     /// Forget a failed peer state matching the token prefix and canonical spans through at.
     pub fn forget(s: *Store, prompt: []const u32, at: u32, spans: []const modes.Span) void {
-        for (s.entries.items) |e| if (!e.expired and e.at == at and e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len]) and modes.equal(e.decode_spans, spans, at)) {
+        for (s.entries.items) |e| if (!e.expired and e.at == at and prefix.starts(prompt, e.tokens) and modes.equal(e.decode_spans, spans, at)) {
             s.counts.failed += 1;
             e.expired = true;
             return s.collectExpired();
@@ -428,7 +431,7 @@ pub const Store = struct {
         if (rewind > 0 and s.active_rewind_at == rewind) try want.append(a, rewind);
         // the prompt this one parts from: the one it resumed, or (fork rule) on a miss the kept one sharing the most
         const kept = if (previous.len > 0 or !s.rules.fork) previous else forks.longestShared(Entry, s.entries.items, prompt);
-        const part: u32 = if (kept.len == 0 or short) 0 else @intCast(std.mem.indexOfDiff(u32, kept, prompt) orelse @min(kept.len, prompt.len));
+        const part: u32 = if (kept.len == 0 or short) 0 else @intCast(prefix.common(kept, prompt));
         // the fork rule keeps one before the part, however near: a state at `at` is keyed with the token at `at`
         const stable: u32 = if (part == 0 or part >= history_len or part < history_len / 2) 0 else if (s.rules.fork) part -| s.rules.lookahead else part;
         if (stable > 0) try want.append(a, stable);
@@ -463,7 +466,7 @@ pub const Store = struct {
         if (at == 0 or n > prompt.len or s.hold) return false;
         s.clock += 1;
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
-        for (s.entries.items) |e| if (!e.expired and e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) {
+        for (s.entries.items) |e| if (!e.expired and e.at == at and e.tokens.len == n and prefix.starts(prompt, e.tokens) and modes.equal(e.decode_spans, spans, at)) {
             e.used = s.clock; // the same state again: no copy
             e.shared = e.shared or shared;
             if (shared) learned.learn(s, e, starts);
@@ -590,10 +593,8 @@ test {
     _ = @import("prompt_cache_lifetime_test.zig");
     _ = @import("prompt_cache_scan_test.zig");
     _ = @import("learned_fault_test.zig");
+    _ = @import("prompt_cache_repeat_test.zig");
+    _ = @import("prompt_prefix_test.zig");
     _ = modes;
     _ = rows;
-}
-
-test {
-    _ = @import("prompt_cache_repeat_test.zig");
 }

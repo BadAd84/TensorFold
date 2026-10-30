@@ -1,5 +1,6 @@
 //! A miss's fork: where a prompt parts from the kept prompt sharing the longest prefix, so a later pass resumes there.
 const std = @import("std");
+const prefix = @import("prompt_prefix.zig");
 
 /// The kept entry sharing the longest prefix with `prompt`, its last prompt the fork mark; empty when none shares.
 pub fn longestShared(comptime E: type, entries: []const *const E, prompt: []const u32) []const u32 {
@@ -7,7 +8,8 @@ pub fn longestShared(comptime E: type, entries: []const *const E, prompt: []cons
     var best_n: usize = 0;
     for (entries) |e| {
         if (e.expired or e.last.len == 0) continue;
-        const n = std.mem.indexOfDiff(u32, e.last, prompt) orelse @min(e.last.len, prompt.len);
+        if (!prefix.beyond(e.last, prompt, best_n)) continue; // it cannot share more than the best (production's skip)
+        const n = prefix.common(e.last, prompt);
         if (n == 0 or n >= prompt.len or n <= best_n) continue;
         best = e;
         best_n = n;

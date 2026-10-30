@@ -2,14 +2,14 @@
 const std = @import("std");
 const pc = @import("prompt_cache.zig");
 const modes = @import("cache_modes.zig");
+const prefix = @import("prompt_prefix.zig");
 
 /// The longest kept token prefix with matching canonical spans through its position, leaving at least one row.
 pub fn find(s: *pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span) ?*pc.Entry {
     std.debug.assert(s.by_position.items.len == s.entries.items.len); // add and Store.remove keep them equal
     for (s.by_position.items[below(s, prompt.len)..]) |e| { // longest first: the first match is the scan's winner
         if (e.expired or e.tokens.len > prompt.len or e.at >= prompt.len or !s.usable(e.at, starts)) continue;
-        const n = e.tokens.len;
-        if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
+        if (!prefix.ends(prompt, e.tokens)) continue; // the last id first, as it always was
         if (!modes.equal(e.decode_spans, spans, e.at)) continue;
         return e;
     }

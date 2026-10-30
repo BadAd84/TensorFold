@@ -293,7 +293,7 @@ pub const Rows = struct {
 
     pub fn matches(r: *const Rows, s: *const State, prompt: []const u32, starts: []const u32, spans: []const Span) bool {
         if (s.tokens.len > prompt.len or s.at >= prompt.len) return false;
-        if (!std.mem.eql(u32, prompt[0..s.tokens.len], s.tokens) or !modes.equal(s.spans, spans, s.at)) return false;
+        if (!@import("prompt_prefix.zig").starts(prompt, s.tokens) or !modes.equal(s.spans, spans, s.at)) return false;
         if (r.keying.planned and starts.len == 0 and r.grid > 0) return s.at % r.grid == 0 and onGrid(s.starts, s.at, r.grid);
         return !r.keying.planned or sameBelow(starts, s.starts, s.at);
     }
