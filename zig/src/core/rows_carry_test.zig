@@ -238,19 +238,22 @@ test "rows_carry refuses when any rank's own directory does not prove it, or a r
     try seed(a, dir, old_identity, 0, want(old_identity, key));
     const old = carry.dirOf(old_identity);
     const alias = carry.dirOf(new_identity);
+    // a rank that cannot answer refuses that start only: the next one asks again
+    var lost: Asked = .{ .answer = error.LinkFailed };
+    for (0..2) |_| try std.testing.expect(!carry.choose(dir, want(new_identity, key), lost.ranks(), null).adopted);
+    try std.testing.expectEqual(@as(usize, 2), lost.calls);
+    try std.testing.expect(carry.readAlias(dir, alias) == null);
+    var yes: Asked = .{ .answer = true };
+    try std.testing.expect(carry.choose(dir, want(new_identity, key), yes.ranks(), null).adopted);
+    // a later start whose ranks refuse drops the alias: the store reads its own directory, all ranks alike
     var no: Asked = .{ .answer = false };
     try std.testing.expect(!carry.choose(dir, want(new_identity, key), no.ranks(), null).adopted);
     try std.testing.expectEqual(@as(usize, 1), no.calls);
     try std.testing.expect(no.id == old and no.key == key and no.dir_len == dir.len + 17);
     try std.testing.expect(carry.readAlias(dir, alias) == null);
-    var lost: Asked = .{ .answer = error.LinkFailed };
-    try std.testing.expect(!carry.choose(dir, want(new_identity, key), lost.ranks(), null).adopted);
-    try std.testing.expect(carry.readAlias(dir, alias) == null);
-    var yes: Asked = .{ .answer = true };
-    try std.testing.expect(carry.choose(dir, want(new_identity, key), yes.ranks(), null).adopted);
-    // a later start whose ranks refuse drops the alias: the store reads its own directory, all ranks alike
-    try std.testing.expect(!carry.choose(dir, want(new_identity, key), no.ranks(), null).adopted);
-    try std.testing.expect(carry.readAlias(dir, alias) == null);
+    // that refusal remembered: the same build's next start skips the directory without asking its ranks
+    try std.testing.expect(!carry.choose(dir, want(new_identity, key), yes.ranks(), null).adopted);
+    try std.testing.expectEqual(@as(usize, 1), yes.calls);
     try std.testing.expectEqual(@as(usize, 1), try view(dir, old_identity, null));
 }
 

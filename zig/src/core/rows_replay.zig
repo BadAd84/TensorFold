@@ -12,6 +12,7 @@ const scan = @import("rows_scan.zig");
 const Rows = rows_store.Rows;
 const State = rows_store.State;
 const Record = @import("lanes").carry_record.Record;
+const Proof = @import("rows_carry.zig").Proof;
 const Allocator = std.mem.Allocator;
 
 /// States a replay prefills at most, as production's gate samples them (SpillCarryDriver: three).
@@ -39,6 +40,15 @@ pub const Verdict = union(enum) {
     differs: struct { rank: usize, name: chain.Name, at: u32, off: u64 }, // the state and its first differing byte
     failed: anyerror,
 };
+
+/// The carry's answer: proved; refused and remembered (a difference, nothing to prove it); an error is tried again.
+pub fn proof(v: Verdict) Proof {
+    return switch (v) {
+        .same => .same,
+        .none, .differs => .refused,
+        .failed => .failed,
+    };
+}
 
 /// One state's outcome: the same everywhere, skipped (a rank could not read its files), or differing on `rank`.
 const Result = union(enum) { same, skip, differs: struct { rank: usize, off: u64 } };
@@ -85,8 +95,7 @@ fn candidates(view: *const Rows, out: *std.ArrayList(Candidate)) !void {
     const d = platform.c.opendir(view.dir) orelse return error.RowsDir;
     defer _ = platform.c.closedir(d);
     while (platform.c.readdir(d)) |ent| {
-        const name = std.mem.sliceTo(&ent.name, 0);
-        if (ent.type != platform.c.DT.REG or !std.mem.endsWith(u8, name, ".st") or scan.parseName(name) == null) continue;
+        const name = scan.stateName(ent) orelse continue;
         var buf: [1200]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ view.dir, name }, 0) catch continue;
         var s = scan.stateOf(view, p) catch continue;
@@ -97,28 +106,11 @@ fn candidates(view: *const Rows, out: *std.ArrayList(Candidate)) !void {
             Rows.freeState(view.gpa, &s);
             continue;
         }
-        out.append(view.gpa, .{ .state = s, .mtime = mtimeOf(p) }) catch |err| {
+        out.append(view.gpa, .{ .state = s, .mtime = scan.mtimeOf(p) }) catch |err| {
             Rows.freeState(view.gpa, &s);
             return err;
         };
     }
-}
-
-/// File `p`'s modify time in nanoseconds (0 when unknown: the oldest), as the platform's own stat reads it.
-fn mtimeOf(p: [:0]const u8) i128 {
-    const fd = platform.c.open(p, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(platform.c.mode_t, 0));
-    if (fd < 0) return 0;
-    defer _ = platform.c.close(fd);
-    if (@import("builtin").os.tag == .linux) { // glibc's fstat is a macro: statx, as prompt_imprint reads a size
-        const linux = std.os.linux;
-        var sx: linux.Statx = undefined;
-        if (platform.c.statx(fd, "", linux.AT.EMPTY_PATH, .{ .MTIME = true }, &sx) != 0 or !sx.mask.MTIME) return 0;
-        return @as(i128, sx.mtime.sec) * std.time.ns_per_s + sx.mtime.nsec;
-    }
-    var st: platform.c.Stat = undefined;
-    if (platform.c.fstat(fd, &st) != 0) return 0;
-    const t = st.mtime();
-    return @as(i128, t.sec) * std.time.ns_per_s + t.nsec;
 }
 
 /// State `s`: its files on rank 0 present, then prefilled fresh, compared here and on every other rank, dropped again.

@@ -131,6 +131,7 @@ const Engine = struct {
     asked: std.ArrayList(u32) = .empty, // each fresh state's position, in order
     ids: std.ArrayList([]u32) = .empty, // the ids each was asked with
     ranks: []const Rank = &.{},
+    fail: bool = false, // its prefill fails: a replay that could not run
 
     fn deinit(e: *Engine) void {
         for (e.ids.items) |x| gpa.free(x);
@@ -144,6 +145,7 @@ const Engine = struct {
 
     fn fresh(ctx: *anyopaque, tokens: []const u32, at: u32) anyerror!pc.Saved {
         const e: *Engine = @ptrCast(@alignCast(ctx));
+        if (e.fail) return error.TestPrefill;
         try e.asked.append(gpa, at);
         try e.ids.append(gpa, try gpa.dupe(u32, tokens));
         e.f.prompt = tokens;
@@ -313,16 +315,13 @@ test "rows_carry replay takes the newest states first, the longest among equals,
     var old_buf: [160]u8 = undefined;
     const old_dir = try oldDir(&old_buf, dir);
     for (try plans(a, dir)) |st| {
-        const age: i96 = switch (st.at) {
+        const t: i96 = switch (st.at) {
             500 => 3,
             800 => 2,
             else => 1,
         };
         var pb: [600]u8 = undefined;
-        const p = try file.path(&pb, old_dir, &chain.hex(st.name), ".st", false);
-        const fh = try std.Io.Dir.cwd().openFile(std.testing.io, p, .{ .mode = .read_write });
-        defer fh.close(std.testing.io);
-        try fh.setTimestamps(std.testing.io, .{ .modify_timestamp = .{ .new = .fromNanoseconds((1_700_000_000 + age) * std.time.ns_per_s) } });
+        try age(try file.path(&pb, old_dir, &chain.hex(st.name), ".st", false), 1_700_000_000 + t);
     }
     const Case = struct { cap: u64, asked: []const u32 };
     for ([_]Case{
@@ -339,6 +338,13 @@ test "rows_carry replay takes the newest states first, the longest among equals,
     }
 }
 
+/// File `p`'s modify time set to `s` seconds past the epoch, through std (whose file calls read the same path).
+fn age(p: []const u8, s: i96) !void {
+    const fh = try std.Io.Dir.cwd().openFile(std.testing.io, p, .{ .mode = .read_write });
+    defer fh.close(std.testing.io);
+    try fh.setTimestamps(std.testing.io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(s * std.time.ns_per_s) } });
+}
+
 /// The carry's replay hook over this file's engine, and how often it ran.
 const Hook = struct {
     e: *Engine,
@@ -347,13 +353,30 @@ const Hook = struct {
     calls: usize = 0,
 
     fn proof(h: *Hook) carry.Replay {
-        return .{ .ctx = h, .run = run };
+        return .{ .ctx = h, .run = run, .cap = h.cap };
     }
 
-    fn run(ctx: *anyopaque, id: u64) bool {
+    fn run(ctx: *anyopaque, id: u64) carry.Proof {
         const h: *Hook = @ptrCast(@alignCast(ctx));
         h.calls += 1;
-        return replay.run(gpa, h.e.f.snapshots(), h.dir, id, want(new_identity), h.cap, h.e.engine()) == .same;
+        return replay.proof(replay.run(gpa, h.e.f.snapshots(), h.dir, id, want(new_identity), h.cap, h.e.engine()));
+    }
+};
+
+/// A replay standing in for rows_replay's: one answer under one cap, and how often it ran.
+const Answer = struct {
+    says: carry.Proof,
+    cap: u64 = replay.default_tokens,
+    calls: usize = 0,
+
+    fn proof(r: *Answer) carry.Replay {
+        return .{ .ctx = r, .run = run, .cap = r.cap };
+    }
+
+    fn run(ctx: *anyopaque, _: u64) carry.Proof {
+        const r: *Answer = @ptrCast(@alignCast(ctx));
+        r.calls += 1;
+        return r.says;
     }
 };
 
@@ -374,4 +397,137 @@ test "rows_carry replay runs only before an alias is written: never without a di
     try std.testing.expect(c.adopted and hook.calls == 1 and e.asked.items.len == 1);
     try std.testing.expect(carry.choose(dir, want(new_identity), null, hook.proof()).adopted); // its alias in place
     try std.testing.expectEqual(@as(usize, 1), hook.calls);
+}
+
+test "rows_carry remembers a refusal: the same build's next starts skip the candidate without replaying it" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const dir = root(&buf, "refused");
+    defer rmTree(dir);
+    try seed(a, dir, &.{.{ .salt = 0, .at = 1400 }});
+    var old_buf: [160]u8 = undefined;
+    try rewrite(try oldDir(&old_buf, dir), ".blk", (try plans(a, dir))[0].plan.pieces[1], 0); // computed otherwise here
+    var e: Engine = .{};
+    defer e.deinit();
+    var hook: Hook = .{ .e = &e, .dir = dir, .cap = replay.default_tokens };
+    const own = carry.dirOf(new_identity);
+    try std.testing.expect(!carry.choose(dir, want(new_identity), null, hook.proof()).adopted);
+    // a crash's alias left beside the refusal changes nothing: refused from the record, never replayed again
+    var alias_buf: [200]u8 = undefined;
+    const al: carry.Alias = .{ .own = own, .dir = carry.dirOf(old_identity), .key = key };
+    try carry.record.replace(try std.fmt.bufPrintSentinel(&alias_buf, "{s}/{x:0>16}.carry", .{ dir, own }, 0), std.mem.asBytes(&al));
+    for (0..2) |_| {
+        const c = carry.choose(dir, want(new_identity), null, hook.proof());
+        try std.testing.expect(!c.adopted and c.id == own and carry.readAlias(dir, own) == null);
+    }
+    try std.testing.expectEqual(@as(usize, 1), hook.calls);
+    try std.testing.expectEqual(@as(usize, 1), e.asked.items.len);
+    // a replay that could not run is no refusal: another build's failing starts replay each time
+    var failing: Engine = .{ .fail = true };
+    defer failing.deinit();
+    var tried: Hook = .{ .e = &failing, .dir = dir, .cap = replay.default_tokens };
+    for (0..2) |_| try std.testing.expect(!carry.choose(dir, want(9), null, tried.proof()).adopted);
+    try std.testing.expectEqual(@as(usize, 2), tried.calls);
+}
+
+test "rows_carry voids a remembered refusal when the candidate's newest state, its states, the key or the cap change" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const dir = root(&buf, "void");
+    defer rmTree(dir);
+    try seed(a, dir, &.{ .{ .salt = 1, .at = 500 }, .{ .salt = 2, .at = 800 } });
+    var old_buf: [160]u8 = undefined;
+    const old_dir = try oldDir(&old_buf, dir);
+    var newest_buf: [600]u8 = undefined;
+    var newest: []const u8 = "";
+    for (try plans(a, dir)) |st| {
+        var pb: [600]u8 = undefined;
+        const p = try file.path(&pb, old_dir, &chain.hex(st.name), ".st", false);
+        try age(p, if (st.at == 500) 1_700_000_003 else 1_700_000_002);
+        if (st.at == 500) newest = try std.fmt.bufPrint(&newest_buf, "{s}", .{p});
+    }
+    var w = want(new_identity);
+    var no: Answer = .{ .says = .refused };
+    try twice(dir, w, &no, 1); // refused and remembered: its second start not replayed
+    try age(newest, 1_700_000_005); // the newest state written again
+    try twice(dir, w, &no, 2);
+    var more: [600]u8 = undefined; // a state more, older than the newest: only the set changed
+    try age(try fakeState(&more, old_dir, 0xa1), 1_700_000_001);
+    try twice(dir, w, &no, 3);
+    no.cap = 200_000;
+    try twice(dir, w, &no, 4);
+    var rec = want(old_identity); // another key on both sides, the directory still proving it
+    rec.key += 1;
+    w.key += 1;
+    try carry.record.write(old_dir, rec);
+    try twice(dir, w, &no, 5);
+    // an adoption forgets the refusal: its states back as remembered, the alias still holds without a replay
+    var yes: Answer = .{ .says = .same, .cap = no.cap };
+    var last: [600]u8 = undefined;
+    const added = try fakeState(&last, old_dir, 0xa2);
+    try std.testing.expect(carry.choose(dir, w, null, yes.proof()).adopted);
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.unlink(added));
+    try std.testing.expect(carry.choose(dir, w, null, yes.proof()).adopted);
+    try std.testing.expectEqual(@as(usize, 1), yes.calls);
+}
+
+/// Two starts of build `w` with replay `r`: neither adopts, and the replay has run `calls` times after them.
+fn twice(dir: []const u8, w: Record, r: *Answer, calls: usize) !void {
+    for (0..2) |_| try std.testing.expect(!carry.choose(dir, w, null, r.proof()).adopted);
+    try std.testing.expectEqual(calls, r.calls);
+}
+
+/// A state file in `dir` named by `n`, its bytes no state (a refusal's record reads names and times only).
+fn fakeState(buf: []u8, dir: []const u8, n: u8) ![:0]const u8 {
+    const p = try std.fmt.bufPrintSentinel(buf, "{s}/{x:0>32}.st", .{ dir, n }, 0);
+    const fd = platform.c.open(p, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(platform.c.mode_t, 0o600));
+    if (fd < 0) return error.TestState;
+    _ = platform.c.close(fd);
+    return p;
+}
+
+test "rows_carry forgets a refusal once the build's own directory holds states, or nothing is left to adopt" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var buf: [128]u8 = undefined;
+    const dir = root(&buf, "forget");
+    defer rmTree(dir);
+    try seed(a, dir, &.{.{ .salt = 0, .at = 1400 }});
+    var no: Answer = .{ .says = .refused };
+    var ref_buf: [200]u8 = undefined;
+    for ([_]u64{ new_identity, 9 }) |id| {
+        try std.testing.expect(!carry.choose(dir, want(id), null, no.proof()).adopted);
+        try std.testing.expect(present(try refusalOf(&ref_buf, dir, id)));
+    }
+    // the new build's own directory holds a state: its refusal goes with its alias
+    var own_buf: [200]u8 = undefined;
+    const own_dir = try std.fmt.bufPrintSentinel(&own_buf, "{s}/{x:0>16}", .{ dir, carry.dirOf(new_identity) }, 0);
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.mkdir(own_dir, 0o700));
+    var st_buf: [600]u8 = undefined;
+    _ = try fakeState(&st_buf, own_dir, 0xb1);
+    try std.testing.expect(!carry.choose(dir, want(new_identity), null, no.proof()).adopted);
+    try std.testing.expect(!present(try refusalOf(&ref_buf, dir, new_identity)));
+    // the older directory gone: nothing to adopt, and the other build's refusal goes too
+    var old_buf: [160]u8 = undefined;
+    rmTree(try oldDir(&old_buf, dir));
+    try std.testing.expect(!carry.choose(dir, want(9), null, no.proof()).adopted);
+    try std.testing.expect(!present(try refusalOf(&ref_buf, dir, 9)));
+    try std.testing.expectEqual(@as(usize, 2), no.calls);
+}
+
+/// Build `identity`'s remembered refusal under `dir`.
+fn refusalOf(buf: []u8, dir: []const u8, identity: u64) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}/{x:0>16}.refused", .{ dir, carry.dirOf(identity) }, 0);
+}
+
+fn present(p: [:0]const u8) bool {
+    const fd = platform.c.open(p, .{ .ACCMODE = .RDONLY }, @as(platform.c.mode_t, 0));
+    if (fd < 0) return false;
+    _ = platform.c.close(fd);
+    return true;
 }

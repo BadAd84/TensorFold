@@ -29,7 +29,7 @@ pub fn start(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, ro
     const asked: ?rows.carry.Ranks = if (local) .{ .ctx = e, .check = check } else null;
     // TF_GLM_OVN_DISK_CARRY_REPLAY_TOKENS: the rows of stored states prefilled again before an adoption (0: none)
     var replay: Replay = .{ .a = a, .gpa = store.gpa, .backend = backend, .e = e, .family = store.family, .root = root, .want = want, .cap = try cuda.ovn.int("DISK_CARRY_REPLAY_TOKENS", rows.replay.default_tokens), .local = local };
-    const c = rows.carry.choose(root, want, asked, if (replay.cap > 0) .{ .ctx = &replay, .run = Replay.run } else null);
+    const c = rows.carry.choose(root, want, asked, if (replay.cap > 0) .{ .ctx = &replay, .run = Replay.run, .cap = replay.cap } else null);
     std.log.info("glm: TF_GLM_OVN_DISK_CARRY: {s} (directory {x:0>16}, carry key {x:0>16}, {d} probe hashes)", .{ c.why, c.id, want.key, parts.items.len });
     return .{ .want = want, .choice = c };
 }
@@ -120,7 +120,7 @@ const Replay = struct {
     cap: u64,
     local: bool,
 
-    fn run(ctx: *anyopaque, id: u64) bool {
+    fn run(ctx: *anyopaque, id: u64) rows.carry.Proof {
         const r: *Replay = @ptrCast(@alignCast(ctx));
         const rest = disk.Rest.of(r.e);
         defer rest.done();
@@ -129,9 +129,9 @@ const Replay = struct {
             .same => |n| std.log.info("glm: TF_GLM_OVN_DISK_CARRY: {d} stored states of {x:0>16} prefilled again, the same bytes on every rank", .{ n, id }),
             .none => std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: no stored state of {x:0>16} within {d} rows could be replayed: no carry", .{ id, r.cap }),
             .differs => |d| std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: the {d}-token state {s} of {x:0>16} differs on rank {d} from image byte {d}: no carry", .{ d.at, &rows.chain.hex(d.name), id, d.rank, d.off }),
-            .failed => |err| std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: replaying {x:0>16} failed ({s}): no carry", .{ id, @errorName(err) }),
+            .failed => |err| std.log.warn("glm: TF_GLM_OVN_DISK_CARRY: replaying {x:0>16} failed ({s}): no carry, tried again next start", .{ id, @errorName(err) }),
         }
-        return v == .same;
+        return rows.replay.proof(v);
     }
 
     /// A stored state's own ids prefilled by this build, kept at its position (rows_replay drops it).
