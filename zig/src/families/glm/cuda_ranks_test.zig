@@ -207,7 +207,7 @@ test "every media limit is part of the ranks' agreement" {
 test "every scheduling and identity field that differs stops the ranks" {
     const zero = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
     const one = Fingerprint.of(2, 1, .{}, 8192, true, @splat(0), @splat(0), hashBytes("/same"));
-    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kda_pad", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "capacity", "heat_high", "heat_low" }) |name| {
+    inline for (.{ "layout", "world", "rank", "pages", "split", "kda_wide", "kda_pad", "pieces", "pair", "layers", "mtp", "vision", "video_tokens", "max_images", "max_videos", "max_frames", "ovn_comms", "capacity", "heat_high", "heat_low" }) |name| {
         var all = [_]Fingerprint{ zero, one };
         @field(all[1], name) += 1;
         try std.testing.expectEqual(@field(Fingerprint.Field, name), mismatch(&all).?.field);

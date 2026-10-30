@@ -37,6 +37,11 @@ pub const Header = extern struct {
 pub const Words = extern struct { w: [96]u32 };
 pub const put_ids = 96 - 16;
 
+/// A step as a follower receives it: the header and its ids (valid until the next receive).
+pub const Step = struct { h: Header, ids: []const u32 };
+
+const one_block = @import("cuda_link_one.zig");
+
 /// The most ids one step carries (a prompt at the engine's capacity).
 pub const Link = struct {
     d: *const cuda.Driver,
@@ -48,6 +53,10 @@ pub const Link = struct {
     gpa: std.mem.Allocator,
     wait: bool, // TF_GLM_LINK_WAIT=1: every step uploaded and waited for, as before the put
     asleep: bool = false, // rank 0: the other ranks sleep on their lines (cuda.tp_watch) until its next step
+    one: bool = false, // TF_GLM_OVN_LINK1 (or LINK_ROCE): a step of up to put_ids ids is one fixed block (cuda_link_one)
+    ring: ?cuda.DeviceBuffer = null, // TF_GLM_OVN_LINK_ROCE: every rank's block, world of them, from the RoCE gather
+    group: ?*const cuda.tp_group.Group = null, // TF_GLM_OVN_LINK_ROCE: the group whose gather carries the block
+    next_roce: bool = false, // the next block crosses by the gather (cuda_link_one.quickNext of the last step's kind)
 
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, stream: cuda.Stream, asked_ids: usize) !Link {
         const max_ids = @max(asked_ids, prompt_wire.words);
@@ -61,17 +70,32 @@ pub const Link = struct {
     }
 
     pub fn deinit(l: *Link) void {
+        if (l.ring) |*r| r.free();
         l.gpa.free(l.ids);
         l.buf.free();
     }
 
-    fn bcast(l: *Link, bytes: usize) !void {
+    /// TF_GLM_OVN_LINK1 and TF_GLM_OVN_LINK_ROCE on this link (every rank agrees through cuda_ranks.ovnComms).
+    pub fn oneBlock(l: *Link, group: *const cuda.tp_group.Group) !void {
+        return one_block.setup(l, group);
+    }
+
+    pub fn bcast(l: *Link, bytes: usize) !void {
         try l.post(bytes);
         try l.stream.synchronize();
     }
 
-    fn post(l: *Link, bytes: usize) !void {
+    pub fn post(l: *Link, bytes: usize) !void {
         try l.lib.check(l.lib.api.ncclBroadcast(l.buf.ptr, l.buf.ptr, bytes, .u8, 0, l.comm, l.stream.handle), "ncclBroadcast");
+    }
+
+    /// tf_glm_put_words: the first `words` of `w` into the link's buffer on its stream, unwaited.
+    pub fn putWords(l: *Link, put: cuda.Function, w: Words, words: usize) !void {
+        var a: cuda.Args = .{};
+        a.add(l.buf.ptr);
+        a.add(@as(u32, @intCast(words)));
+        a.add(w);
+        try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
     }
 
     /// Rank 0: the step and ids to every rank; up to `put_ids` ids go by `put` unwaited, longer ones upload and wait.
@@ -79,15 +103,12 @@ pub const Link = struct {
         if (ids.len > l.ids.len) return error.TooManyIds;
         var hh = h;
         hh.n = @intCast(ids.len);
+        if (l.one) return one_block.send(l, put, hh, ids);
         if (!l.wait and ids.len <= put_ids) {
             var w: Words = undefined;
             @memcpy(w.w[0..16], std.mem.bytesAsSlice(u32, std.mem.asBytes(&hh)));
             @memcpy(w.w[16..][0..ids.len], ids);
-            var a: cuda.Args = .{};
-            a.add(l.buf.ptr);
-            a.add(@as(u32, @intCast(16 + ids.len)));
-            a.add(w);
-            try cuda.launch.launch(put, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, l.stream, &a);
+            try l.putWords(put, w, 16 + ids.len);
             try l.post(64);
             if (ids.len > 0) try l.post(64 + ids.len * 4);
             return;
@@ -115,7 +136,8 @@ pub const Link = struct {
     }
 
     /// Other ranks: the next step and its ids (valid until the next receive).
-    pub fn receive(l: *Link) !struct { h: Header, ids: []const u32 } {
+    pub fn receive(l: *Link) !Step {
+        if (l.one) return one_block.receive(l);
         try l.bcast(64);
         var h: Header = undefined;
         try l.buf.download(0, std.mem.asBytes(&h));
