@@ -104,7 +104,7 @@ pub const Imprint = struct {
         for (m.metas.items) |*x| {
             if (x.at <= longer_than or x.tokens.len > prompt.len or x.at >= prompt.len) continue;
             if (out != null and x.at <= out.?.at) continue;
-            if (!std.mem.eql(u32, prompt[0..x.tokens.len], x.tokens)) continue;
+            if (!@import("prompt_prefix.zig").starts(prompt, x.tokens)) continue;
             if (planned and !sameBelow(starts, x.starts, x.at)) continue;
             out = x;
         }

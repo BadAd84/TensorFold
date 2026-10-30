@@ -31,7 +31,7 @@ pub fn cut(r: pc.Rules, len: usize, from: u32, end: u32, user: u32, starts: []co
 
 fn same(e: *const pc.Entry, prompt: []const u32, at: u32, lookahead: u32, spans: []const modes.Span) bool {
     return !e.expired and e.at == at and e.tokens.len == @as(usize, at) + lookahead and
-        e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len]) and
+        @import("prompt_prefix.zig").starts(prompt, e.tokens) and
         modes.equal(e.decode_spans, spans, at);
 }
 

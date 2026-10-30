@@ -18,6 +18,7 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
     var best_saved: f64 = 0;
     for (r.states.items, 0..) |*state, i| {
         if (s.family.vtable.bytes(s.family.ptr, state.at) > room) continue;
+        if (moot(r, out, state.at, from)) continue; // TF_GLM_OVN_KEPT_WALK: no compare where a match changes nothing
         if (!r.matches(state, prompt, starts, spans)) continue;
         if (out.disk == null or state.at > r.states.items[out.disk.?].at) out.disk = i;
         if (state.at <= from) continue;
@@ -32,6 +33,11 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
     }
     if (out.restore) |i| out.disk = i;
     return out;
+}
+
+/// Gated, a state no longer than the restore point nor the disk match found: whether it matches decides nothing.
+fn moot(r: *const rows.Rows, out: Choice, at: u32, from: u32) bool {
+    return @import("prompt_prefix.zig").gated() and at <= from and out.disk != null and at <= r.states.items[out.disk.?].at;
 }
 
 fn capacity(s: *const pc.Store, have: ?*pc.Entry) ?u64 {
