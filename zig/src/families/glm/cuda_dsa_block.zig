@@ -180,6 +180,10 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         if (sharded) try index_shard.select(set, k.ops, stream, k.shard.?, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.prof) else try sparse.selectTokensProfile(set, k.ops, stream, v.qi, v.ikr + ix.d * 2, kw_rows, c.pk, t, pos, host_pos, rows, ix.heads, ix.d, c.pk_rows - 2, v.select, v.tokens, v.counts, k.split, k.prof);
         stamp = prof.span(k.prof, stream, .mla);
         defer stamp.end();
+        // TF_GLM_OVN_ONEPASS_PIPE: the one-pass pipeline with the default's bits, bit-identical to the chunk programs
+        if (set.onepass_pipe) |fp| {
+            if (onepass.takesExact(set.prompt, c.ls, l.heads, l.lw, rows)) return onepass.runPipe(fp, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.ol, rows, l.heads, scale);
+        }
         // TF_GLM_OVN_ONEPASS_EXACT: the same shapes in one pass a row, bit-identical to the chunk programs and merge
         if (set.onepass_exact) |fe| {
             if (onepass.takesExact(set.prompt, c.ls, l.heads, l.lw, rows)) return onepass.runExact(fe, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.ol, rows, l.heads, scale);

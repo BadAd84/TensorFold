@@ -32,7 +32,7 @@ fn caches(r: *Rig, set: glue.Set) !Cache {
 }
 
 /// One case: the exact kernel equals the default's bytes, and the existing one-pass does not (the red control).
-fn one(r: *Rig, ks: *const glue.Kernels, onepass_f: cuda.Function, c: Cache, rows: usize, heads: usize) !usize {
+fn one(r: *Rig, ks: *const glue.Kernels, onepass_f: cuda.Function, pipe_exact: cuda.Function, c: Cache, rows: usize, heads: usize) !usize {
     const counts = [_]i32{ 0, 1, 31, 32, 33, 511, 512, 513, 1024, 2048, 2051, 3 }; // chunk and tile edges, count 0
     const tok = try r.a.alloc(i32, rows * width);
     @memset(tok, -1);
@@ -60,6 +60,11 @@ fn one(r: *Rig, ks: *const glue.Kernels, onepass_f: cuda.Function, c: Cache, row
     check.sameBytes(try std.fmt.bufPrint(&name, "exact one-pass == chunk programs + merge, {d} rows {d} heads", .{ rows, heads }), try r.back(out_exact, bytes), want) catch {
         fails += 1;
     };
+    const out_pipe = try r.zeros(bytes);
+    try op.runPipe(pipe_exact, r.s, dq, c.fp, c.scales, .{}, dtok, dcnt, width, out_pipe, rows, heads, scale);
+    check.sameBytes(try std.fmt.bufPrint(&name, "pipe exact == chunk programs + merge, {d} rows {d} heads", .{ rows, heads }), try r.back(out_pipe, bytes), want) catch {
+        fails += 1;
+    };
     const ctrl = try r.back(out_op, bytes);
     check.expect(!std.mem.eql(u8, ctrl, want), "glm-onepass-exact-check: {d} rows {d} heads: the existing one-pass matched the default (the red control must differ)", .{ rows, heads }) catch {
         fails += 1;
@@ -85,10 +90,12 @@ pub fn run(gpu: check.Gpu) !void {
     const ks = try glue.Kernels.loadOvn(mod, true);
     var opk = try op.Kernels.load(gpu.d, cuda.kernels.glm_onepass, major);
     defer opk.unload();
+    var ppk = try op.PipeKernels.load(gpu.d, cuda.kernels.glm_onepass_pipe, major);
+    defer ppk.unload();
     const c = try caches(&r, .{ .glue = &ks });
     var fails: usize = 0;
     // rows >= 5 at 17-24 heads: the default uses 32-head blocks (takesExact's shapes); one and four rows stay on chunks
-    for ([_][2]usize{ .{ 5, 22 }, .{ 5, 21 }, .{ 16, 24 }, .{ 24, 17 }, .{ 70, 22 } }) |x| fails += try one(&r, &ks, opk.f, c, x[0], x[1]);
+    for ([_][2]usize{ .{ 5, 22 }, .{ 5, 21 }, .{ 16, 24 }, .{ 24, 17 }, .{ 70, 22 } }) |x| fails += try one(&r, &ks, opk.f, ppk.exact, c, x[0], x[1]);
     try check.expect(fails == 0, "glm-onepass-exact-check: {d} checks failed", .{fails});
     check.pass("glm-onepass-exact-check: tf_glm_onepass_exact equals the chunk programs plus merge byte for byte; the existing one-pass differs", .{});
 }

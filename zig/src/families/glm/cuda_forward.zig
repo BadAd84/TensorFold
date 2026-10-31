@@ -53,6 +53,7 @@ pub const Modules = struct {
     pools32: bool = false, // TF_GLM_OVN_POOLS32: a split prompt indexer gathers its picks as int32
     shard_from: usize = 0, // TF_GLM_OVN_DECODE_SHARD: decode windows from this position shard their indexer pools
     onepass: ?onepass_mod.Kernels, // TF_GLM_OVN_SPARSE_ONEPASS: prompt rows' sparse attention in one pass (glm_onepass)
+    onepass_pipe: ?onepass_mod.PipeKernels, // TF_GLM_OVN_ONEPASS_PIPE: the one-pass pipeline with bit-exact switches
     chunked: ?kda_chunk.Kernel, // TF_GLM_OVN_KDA_CHUNKED: prompt chunks' KDA chain in chunked (WY) form
     tiled: bool = false, // eligible bf16 linears are tiled; KDA inputs with uneven strides retain their row-major path
     packs: ?*const mm_mod.Packed = null, // the linears packed to 4, 6 or 8 bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
@@ -109,20 +110,19 @@ pub const Modules = struct {
         m.moe_ovn = moe.Ovn.read();
         m.onepass = onepass_mod.open(d, k.glm_onepass, @intCast(try ctx.attribute(.compute_capability_major)));
         errdefer if (m.onepass) |*x| x.unload();
-        m.tiled = false;
+        m.onepass_pipe = onepass_mod.openPipe(d, k.glm_onepass_pipe, @intCast(try ctx.attribute(.compute_capability_major)));
         m.pools32 = cuda.ovn.on("POOLS32");
         m.shard_from = try dsa_block.index_shard.from(); // a typo is refused
-        m.packs = null; // `m` starts undefined: the field default does not apply
-        m.l2pace = null;
+        m.tiled = false;
+        m.packs = null;
+        m.l2pace = null; // m starts undefined, so the field defaults do not apply
         m.side = try moe_side.Side.init(d); // last: nothing after it fails
         return m;
     }
 
-    /// What weights.load runs: the dense packing, the FP8 lane, and the MTP head's quantizers and 4-bit tiling.
     pub fn tools(m: *const Modules) weights.Tools {
         return .{ .pack_dense = m.pack_dense, .lane = &m.lane, .quant = &m.quant, .q4 = &m.q4 };
     }
-
     pub fn ops(m: *const Modules) cuda.Module {
         return m.mods[1];
     }
@@ -133,12 +133,12 @@ pub const Modules = struct {
         if (m.chunked) |*x| x.unload();
         if (m.index) |*x| x.unload();
         if (m.onepass) |*x| x.unload();
+        if (m.onepass_pipe) |*x| x.unload();
         m.exl3.unload();
         for (&m.mods) |*x| x.unload();
         m.lane.unload();
         m.prompt.unload();
         m.experts.unload();
-        m.* = undefined;
     }
 };
 
@@ -264,7 +264,7 @@ pub const Forward = struct {
 
     pub fn set(f: *const Forward) glue.Set {
         const pdl = f.m.pdl_early >= @as(u64, if (f.ranks[0].b.prefill) 2 else 1);
-        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .pdl_early = pdl, .mla = f.m.mla, .onepass = if (f.m.onepass) |x| x.f else null, .onepass_exact = if (onepass_mod.wantedExact()) f.m.glue.onepass_exact else null };
+        return .{ .glue = &f.m.glue, .index = if (f.m.index) |*x| x else null, .mm = if (f.m.tiled) &f.m.mm else null, .packs = f.m.packs, .prompt = f.ranks[0].b.prefill, .linear = .{ .lane = &f.m.lane }, .copy_rows = f.m.copy_rows, .pdl_early = pdl, .mla = f.m.mla, .onepass = if (f.m.onepass) |x| x.f else null, .onepass_exact = if (onepass_mod.wantedExact()) f.m.glue.onepass_exact else null, .onepass_pipe = if (f.m.onepass_pipe) |x| x.exact else null };
     }
 
     /// reduce.sums' gather: every rank's partial of `rows` rows into every rank's gathered buffer, rank order.

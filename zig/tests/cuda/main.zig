@@ -53,6 +53,7 @@ const glm_index_regroup_check = @import("glm_index_regroup_check.zig");
 const glm_shard_check = @import("glm_shard_check.zig");
 const glm_onepass_check = @import("glm_onepass_check.zig");
 const glm_onepass_exact_check = @import("glm_onepass_exact_check.zig");
+const glm_onepass_bench = @import("glm_onepass_bench.zig");
 const glm_pk8_check = @import("glm_pk8_check.zig");
 const carveout_tests = @import("carveout_tests.zig");
 const nvfp4_tests = @import("nvfp4_tests.zig");
@@ -286,7 +287,6 @@ const usage =
     \\  glm-index-regroup-check   TF_GLM_OVN_INDEX_REGROUP's scores and pools against today's, byte for byte (one GPU)
     \\  glm-shard-check           TF_GLM_OVN_DECODE_SHARD's ranks emulated, merged tokens against selectTokens, byte for byte (one GPU)
     \\  glm-onepass-check         TF_GLM_OVN_SPARSE_ONEPASS's kernel against float64, slab == pages == split, deterministic (one GPU)
-    \\  glm-onepass-exact-check   TF_GLM_OVN_ONEPASS_EXACT's kernel equals the chunk programs plus merge byte for byte; the one-pass differs (one GPU)
     \\  glm-pk8-check             TF_GLM_OVN_PK8's kv8 pooled keys: writer against kv8.quantize_rows, scorers against bf16 on their values (one GPU)
     \\  glm-snap-gather           TF_GLM_OVN_SNAP_GATHER's keep and restore by tf_glm_snap_copy against a memcpy a piece (one GPU)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
@@ -459,6 +459,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-shard-check")) return glm_shard_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-onepass-check")) return glm_onepass_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-onepass-exact-check")) return glm_onepass_exact_check.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-onepass-bench")) return glm_onepass_bench.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-pk8-check")) return glm_pk8_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-snap-gather")) return glm_snap_gather_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));

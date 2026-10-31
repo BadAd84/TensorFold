@@ -6,7 +6,7 @@ const mm_mod = @import("cuda_mm.zig");
 const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{}, onepass: ?cuda.Function = null, onepass_exact: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{}, onepass: ?cuda.Function = null, onepass_exact: ?cuda.Function = null, onepass_pipe: ?cuda.Function = null };
 
 /// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _LATENT_MMA, _SEG_PASS); the defaults launch today's.
 pub const Mla = struct {
