@@ -161,7 +161,7 @@ pub fn partials(f: *const Forward, p: *const Pieces, lo: usize, n: usize, split:
             const mine = share(n, world, me);
             const own = mine[1] - mine[0];
             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
-            if (try fprx.of(x, f.ring, p.side)) |ch| {
+            if (try fprx.of(x, f.prx, f.ring, p.side)) |ch| {
                 if (try fprx.partialsZc(ch, p.side, plan, room(r, lo), r.b.part, lo, D, own_later)) return; // read in place
                 try ch.exchange(p.side, &fprx.partials(plan, room(r, lo), r.b.part, lo, D));
             } else if (f.ring) try relay.partials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D) else try relay.splitPartials(x.lib, x.comm, p.side, plan, room(r, lo), r.b.part, lo, D);
@@ -199,7 +199,7 @@ pub fn shareGlued(f: *const Forward, p: *const Pieces, lo: usize, n: usize, last
             const me = r.w.share.rank;
             const rows_of = if (last) r.b.hidden else r.b.normed;
             const plan: relay.Relay = .{ .world = world, .rank = me, .n = n };
-            if (try fprx.of(x, f.ring, p.side)) |ch| try ch.exchange(p.side, &fprx.glued(plan, rows_of, lo, D)) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
+            if (try fprx.of(x, f.prx, f.ring, p.side)) |ch| try ch.exchange(p.side, &fprx.glued(plan, rows_of, lo, D)) else if (f.ring) try relay.glued(x.lib, x.comm, p.side, plan, rows_of, lo, D) else try relay.splitGlued(x.lib, x.comm, p.side, plan, rows_of, lo, D);
         },
     }
 }
@@ -238,6 +238,6 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
         const n = piece[1] - piece[0];
         if (!f.splits(n)) continue;
         const plan: relay.Relay = .{ .world = r.w.share.world, .rank = r.w.share.rank, .n = n };
-        if (try fprx.of(x, f.ring, f.stream)) |ch| try ch.exchange(f.stream, &fprx.glued(plan, t.out, piece[0], dims)) else if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
+        if (try fprx.of(x, f.prx, f.ring, f.stream)) |ch| try ch.exchange(f.stream, &fprx.glued(plan, t.out, piece[0], dims)) else if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
     }
 }

@@ -247,6 +247,7 @@ pub const Forward = struct {
     pieces: ?*const Pieces = null, // a prompt chunk's exchanges in row pieces on a second stream (null: whole)
     split: bool = true, // TF_GLM_PREFILL_REDUCE=split (the default with send/recv): each rank glues its own rows
     ring: bool = false, // TF_GLM_PREFILL_REDUCE=ring: split, its exchanges passed along the ring (cuda_relay)
+    prx: bool = false, // TF_GLM_OVN_PRX takes this pass's split exchanges (cuda_forward_prx.takes): paired, or PRX_ALONE
     split_min: usize = 0, // TF_GLM_SPLIT_MIN: a piece of fewer rows glues whole (its exchanges cost more than they save)
     images: ?ImageRows = null, // a prompt pass's image rows over their placeholders' embeddings (its sequence only)
     prof: ?*prof_mod.Prof = null, // TF_GLM_PROF=1: events between the sections

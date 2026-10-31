@@ -100,7 +100,7 @@ fn pass(gpu: Gpu, a: std.mem.Allocator, checkpoint: []const u8, group: *cuda.tp_
     defer x.end() catch {};
     try x.bind(0);
     try x.begin(null);
-    // two full chunks and a remainder: a paired step (TF_GLM_PROMPT_PAIR, on by default) and a pieced chunk
+    // two chunks then 300 rows: a paired step (by the channel) and a pieced chunk alone (NCCL unless PRX_ALONE=1)
     const ids = try a.alloc(u32, 2 * glm.engine.prompt_rows + 300);
     for (ids, 0..) |*u, j| u.* = @intCast(100 + (j * 7919) % 5000);
     p.first = try x.prefill(ids, null, null);
