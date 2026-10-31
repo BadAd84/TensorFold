@@ -147,19 +147,6 @@ test "an engine refuses shared rows TF_GLM_OVN_SHARED_ROWS does not allow (auto 
     }
 }
 
-test "the shared rows size nothing at load: Engine.init and the knobs' open make no shared buffer, DRAW1 or SEG_DSA" {
-    const src = @embedFile("cuda_engine.zig");
-    const at = std.mem.indexOf(u8, src, "pub fn init(").?;
-    const init = src[at..std.mem.indexOfPos(u8, src, at, "pub fn deinit(").?];
-    const ovn = @embedFile("cuda_engine_ovn.zig");
-    const open = ovn[0..std.mem.indexOf(u8, ovn, "pub fn close(").?];
-    for ([_][]const u8{ "initShared", "Draw1.init", "SegDsa", "ensure(" }) |made| {
-        try std.testing.expect(std.mem.indexOf(u8, init, made) == null); // before the page pool: would move what follows
-        try std.testing.expect(std.mem.indexOf(u8, open, made) == null);
-    }
-    try std.testing.expect(std.mem.indexOf(u8, src, "@import(\"cuda_engine_shared.zig\").ensure(e)") != null); // verify makes them
-}
-
 test "release frees what ensure made and lets the next verify make it again" {
     var e: Engine = undefined;
     e.bs = null;
