@@ -100,6 +100,39 @@ fn nchunks(n: usize) usize {
     return (n + chunk - 1) / chunk;
 }
 
+// The pipe reuses the PV o across chunks; the first tile's alpha = exp(m_reset - nm) must zero the carry when reset.
+fn chunkPartialReset(row: Row, qk: f32, start: usize, o_carry: [lw]f32, m_reset: f32) Partial {
+    var p: Partial = .{ .m = m_reset, .l = 0, .o = o_carry };
+    var t: usize = 0;
+    while (t < chunk) : (t += tile) {
+        var sc: [tile]f32 = undefined;
+        var vs: [tile][lw]f32 = undefined;
+        var tmax: f32 = -inf;
+        for (0..tile) |k| {
+            const idx = start + t + k;
+            if (idx < row.n) {
+                sc[k] = chunkKey(row, qk, idx, &vs[k]);
+                tmax = @max(tmax, sc[k]);
+            } else sc[k] = -inf;
+        }
+        const active = tmax != -inf;
+        const nm = if (active) @max(p.m, tmax) else p.m;
+        const alpha: f32 = if (active) (if (p.m == -inf) 0 else expf(p.m - nm)) else 1;
+        for (0..lw) |d| p.o[d] = p.o[d] * alpha;
+        var lt: f32 = 0;
+        for (0..tile) |k| {
+            const idx = start + t + k;
+            const pk: f32 = if (active and idx < row.n) expf(sc[k] - nm) else 0;
+            const pb = bf16(pk);
+            for (0..lw) |d| p.o[d] = @mulAdd(f32, pb, vs[k][d], p.o[d]);
+            lt += pk;
+        }
+        p.l = @mulAdd(f32, p.l, alpha, lt);
+        p.m = nm;
+    }
+    return p;
+}
+
 // Today's default: every chunk's partial materialised, then one merge pass over them (chunks then tf_glm_merge).
 fn chunkOrder(row: Row) [lw]f32 {
     const nch = nchunks(row.n);
@@ -201,4 +234,21 @@ test "onepass exact order: equals the chunk programs' order bit for bit and diff
         if (nchunks(n) > 1 and !same(ex, op)) differed = true; // and a multi-chunk row separates it from the global one
     }
     try std.testing.expect(differed); // at least one multi-chunk row separates the exact order from the global one
+}
+
+test "onepass pipe reset: a reset chunk zeroes the carried PV accumulator (every chunk's first tile is active)" {
+    const reset_m = -inf; // the pipe resets the QK max to -inf at a chunk boundary; the first tile's alpha is then 0
+    for ([_]usize{ 5, 8, 12, 13, 16 }, 0..) |n, s| { // n <= max_keys; chunk = 4, so these are 2 to 4 chunks
+        const row = makeRow(0xC0 + s, n);
+        var carry: [lw]f32 = undefined;
+        for (&carry, 0..) |*c, d| c.* = 3.5 + @as(f32, @floatFromInt(d)); // a nonzero leftover from a previous chunk
+        var cstart: usize = 0;
+        while (cstart < n) : (cstart += chunk) { // every live chunk's first tile has a key, so alpha = 0 zeroes carry
+            const fresh = chunkPartial(row, qk_scale, cstart);
+            const reused = chunkPartialReset(row, qk_scale, cstart, carry, reset_m);
+            try std.testing.expect(same(fresh.o, reused.o)); // the carry must not survive a correct reset
+            try std.testing.expectEqual(fresh.l, reused.l);
+            try std.testing.expectEqual(fresh.m, reused.m);
+        }
+    }
 }

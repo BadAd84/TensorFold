@@ -18,7 +18,7 @@ struct SmemPipe {
 };
 static_assert(sizeof(SmemPipe) == 100512, "cuda_onepass.zig's pipe smem");
 
-// DECODE on: the default decode (e4m3 -> half -> float -> * scale -> bf16), scale in the value; off: the bit trick.
+// DECODE on: default decode (scale folded into the value); raw_load loads the scale only in lane 0, so broadcast it.
 template <bool DECODE>
 __device__ __forceinline__ void convert_pipe(const Raw& r, uint4* kt, float* ks, int pw, int lane) {
     if constexpr (!DECODE) {
@@ -29,7 +29,7 @@ __device__ __forceinline__ void convert_pipe(const Raw& r, uint4* kt, float* ks,
     for (int i = 0; i < 8; ++i) {
         const int key = pw + 4 * i;
         const uint32_t in[4] = {r.v[i].x, r.v[i].y, r.v[i].z, r.v[i].w};
-        const float s = r.s[i];
+        const float s = __shfl_sync(0xffffffffu, r.s[i], 0);
         uint32_t w[8];
 #pragma unroll
         for (int m = 0; m < 8; ++m) {
