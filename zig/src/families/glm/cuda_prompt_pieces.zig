@@ -98,7 +98,7 @@ pub fn run(e: *Engine, pieces: []const Piece, marks: ?[]const ?engine.Marks, fir
     }
     try e.gate(null);
     var one: [1]fw.Rank = .{.{ .w = &e.w, .st = segs[0].st, .b = &e.bp, .segs = segs[0..pieces.len] }};
-    var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .split_min = e.settings.split_min, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(true) else null };
+    var f: fw.Forward = .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = &one, .exchange = e.exchange(), .pieces = &e.pieces, .split = e.settings.split, .ring = e.settings.ring, .prx = @import("cuda_forward_prx.zig").takes(false), .split_min = e.settings.split_min, .kda_wide = e.settings.kda_wide, .taps = if (e.drafter) |dr| dr.taps(true) else null };
     try f.run(@ptrCast(ids[0..rows]));
     if (e.drafter) |dr| for (pieces, segs[0..pieces.len]) |p, g|
         try dr.promptSegment(e, p.slot, p.start, p.rows, p.len, g.row0);

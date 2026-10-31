@@ -6,17 +6,22 @@ const relay = @import("cuda_relay.zig");
 const Relay = relay.Relay;
 const plan = cuda.prx_plan;
 
-/// The channel a split exchange on `s` takes: one is open, the ring is off, `s` is not capturing (every rank alike).
-pub fn pick(comptime C: type, ch: ?*C, ring: bool, s: cuda.Stream) !?*C {
-    if (ring) return null;
+/// The channel a split exchange on `s` takes: one open, the pass takes it (`on`), the ring off, `s` not capturing.
+pub fn pick(comptime C: type, ch: ?*C, on: bool, ring: bool, s: cuda.Stream) !?*C {
+    if (!on or ring) return null;
     const c = ch orelse return null;
     if (try c.capturing(s)) return null;
     return c;
 }
 
-/// The channel of the forward's exchange (`x`: Exchange.nccl), as `pick` decides.
-pub fn of(x: anytype, ring: bool, s: cuda.Stream) !?*cuda.prx.Channel {
-    return pick(cuda.prx.Channel, if (x.group) |g| g.prx else null, ring, s);
+/// The channel of the forward's exchange (`x`: Exchange.nccl) for a pass that takes it (`on`: Forward.prx), as `pick`.
+pub fn of(x: anytype, on: bool, ring: bool, s: cuda.Stream) !?*cuda.prx.Channel {
+    return pick(cuda.prx.Channel, if (x.group) |g| g.prx else null, on, ring, s);
+}
+
+/// Forward.prx: a paired step's passes (the other chunk's sites hide the hops), a pass alone with TF_GLM_OVN_PRX_ALONE.
+pub fn takes(paired: bool) bool {
+    return paired or cuda.ovn.on("PRX_ALONE");
 }
 
 /// The most rows any rank owns of the piece: every rank cuts the same calls from it.
@@ -160,14 +165,26 @@ const FakeChannel = struct {
     }
 };
 
-test "TF_GLM_OVN_PRX: a split exchange takes the channel unless none is open, the ring relays or the stream captures" {
+test "TF_GLM_OVN_PRX: a split exchange takes the channel unless none is open, the pass or ring declines, or it captures" {
     const s: cuda.Stream = .{ .d = undefined, .handle = null };
     var live: FakeChannel = .{ .cap = false };
     var captured: FakeChannel = .{ .cap = true };
-    try std.testing.expectEqual(@as(?*FakeChannel, &live), try pick(FakeChannel, &live, false, s));
-    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &live, true, s));
-    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &captured, false, s));
-    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, null, false, s));
+    try std.testing.expectEqual(@as(?*FakeChannel, &live), try pick(FakeChannel, &live, true, false, s));
+    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &live, false, false, s)); // a pass alone
+    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &live, true, true, s));
+    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, &captured, true, false, s));
+    try std.testing.expectEqual(@as(?*FakeChannel, null), try pick(FakeChannel, null, true, false, s));
+}
+
+test "TF_GLM_OVN_PRX_ALONE: a paired step's passes take the channel; a pass alone only with the knob" {
+    cuda.ovn.fake("PRX_ALONE", null);
+    defer cuda.ovn.fake("PRX_ALONE", null);
+    try std.testing.expect(takes(true));
+    try std.testing.expect(!takes(false));
+    cuda.ovn.fake("PRX_ALONE", "0");
+    try std.testing.expect(!takes(false));
+    cuda.ovn.fake("PRX_ALONE", "1");
+    try std.testing.expect(takes(false) and takes(true));
 }
 
 /// A channel that records its ZC call, for partialsZc.

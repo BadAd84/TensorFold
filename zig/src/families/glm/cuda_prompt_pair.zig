@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
+const fprx = @import("cuda_forward_prx.zig");
 const dflash = @import("dflash.zig");
 const weights = @import("cuda_weights.zig");
 const snapshots = @import("cuda_snapshots.zig");
@@ -102,6 +103,8 @@ pub fn prefill(e: *Engine, part: []const u32, start: usize, rows: usize, len: us
     fb.prof = null;
     fa.taps = null; // drafterIdle: the drafter ingests none of these rows, so a chunk at a time's taps go unread too
     fb.taps = null;
+    fa.prx = fprx.takes(true); // each chunk's exchanges under the other's sites: the channel's staged hops are hidden
+    fb.prx = fprx.takes(true);
     fa.index_split = split; // the step's choice (TF_GLM_INDEX_SPLIT) for both chunks
     fb.index_split = split;
     const st = &e.cur.st;
