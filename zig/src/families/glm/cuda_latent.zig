@@ -32,6 +32,8 @@ fn cdiv(a: usize, b: usize) u32 {
 /// latent.absorb_q: out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums; sk: E4M3 kv_b's.
 pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, sk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
+    // TF_GLM_OVN_LATENT_MMA_EXACT: a prompt buffer's rows on the CUDA cores, byte for byte absorb_q, 16-byte kv_b loads
+    if (set.prompt and set.mla.mma_exact and sk == 0 and wk % 16 == 0) return rowBlocks(set.glue.absorb_exact, stream, .{ q, wk, out }, rows, heads, lw / 32);
     if (set.prompt and set.mla.mma) return mmaBlocks(if (sk != 0) set.glue.absorb_mma8 else set.glue.absorb_mma, stream, q, wk, sk, out, rows, heads, lw);
     if (sk != 0) { // TF_GLM_OVN_KVB8: wk E4M3 [heads][d][lw], sk fp32 [heads][d][lw / 128]
         if (wk % 8 != 0) return error.LatentShape;
@@ -70,6 +72,8 @@ fn mmaBlocks(f: cuda.Function, stream: cuda.Stream, x: u64, w: u64, s: u64, out:
 /// latent.expand_v: out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw]; sv: E4M3 kv_b's.
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, sv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
+    // TF_GLM_OVN_LATENT_MMA_EXACT: a prompt buffer's rows on the CUDA cores, byte for byte expand_v, 16-byte loads
+    if (set.prompt and set.mla.mma_exact and sv == 0 and wv % 16 == 0 and ol % 16 == 0) return rowBlocks(set.glue.expand_exact, stream, .{ ol, wv, out }, rows, heads, dv / 16);
     if (set.prompt and set.mla.mma) return mmaBlocks(if (sv != 0) set.glue.expand_mma8 else set.glue.expand_mma, stream, ol, wv, sv, out, rows, heads, dv);
     if (sv != 0) { // TF_GLM_OVN_KVB8: wv E4M3 [heads][dv][lw], sv fp32 [heads][dv][lw / 128]
         if (wv % 8 != 0) return error.LatentShape;

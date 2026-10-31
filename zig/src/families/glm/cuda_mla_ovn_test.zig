@@ -116,6 +116,40 @@ test "TF_GLM_OVN_LATENT_MMA: every row of a prompt buffer on the mma forms, deco
     try t.expectError(error.LatentShape, latent.absorbQ(prompt, s, 264, 4096, 0, 512, 64, 22, 256, 512)); // q off 16 B
 }
 
+test "TF_GLM_OVN_LATENT_MMA_EXACT: the knob reads, and a prompt buffer's absorb and expand run the exact kernels" {
+    inline for (.{ "MLA_FUSEMERGE", "ABSORB_VEC", "LATENT_MMA", "SEG_PASS", "KVB8", "DECODE_SHARD", "PK8" }) |k| cuda.ovn.fake(k, null);
+    cuda.ovn.fake("LATENT_MMA_EXACT", "1");
+    try t.expect((try glue.Mla.read()).mma_exact);
+    try t.expect(!(try glue.Mla.read()).mma); // the exact knob does not turn on the tensor-core form
+    try t.expect(glue.Mla.wanted());
+    cuda.ovn.fake("LATENT_MMA_EXACT", null);
+    try t.expect(!(try glue.Mla.read()).mma_exact);
+    try t.expect(!glue.Mla.wanted());
+
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Rec.run;
+    const ks = kernels(&d);
+    const s: cuda.Stream = .{ .d = &d, .handle = null };
+    const prompt: glue.Set = .{ .glue = &ks, .prompt = true, .mla = .{ .mma_exact = true } };
+    const decode: glue.Set = .{ .glue = &ks, .mla = .{ .mma_exact = true } };
+    Rec.n = 0;
+    try latent.absorbQ(prompt, s, 256, 4096, 0, 512, 4096, 22, 256, 512);
+    try latent.expandV(prompt, s, 256, 4096, 0, 512, 3, 22, 256, 512); // a resumed tail of 3 rows: the same kernel
+    try latent.absorbQ(decode, s, 256, 4096, 0, 512, 2, 22, 256, 512); // decode keeps today's kernels
+    try latent.expandV(decode, s, 256, 4096, 0, 512, 2, 22, 256, 512);
+    try t.expectEqualSlices(usize, &.{ id("absorb_exact"), id("expand_exact"), id("absorb_q"), id("expand_v") }, Rec.ids[0..Rec.n]);
+    try t.expectEqualSlices(c_uint, &.{ 64, 1 }, Rec.gz[0..2]); // 64-row blocks: 4,096, then a 3-row tail
+    const both: glue.Set = .{ .glue = &ks, .prompt = true, .mla = .{ .mma = true, .mma_exact = true } };
+    Rec.n = 0;
+    try latent.absorbQ(both, s, 256, 4096, 0, 512, 64, 22, 256, 512); // the exact form wins over the tensor-core form
+    try t.expectEqual(id("absorb_exact"), Rec.ids[0]);
+    Rec.n = 0;
+    try latent.absorbQ(prompt, s, 256, 4096, 8192, 512, 2, 22, 256, 512); // KVB8 (sk != 0): the bf16-only exact kernel steps aside
+    try t.expectEqual(id("absorb_q8"), Rec.ids[0]);
+    try latent.absorbQ(prompt, s, 256, 4104, 0, 512, 64, 22, 256, 512); // wk off 16 bytes: base absorb_q keeps the same bytes
+    try t.expectEqual(id("absorb_q"), Rec.ids[Rec.n - 1]);
+}
+
 test "TF_GLM_OVN_SEG_PASS: decode chunk launches on the seg pass (24-head blocks for 17-24 heads), prompts as today" {
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Rec.run;
