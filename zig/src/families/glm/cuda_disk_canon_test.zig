@@ -119,7 +119,7 @@ test "glm canon: a byte of a layer's live copy that differs refuses; one in its 
     try std.testing.expectEqual(@as(?u64, null), try differs(s, f, stored_w, fresh_w));
 }
 
-test "glm canon: ring rows both states hold are compared by position; a row one of them dropped is not" {
+test "glm canon: ring rows of the current pool are compared by position; rows of completed pools or dropped are not" {
     var parts: std.ArrayList(image.Part) = .empty;
     defer parts.deinit(a);
     try image.parts(sh, at, &parts, a);
@@ -129,13 +129,21 @@ test "glm canon: ring rows both states hold are compared by position; a row one 
     defer a.free(s);
     const f = try place(fresh_w, 0x11);
     defer a.free(f);
-    const both = ring + (25 - stored_w.base) * sh.ring_row; // position 25: both rings hold it
-    s[@intCast(both)] +%= 1;
-    try std.testing.expectEqual(@as(?u64, both), try differs(s, f, stored_w, fresh_w));
-    s[@intCast(both)] -%= 1;
+    const live = ring + (29 - stored_w.base) * sh.ring_row; // position 29: pool 7 (28..31), the one a next pass reads
+    s[@intCast(live)] +%= 1;
+    try std.testing.expectEqual(@as(?u64, live), try differs(s, f, stored_w, fresh_w));
+    s[@intCast(live)] -%= 1;
+    // position 25, both rings hold it but pool 6 is complete (its pooled row compared): pool_keys never reads it again
+    const pooled = ring + (25 - stored_w.base) * sh.ring_row;
+    s[@intCast(pooled)] +%= 1;
+    try std.testing.expectEqual(@as(?u64, null), try differs(s, f, stored_w, fresh_w));
+    s[@intCast(pooled)] -%= 1;
     const dropped = ring + (17 - stored_w.base) * sh.ring_row; // position 17: the fresh ring was rebased past it
     s[@intCast(dropped)] +%= 1;
     try std.testing.expectEqual(@as(?u64, null), try differs(s, f, stored_w, fresh_w));
+    var odd = fresh_w; // a base no rebase leaves (rebases base a ring on a pool): no words of a state
+    odd.base = 21;
+    try std.testing.expectError(error.DiskWords, differs(s, f, stored_w, odd));
     // the words' head rows differ: refused at the words, nothing past them lined up
     var other = fresh_w;
     other.mtp_len -= 1;

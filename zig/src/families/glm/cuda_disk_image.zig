@@ -158,8 +158,8 @@ pub fn prefix(sh: Shape, img: u64, s_cur: u64, f_cur: u64, out: *std.ArrayList(M
 fn cacheMatches(sh: Shape, img: u64, size: [5]u64, n: u64, s_base: u64, f_base: u64, out: *std.ArrayList(Match), a: std.mem.Allocator) !u64 {
     try same(img, n * sh.latent, out, a);
     try same(img + size[0], if (sh.scales) n * 4 else 0, out, a);
-    // a ring keeps position p at row p - base (State.setBases); a rebase drops only rows no later read takes
-    const lo = @max(s_base, f_base);
+    // a ring holds position p at row p - base (State.setBases); pool_keys, its one reader, starts at a pass's own pool
+    const lo = n / sparse.pool * sparse.pool; // so a completed pool's rows are never read again (both bases below)
     var ring = img + size[0] + size[1];
     for (0..2) |_| {
         if (lo < n) try out.append(a, .{ .off = ring + (lo - s_base) * sh.ring_row, .len = (n - lo) * sh.ring_row, .fresh = ring + (lo - f_base) * sh.ring_row });
@@ -169,9 +169,9 @@ fn cacheMatches(sh: Shape, img: u64, size: [5]u64, n: u64, s_base: u64, f_base: 
     return ring + size[4];
 }
 
-/// Whether a ring based at `base` holds positions [base, n) within its `rows` rows.
+/// Whether a ring based at `base` holds positions [base, n) within its `rows` rows, based on a pool (State.rebase).
 fn holds(base: u64, n: u64, rows: u64) bool {
-    return base <= n and n - base <= rows;
+    return base % sparse.pool == 0 and base <= n and n - base <= rows;
 }
 
 /// `len` bytes at `off` answered at the same place.
