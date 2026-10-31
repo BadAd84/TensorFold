@@ -5,8 +5,15 @@ const cuda = @import("cuda");
 const check = @import("check.zig");
 const Gpu = check.Gpu;
 
-/// One engine pass: the prompt's first token, a 4-row window's and a 1-row window's tokens and logits.
-const Pass = struct { first: u32 = 0, outs: [5]u32 = @splat(0), logits: []u16 = &.{} };
+/// One engine pass: the prompt's first token, two windows' tokens and logits; rank 0 counts its steps' channel calls.
+const Pass = struct {
+    first: u32 = 0,
+    outs: [5]u32 = @splat(0),
+    logits: []u16 = &.{},
+    pair_steps: u64 = 0, // paired prompt steps (Pair.steps)
+    pair_calls: u64 = 0, // channel exchanges those steps enqueued
+    alone_calls: u64 = 0, // channel exchanges the chunks alone enqueued (PRX_ALONE's only)
+};
 
 /// `glm-prx-check <ckpt> <rank> <world> <idfile>`: on every rank NCCL, then the channel copying, then it with ZC.
 pub fn prxCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
@@ -23,6 +30,9 @@ pub fn prxCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_
         std.debug.print("REFUSE {s}\n", .{problem});
         return err;
     };
+    // the default path (PRX_ALONE off) is a paired step's: it needs the pair and other ranks to exchange with
+    try check.expect(set.pair, "prx: glm-prx-check needs TF_GLM_PROMPT_PAIR on (unset or 1)", .{});
+    try check.expect(world > 1, "prx: glm-prx-check needs other ranks", .{});
     var group: cuda.tp_group.Group = .{ .lib = lib, .comm = comm, .rank = @intCast(rank), .world = @intCast(world) };
     var s = try cuda.Stream.init(gpu.d, false);
     defer s.deinit();
@@ -32,6 +42,7 @@ pub fn prxCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_
         return error.TestFailed;
     };
     defer ch.deinit();
+    const alone = cuda.ovn.on("PRX_ALONE");
     var caps: [3]glm.rotlayer.Capture = undefined;
     var runs: [3]Pass = undefined;
     var calls: [3]u64 = undefined;
@@ -52,6 +63,15 @@ pub fn prxCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_
         std.debug.print("FAIL prx: rank {d}: exchanges by the channel {d}/{d}/{d}, read in place {d}/{d}/{d} (NCCL, copied, ZC)\n", .{ rank, calls[0], calls[1], calls[2], zcs[0], zcs[1], zcs[2] });
         failed = true;
     }
+    if (rank == 0) for (runs, 0..) |p, k| {
+        // one paired step in every pass; by the channel in passes 1 and 2; chunks alone by it only with PRX_ALONE
+        const pair_ok = p.pair_steps == 1 and (k == 0 or p.pair_calls > 0);
+        const alone_ok = if (k > 0 and alone) p.alone_calls > 0 else p.alone_calls == 0;
+        if (!pair_ok or !alone_ok) {
+            std.debug.print("FAIL prx: pass {d}: {d} paired step(s) took {d} channel exchanges, chunks alone {d} (PRX_ALONE {})\n", .{ k, p.pair_steps, p.pair_calls, p.alone_calls, alone });
+            failed = true;
+        }
+    };
     var layers: usize = 0;
     var rows: usize = 0;
     for (caps[0].sums, caps[0].rows, 0..) |sa, ra, j| {
@@ -75,13 +95,14 @@ pub fn prxCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_
         };
     }
     if (failed) return error.TestFailed;
-    check.pass("TF_GLM_OVN_PRX at TP={d}: rank {d}'s glued rows of {d} layers ({d} in all, a two-chunk prompt and two decode windows){s} equal NCCL's byte for byte, copied ({d} exchanges by the NICs) and read in place ({d} of {d})", .{ world, rank, layers, rows, if (rank == 0) " and the windows' tokens and logits" else "", calls[1], zcs[2], calls[2] });
+    const how = if (alone) "every chunk by the channel (PRX_ALONE)" else "the paired step by the channel, the chunk alone by NCCL";
+    check.pass("TF_GLM_OVN_PRX at TP={d}: rank {d}'s glued rows of {d} layers ({d} in all, a paired step, a chunk alone, two decode windows){s} equal NCCL's byte for byte, {s}: copied ({d} exchanges by the NICs) and read in place ({d} of {d})", .{ world, rank, layers, rows, if (rank == 0) " and the windows' tokens and logits" else "", how, calls[1], zcs[2], calls[2] });
 }
 
 /// One engine on this rank over `group` (its channel set or not), its forwards' glued rows into `cap`: rank 0 leads.
 fn pass(gpu: Gpu, a: std.mem.Allocator, checkpoint: []const u8, group: *cuda.tp_group.Group, rank: c_int, world: c_int, set: anytype, cap: anytype) !Pass {
     const glm = @import("glm_cuda");
-    const capacity = 16384;
+    const capacity = glm.prompt_pair.prx_check_capacity;
     const e = try glm.engine.Engine.init(gpu.gpa, gpu.io, gpu.d, gpu.ctx, checkpoint, &group.lib, group.comm, @intCast(rank), @intCast(world), .{ .capacity = capacity, .mtp = false, .settings = set });
     defer e.deinit();
     e.group = group;
@@ -100,10 +121,23 @@ fn pass(gpu: Gpu, a: std.mem.Allocator, checkpoint: []const u8, group: *cuda.tp_
     defer x.end() catch {};
     try x.bind(0);
     try x.begin(null);
-    // two chunks then 300 rows: a paired step (by the channel) and a pieced chunk alone (NCCL unless PRX_ALONE=1)
-    const ids = try a.alloc(u32, 2 * glm.engine.prompt_rows + 300);
+    // two chunks then 300 rows (prompt_pair's host test pins pairedAt's rules): a paired step, a chunk alone
+    const ids = try a.alloc(u32, glm.prompt_pair.prx_check_len);
     for (ids, 0..) |*u, j| u.* = @intCast(100 + (j * 7919) % 5000);
-    p.first = try x.prefill(ids, null, null);
+    try check.expect(e.pairedAt(0, ids.len, null, null), "prx: the prompt's first step would not pair (pairedAt)", .{});
+    var at: usize = 0;
+    p.first = while (true) { // Leader.chunk, paired where pairedAt allows, as the serve's prompt steps
+        const steps = e.pair.?.steps;
+        const before = if (group.prx) |ch| ch.calls else 0;
+        const r = try x.chunk(ids, at, true, null, null, null);
+        const took = (if (group.prx) |ch| ch.calls else 0) - before;
+        if (e.pair.?.steps != steps) {
+            p.pair_steps += e.pair.?.steps - steps;
+            p.pair_calls += took;
+        } else p.alone_calls += took;
+        if (r.first) |f| break f;
+        at += r.rows;
+    };
     const V = e.share.vocab.len();
     p.logits = try a.alloc(u16, 5 * V);
     const win = [_]u32{ p.first, 101, 202, 303 };
