@@ -20,8 +20,6 @@ const sh: image.Shape = .{
     .capacity = 64,
     .head = true,
     .kda = .{ .pos = 0, .conv = 16, .conv_len = 24, .rec = 64, .rec_layer = 32, .layers = 3 },
-    .hidden = 8,
-    .hidden_len = 10,
 };
 const at: u32 = 30;
 const mtp_len: u64 = 29;
@@ -59,7 +57,6 @@ fn place(w: Words, noise: u8) ![]u8 {
     try cache(out, offs.items[2 + sh.layers * 5 ..][0..4].*, mtp_len, w.mtp_base, 100);
     const tail = offs.items[offs.items.len - 1];
     std.mem.writeInt(u32, out[@intCast(tail)..][0..4], @intCast(mtp_len), .little);
-    for (0..sh.hidden_len) |j| out[@intCast(tail + sh.hidden + j)] = held(200, j);
     return out;
 }
 
@@ -184,4 +181,20 @@ test "glm heldDiff: a held byte that differs is found (conv, a live KDA copy, a 
     const g = try place(other, 0x11);
     defer a.free(g);
     try std.testing.expectEqual(@as(?u64, 24), try image.heldDiff(sh, at, s, g, a));
+}
+
+/// The small shape's first-draft row in its tail: past the head's position word (256 and 8,192 bytes on the model).
+const draft_row = .{ .off = 8, .len = 10 };
+
+test "glm heldDiff: another first-draft row is the same state; the head's position word is held" {
+    const s = try place(stored_w, 0x11);
+    defer a.free(s);
+    const f = try a.dupe(u8, s);
+    defer a.free(f);
+    const tail = s.len - sh.tail;
+    @memset(f[tail + draft_row.off ..][0..draft_row.len], 0x5a); // the row an earlier prompt's last chunk left
+    try std.testing.expectEqual(@as(?usize, tail + draft_row.off), std.mem.indexOfDiff(u8, s, f)); // ovn14's shape
+    try std.testing.expectEqual(@as(?u64, null), try image.heldDiff(sh, at, s, f, a));
+    f[tail + 1] +%= 1;
+    try std.testing.expectEqual(@as(?u64, tail + 1), try image.heldDiff(sh, at, s, f, a));
 }
