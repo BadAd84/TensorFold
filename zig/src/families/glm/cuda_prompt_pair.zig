@@ -185,19 +185,29 @@ test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
     try std.testing.expect(!wanted(false, 3));
 }
 
-test "TF_GLM_OVN_PRX: glm-prx-check's prompt pairs its first step (pairedAt's rules) and leaves a split tail alone" {
+test "TF_GLM_OVN_PRX: glm-prx-check's prompt takes one paired step, at 0 (pairedAt's rules), then split chunks alone" {
     const C = fw.prefill_rows;
-    const len = prx_check_len;
+    const len: usize = prx_check_len;
     const ring = @min(prx_check_capacity, @import("cuda_state.zig").index_ring); // State.ring_rows at that capacity
+    try std.testing.expect(len <= prx_check_capacity);
     for (2..cuda.prx.max_world + 1) |world| {
         try std.testing.expect(wanted(true, world)); // the engine makes the twin
-        try std.testing.expect(takesTwo(0, len, world, &.{}));
-        try std.testing.expectEqual(@as(usize, C), pairRows(0, len, &.{}));
-        try std.testing.expect(ringsAgree(0, ring, 0, C)); // a fresh sequence's rings at base 0
-        try std.testing.expect(!takesTwo(2 * C, len, world, &.{})); // the 300-row tail goes alone
-        var cut: [fw.max_pieces][2]usize = undefined;
-        const n = fw.ranges(len - 2 * C, 3, &cut); // TF_GLM_OVERLAP_PIECES' default
-        for (cut[0..n]) |p| try std.testing.expect(p[1] - p[0] >= world); // every piece splits: PRX_ALONE has calls
+        var at: usize = 0;
+        var base: usize = 0; // the rings' base, as State.ready rebases it (glm-pair-check's walk)
+        var pairs: usize = 0;
+        var alone: usize = 0;
+        while (at < len) {
+            const rb = pairRows(at, len, &.{});
+            const two = takesTwo(at, len, world, &.{}) and ringsAgree(base, ring, at, rb);
+            try std.testing.expect(two == (at == 0)); // the check counts exactly one paired step, the first
+            const rows = if (two) C + rb else @min(len - at, C);
+            if (at + rows > base + ring) base = at;
+            if (two) pairs += 1 else alone += 1;
+            var cut: [fw.max_pieces][2]usize = undefined;
+            const n = fw.ranges(@min(rows, C), 3, &cut); // TF_GLM_OVERLAP_PIECES' default
+            for (cut[0..n]) |p| try std.testing.expect(p[1] - p[0] >= world); // every piece splits: the channel's
+            at += rows;
+        }
+        try std.testing.expect(pairs == 1 and alone >= 1); // PRX_ALONE's lone chunks have calls to make
     }
-    try std.testing.expect(len <= prx_check_capacity);
 }
