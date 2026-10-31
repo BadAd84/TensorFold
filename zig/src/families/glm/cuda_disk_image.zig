@@ -122,6 +122,24 @@ pub fn canon(sh: Shape, at: u32, s: Words, f: Words, out: *std.ArrayList(Match),
     try same(img + sh.hidden, sh.hidden_len, out, a); // the first-draft row; the rest of the tail is padding
 }
 
+/// The first held byte where two images of one state at `at` differ (all words, then canon's matches); null: none.
+pub fn heldDiff(sh: Shape, at: u32, p: []const u8, q: []const u8, a: std.mem.Allocator) !?u64 {
+    if (p.len != q.len or p.len < Words.bytes) return 0;
+    if (std.mem.indexOfDiff(u8, p[0..Words.bytes], q[0..Words.bytes])) |i| return i;
+    const w = try Words.decode(std.mem.bytesToValue([6]u64, p[0..Words.bytes]), at);
+    var ms: std.ArrayList(Match) = .empty;
+    defer ms.deinit(a);
+    try canon(sh, at, w, w, &ms, a);
+    var first: ?u64 = null;
+    for (ms.items) |m| {
+        if (m.off + m.len > p.len) return error.SnapshotShape;
+        const x = p[@intCast(m.off)..][0..@intCast(m.len)];
+        const i = std.mem.indexOfDiff(u8, x, q[@intCast(m.off)..][0..@intCast(m.len)]) orelse continue;
+        if (first == null or m.off + i < first.?) first = m.off + i;
+    }
+    return first;
+}
+
 /// A prefix at image offset `img` (rank 0's, or another rank's in the store): its fields, each KDA layer's live copy.
 pub fn prefix(sh: Shape, img: u64, s_cur: u64, f_cur: u64, out: *std.ArrayList(Match), a: std.mem.Allocator) !void {
     const k = sh.kda;

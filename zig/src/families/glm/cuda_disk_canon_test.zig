@@ -143,3 +143,37 @@ test "glm canon: ring rows both states hold are compared by position; a row one 
     defer a.free(g);
     try std.testing.expectEqual(@as(?u64, 16), try differs(s, g, stored_w, other));
 }
+
+/// The image offset of the prefix's first byte past the KDA layers' copies: a decode window's scratch (State.proj).
+const scratch: u64 = Words.bytes + sh.kda.rec + 2 * sh.kda.layers * sh.kda.rec_layer;
+
+test "glm heldDiff: one state with other window scratch and stale bytes is the same state; raw bytes part at proj" {
+    const s = try place(stored_w, 0x11);
+    defer a.free(s);
+    const f = try a.dupe(u8, s);
+    defer a.free(f);
+    @memset(f[@intCast(scratch)..][0..@intCast(Words.bytes + sh.prefix - scratch)], 0x77); // another window's rows
+    try std.testing.expectEqual(@as(?u64, scratch), std.mem.indexOfDiff(u8, s, f)); // glm-lineage-check's failure shape
+    try std.testing.expectEqual(@as(?u64, null), try image.heldDiff(sh, at, s, f, a));
+    const g = try place(stored_w, 0x77); // every byte the state does not hold another
+    defer a.free(g);
+    try std.testing.expectEqual(@as(?u64, null), try image.heldDiff(sh, at, s, g, a));
+}
+
+test "glm heldDiff: a held byte that differs is found (conv, a live KDA copy, a latent row, a ring base word)" {
+    const s = try place(stored_w, 0x11);
+    defer a.free(s);
+    const f = try place(stored_w, 0x77);
+    defer a.free(f);
+    const latent = Words.bytes + sh.prefix + 3 * sh.latent + 1; // the first DSA layer's row 3
+    for ([_]u64{ Words.bytes + sh.kda.conv + 7, copyAt(1, 0) + 5, latent }) |off| {
+        f[@intCast(off)] +%= 1;
+        try std.testing.expectEqual(@as(?u64, off), try image.heldDiff(sh, at, s, f, a));
+        f[@intCast(off)] -%= 1;
+    }
+    var other = stored_w;
+    other.base -= 2; // the same rows in a ring placed elsewhere: its words say so, and the images are not alike
+    const g = try place(other, 0x11);
+    defer a.free(g);
+    try std.testing.expectEqual(@as(?u64, 24), try image.heldDiff(sh, at, s, g, a));
+}
