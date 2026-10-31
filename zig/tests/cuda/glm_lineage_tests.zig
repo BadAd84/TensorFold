@@ -24,11 +24,14 @@ const Keep = struct {
 /// What one arm leaves to compare: every request's first token, next window's tokens and logits, every kept image.
 const Arm = struct {
     a: std.mem.Allocator,
-    out: std.ArrayList([]const u8) = .empty,
-    fn add(r: *Arm, bytes: []const u8) !void {
-        try r.out.append(r.a, try r.a.dupe(u8, bytes));
+    out: std.ArrayList(Record) = .empty,
+    fn add(r: *Arm, bytes: []const u8, at: u32) !void {
+        try r.out.append(r.a, .{ .bytes = try r.a.dupe(u8, bytes), .at = at });
     }
 };
+
+/// A record's bytes; `at` > 0: rank 0's image of a state kept at `at`.
+const Record = struct { bytes: []const u8, at: u32 = 0 };
 
 /// The scenario's driver on rank 0: a request is a slot, its ids, the state it resumes and the marks it keeps at.
 const Run = struct {
@@ -66,15 +69,15 @@ const Run = struct {
         try r.x.verify(&win, &outs, 0);
         const logits = try r.arm.a.alloc(u16, win.len * r.vocab);
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(logits.ptr, e.bd.logits, logits.len * 2), "cuMemcpyDtoH");
-        try r.arm.add(std.mem.asBytes(&first));
-        try r.arm.add(std.mem.asBytes(&outs));
-        try r.arm.add(std.mem.sliceAsBytes(logits));
+        try r.arm.add(std.mem.asBytes(&first), 0);
+        try r.arm.add(std.mem.asBytes(&outs), 0);
+        try r.arm.add(std.mem.sliceAsBytes(logits), 0);
         for (keep.ids[0..keep.n], 0..) |id, i| {
             if (id == 0) {
                 std.debug.print("FAIL lineage: slot {d} kept nothing at mark {d}\n", .{ slot, buf[i] });
                 return error.TestFailed;
             }
-            try r.arm.add(try r.image(id));
+            try r.arm.add(try r.image(id), @intCast(e.snaps.get(id).?.pos));
         }
         if (keep.n != n + at.len) {
             std.debug.print("FAIL lineage: slot {d} kept {d} states at {d} marks\n", .{ slot, keep.n, n + at.len });
@@ -134,9 +137,9 @@ fn forget(e: anytype) void {
 }
 
 /// `glm-lineage-check` (TF_GLM_OVN_LINEAGE=1): one scenario of turns on pages, forks, a window's resumes and a state
-/// evicted and read back, run on rank 0 without the knob and with it; every kept image (the restored state at each
-/// resume row among them), first token and next window's tokens and logits must be equal byte for byte, and the
-/// knob's arm must leave rows in place and share pages.
+/// evicted and read back, run on rank 0 without the knob and with it; every first token and next window's tokens and
+/// logits must be equal byte for byte, every kept image (the restored state at each resume row among them) in every
+/// byte the state holds (cuda_disk_image.heldDiff), and the knob's arm must leave rows in place and share pages.
 pub fn lineageCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int, id_path: []const u8) !void {
     const glm = @import("glm_cuda");
     var arena = std.heap.ArenaAllocator.init(gpu.gpa);
@@ -209,14 +212,20 @@ pub fn lineageCheck(gpu: Gpu, checkpoint: []const u8, rank: c_int, world: c_int,
         std.debug.print("FAIL lineage: {d} records without the knob, {d} with it\n", .{ arms[0].out.items.len, arms[1].out.items.len });
         failed = true;
     }
-    for (arms[0].out.items, arms[1].out.items, 0..) |p, q, i| if (!std.mem.eql(u8, p, q)) {
-        std.debug.print("FAIL lineage: record {d} differs at byte {?d} of {d}\n", .{ i, std.mem.indexOfDiff(u8, p, q), p.len });
-        failed = true;
-    };
+    const sh = try glm.disk_ranks.shape(e);
+    for (arms[0].out.items, arms[1].out.items, 0..) |p, q, i| {
+        const raw = std.mem.indexOfDiff(u8, p.bytes, q.bytes) orelse continue;
+        // an image's window scratch carries the last decode window on its slot, which the arms ran in other orders
+        const held = if (p.at == 0 or p.at != q.at) raw else try glm.disk_image.heldDiff(sh, p.at, p.bytes, q.bytes, a);
+        if (held) |at| {
+            std.debug.print("FAIL lineage: record {d} differs at byte {d} of {d}\n", .{ i, at, p.bytes.len });
+            failed = true;
+        } else std.debug.print("lineage: record {d} differs only past what a state holds, from byte {d}\n", .{ i, raw });
+    }
     if (stats.skipped == 0 or stats.shared == 0) {
         std.debug.print("FAIL lineage: the knob's restores left {d} bytes in place and its keeps shared {d}\n", .{ stats.skipped, stats.shared });
         failed = true;
     }
     if (failed) return error.TestFailed;
-    check.pass("lineage at TP={d}: {d} records (turns on pages, forks, a window's resumes, a reloaded state) equal the knob-off path byte for byte; the knob's keeps and restores copied {d} MiB, left {d} MiB in place and shared {d} MiB", .{ world, arms[0].out.items.len, stats.copied >> 20, stats.skipped >> 20, stats.shared >> 20 });
+    check.pass("lineage at TP={d}: {d} records (turns on pages, forks, a window's resumes, a reloaded state) equal the knob-off path in every byte a state holds; the knob's keeps and restores copied {d} MiB, left {d} MiB in place and shared {d} MiB", .{ world, arms[0].out.items.len, stats.copied >> 20, stats.skipped >> 20, stats.shared >> 20 });
 }
