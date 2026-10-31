@@ -42,7 +42,7 @@ pub const Seg = struct { img: u64, len: u64, from: union(enum) { words, lease: u
 /// What a rank's kept state holds, read from a sequence of the engine (its addresses are not used past here).
 pub const Shape = struct {
     prefix: u64, // the sequence's own fields before its caches: KDA conv and states, a window's saved rows
-    tail: u64, // its fields after them: the head's position and first-draft row
+    tail: u64, // its fields after them: the head's position, then the first-draft row (rewritten before any read)
     layers: u32, // DSA layers, whose rows are shared by position
     latent: u32, // a latent row's bytes
     scales: bool, // fp8 latent rows: a 4-byte scale each
@@ -53,8 +53,6 @@ pub const Shape = struct {
     capacity: u32,
     head: bool, // the MTP head's caches are kept (drafting)
     kda: Kda = .{}, // the prefix's fields a state holds (canon): the rest is a decode window's scratch and padding
-    hidden: u64 = 0, // the tail's first-draft row: its offset in the tail
-    hidden_len: u64 = 0,
 
     pub fn of(st: *const State, c: *const Config, capacity: usize, head: bool) !Shape {
         if (st.rings.len == 0) return error.SnapshotShape;
@@ -77,8 +75,6 @@ pub const Shape = struct {
             .capacity = @intCast(capacity),
             .head = head,
             .kda = kda,
-            .hidden = st.prompt_hidden -% st.mtp_pos_dev,
-            .hidden_len = c.hidden * 2,
         };
     }
 
@@ -106,7 +102,7 @@ const Match = @import("lanes").rows_image.Match;
 
 /// TF_GLM_OVN_DISK_CARRY's replay: which bytes of a stored image at `at` (words `s`) answer a fresh one's (`f`).
 pub fn canon(sh: Shape, at: u32, s: Words, f: Words, out: *std.ArrayList(Match), a: std.mem.Allocator) !void {
-    if (sh.tail < 4 or sh.hidden + sh.hidden_len > sh.tail) return error.SnapshotShape;
+    if (sh.tail < 4) return error.SnapshotShape;
     for ([_]Words{ s, f }) |w| {
         if (!holds(w.base, at, @min(at, sh.ring_rows))) return error.DiskWords;
         if (sh.head and (w.mtp_len > sh.headRows(at) or !holds(w.mtp_base, w.mtp_len, @min(w.mtp_len, sh.ring_rows)))) return error.DiskWords;
@@ -118,8 +114,7 @@ pub fn canon(sh: Shape, at: u32, s: Words, f: Words, out: *std.ArrayList(Match),
     var img: u64 = Words.bytes + sh.prefix;
     for (0..sh.layers) |_| img = try cacheMatches(sh, img, cache(sh, at), at, s.base, f.base, out, a);
     if (sh.head) img = try cacheMatches(sh, img, cache(sh, sh.headRows(at)), s.mtp_len, s.mtp_base, f.mtp_base, out, a);
-    try same(img, 4, out, a); // the head's position word
-    try same(img + sh.hidden, sh.hidden_len, out, a); // the first-draft row; the rest of the tail is padding
+    try same(img, 4, out, a); // the head's position word; the first-draft row is written before a read (cuda_prompt_hold)
 }
 
 /// The first held byte where two images of one state at `at` differ (all words, then canon's matches); null: none.
