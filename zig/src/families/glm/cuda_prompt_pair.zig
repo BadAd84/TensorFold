@@ -13,6 +13,11 @@ const Engine = engine.Engine;
 /// The fewest rows a paired step's second chunk takes: a shorter one's sites end before the first's exchanges do.
 pub const min_rows = fw.prefill_rows / 4;
 
+/// glm-prx-check's prompt: a paired step at 0 (two full chunks, PRX's default path), then 300 rows alone (PRX_ALONE's).
+pub const prx_check_len = 2 * fw.prefill_rows + 300;
+/// glm-prx-check's sequence capacity: its index rings hold both chunks, so ringsAgree pairs the step at 0.
+pub const prx_check_capacity = 4 * fw.prefill_rows;
+
 /// A paired step's second chunk: twins of the prompt buffers, pieces on their side stream, and its first position.
 pub const Pair = struct {
     bp: fw.Buffers,
@@ -178,4 +183,21 @@ test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
     try std.testing.expect(!wanted(true, 1));
     try std.testing.expect(wanted(true, 2));
     try std.testing.expect(!wanted(false, 3));
+}
+
+test "TF_GLM_OVN_PRX: glm-prx-check's prompt pairs its first step (pairedAt's rules) and leaves a split tail alone" {
+    const C = fw.prefill_rows;
+    const len = prx_check_len;
+    const ring = @min(prx_check_capacity, @import("cuda_state.zig").index_ring); // State.ring_rows at that capacity
+    for (2..cuda.prx.max_world + 1) |world| {
+        try std.testing.expect(wanted(true, world)); // the engine makes the twin
+        try std.testing.expect(takesTwo(0, len, world, &.{}));
+        try std.testing.expectEqual(@as(usize, C), pairRows(0, len, &.{}));
+        try std.testing.expect(ringsAgree(0, ring, 0, C)); // a fresh sequence's rings at base 0
+        try std.testing.expect(!takesTwo(2 * C, len, world, &.{})); // the 300-row tail goes alone
+        var cut: [fw.max_pieces][2]usize = undefined;
+        const n = fw.ranges(len - 2 * C, 3, &cut); // TF_GLM_OVERLAP_PIECES' default
+        for (cut[0..n]) |p| try std.testing.expect(p[1] - p[0] >= world); // every piece splits: PRX_ALONE has calls
+    }
+    try std.testing.expect(len <= prx_check_capacity);
 }
