@@ -87,6 +87,34 @@ fn sharedRowsOdd(name: [:0]const u8) ?[]const u8 {
     return null;
 }
 
+fn bsRows(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_OVN_SHARED_BS_ROWS")) return "64";
+    return null;
+}
+
+fn bsRowsAuto(name: [:0]const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "TF_GLM_OVN_SHARED_BS_ROWS")) return "auto";
+    return null;
+}
+
+test "TF_GLM_OVN_SHARED_BS_ROWS: the buffers' rows apart from the cap, at least the cap, agreed by the ranks" {
+    var problem: []const u8 = "";
+    const s = try Settings.read(&bsRows, &problem);
+    try std.testing.expect(s.shared_rows == 32 and s.shared_bs_rows == 64);
+    try std.testing.expectEqual(@as(u32, 64), try ranks.bufferRows(s)); // a 32-row cap on 64-row buffers
+    try std.testing.expectEqual(@as(u32, 32), try ranks.bufferRows(.{})); // unset: the cap's rows
+    try std.testing.expectEqual(@as(u32, 48), try ranks.bufferRows(.{ .shared_rows = 48 }));
+    try std.testing.expectError(error.BadSharedRows, ranks.bufferRows(.{ .shared_rows = 64, .shared_bs_rows = 48 }));
+    try std.testing.expectError(error.BadSharedRows, ranks.bufferRows(.{ .shared_rows = 0 })); // auto unresolved
+    try std.testing.expectError(error.BadSetting, Settings.read(&bsRowsAuto, &problem));
+    try std.testing.expectStringStartsWith(problem, "TF_GLM_OVN_SHARED_BS_ROWS: ");
+    try std.testing.expectError(error.BadSetting, Settings.read(&sharedRowsOdd, &problem));
+    const h = hashBytes("/c");
+    const a = Fingerprint.of(2, 0, .{}, 8192, true, @splat(0), @splat(0), h);
+    const b = Fingerprint.of(2, 1, .{ .shared_bs_rows = 64 }, 8192, true, @splat(0), @splat(0), h);
+    try std.testing.expectEqual(Fingerprint.Field.shared_rows, mismatch(&.{ a, b }).?.field);
+}
+
 test "TF_GLM_OVN_SHARED_ROWS: 32 to 64 in steps of 8, auto by the streams, refused otherwise, agreed by the ranks" {
     var problem: []const u8 = "";
     try std.testing.expectEqual(@as(u32, 32), (try Settings.read(&ringed, &problem)).shared_rows); // unset: today's 32

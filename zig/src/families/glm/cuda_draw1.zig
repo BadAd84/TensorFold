@@ -16,6 +16,11 @@ const pair_bytes = 16;
 /// A draw's per-row words as one upload: each sampled row's rule, its position less one, its logits row.
 const Ctl = extern struct { rules: [rows_max]sampler.Rule, metas: [rows_max]i32, src: [rows_max]u32 };
 
+/// Device bytes Draw1.init allocates for `rows` rows over `world` ranks (the rooms reserve them at load).
+pub fn deviceBytes(world: usize, rows: usize, vocab: usize) u64 {
+    return world * rows * pair_bytes + world * rows * max_k * 8 + rows * vocab * 2 + @sizeOf(Ctl) + rows * 4;
+}
+
 /// One part's rows: logits rows row0.. of the draw's buffer, tokens at first, first + 1, ...; null sampling: greedy.
 pub const Part = struct { row0: usize, rows: usize, first: u64, sampling: ?sampler.Sampling, out: []u32 };
 
@@ -35,13 +40,13 @@ pub const Draw1 = struct {
     full: cuda.DeviceBuffer, // bf16 [rows][vocab]: -inf but the gathered candidates
     ctl: cuda.DeviceBuffer, // Ctl
     tok: cuda.DeviceBuffer, // u32 [rows]
-    rows: usize, // the rows the buffers hold: the load's TF_GLM_OVN_SHARED_ROWS
+    rows: usize, // the rows the buffers hold: the shared buffers' (cuda_ranks.bufferRows)
 
-    /// Made at load with the knob on; glm_glue is the forward's module 6 (fw.Modules.load's order).
+    /// Made at the first verify with the knob on (cuda_engine_shared.ensure); glm_glue is the forward's module 6.
     pub fn init(e: *Engine) !Draw1 {
         const d = e.d;
         const world = e.share.world;
-        const rows: usize = e.settings.shared_rows;
+        const rows: usize = try ranks.bufferRows(e.settings);
         std.debug.assert(rows <= rows_max);
         var x: Draw1 = undefined;
         x.rows = rows;
@@ -229,6 +234,9 @@ test "TF_GLM_OVN_DRAW1: its buffers hold the load's TF_GLM_OVN_SHARED_ROWS rows;
         try std.testing.expectEqual(@as(usize, rows), e.draw1.?.rows);
         const want = [_]usize{ 3 * rows * pair_bytes, 3 * rows * max_k * 8, rows * 154880 * 2, @sizeOf(Ctl), rows * 4 };
         try std.testing.expectEqualSlices(usize, &want, Fake.sizes[0..Fake.n]);
+        var sum: usize = 0;
+        for (Fake.sizes[0..Fake.n]) |n| sum += n;
+        try std.testing.expectEqual(@as(u64, sum), deviceBytes(3, rows, 154880)); // what the rooms reserve
         // a part ending one row past the load's rows is refused before any launch
         try std.testing.expectError(error.BadDraw, draw(&e, 0, &.{.{ .row0 = rows - 4, .rows = 5, .first = 1, .sampling = null, .out = &out }}));
     }

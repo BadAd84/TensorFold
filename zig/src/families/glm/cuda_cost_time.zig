@@ -41,7 +41,7 @@ pub fn shapes(rows: usize, out: *[most_shapes]Shape) []const Shape {
 /// Whether this load times its costs: the knob, DFlash2 (the only user of the tables), shared windows, no vision
 /// (an image set binds per slot). Every rank decides alike: these are agreed settings.
 pub fn wanted(e: *const Engine) bool {
-    return cuda.ovn.on("COST_TIME") and e.drafter != null and e.bs != null and e.images == null;
+    return cuda.ovn.on("COST_TIME") and e.drafter != null and e.mtp and e.images == null;
 }
 
 fn now(e: *const Engine) i96 {
@@ -57,6 +57,7 @@ pub fn run(e: *Engine) !Timed {
     const end = first_slot + slots;
     if (e.seqs.items.len < end) try e.seqs.appendNTimes(e.gpa, null, end - e.seqs.items.len);
     for (e.seqs.items[first_slot..end]) |q| if (q != null) return error.SlotTaken;
+    defer @import("cuda_engine_shared.zig").release(e); // made again at the first served verify, after the pool
     defer { // every timed slot freed (Engine.release), and the drafter rings its passes made, as before the step
         for (first_slot..end) |slot| e.release(@intCast(slot));
         if (e.drafter) |dr| if (dr.slots.items.len > first_slot) for (dr.slots.items[first_slot..@min(end, dr.slots.items.len)]) |*s| {

@@ -131,11 +131,12 @@ pub const Engine = struct {
     pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
+    shared_made: bool = false, // e.bs, DRAW1 and SEG_DSA made (cuda_engine_shared.ensure, at the first verify)
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
         if (world > ranks.max_world) return error.TooManyRanks; // before anything is allocated
-        if (!ranks.validRows(o.settings.shared_rows)) return error.BadSharedRows; // auto resolved at open (autoRows)
+        _ = try ranks.bufferRows(o.settings); // auto resolved at open (autoRows); the buffers hold the cap at least
         const e = try gpa.create(Engine);
         errdefer gpa.destroy(e);
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -243,9 +244,7 @@ pub const Engine = struct {
         errdefer e.bd.deinit();
         e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bm.deinit();
-        if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, o.settings.shared_rows, o.capacity);
-        if (e.bs) |b| if (rank == 0) std.log.info("glm: shared verify windows of up to {d} rows (TF_GLM_OVN_SHARED_ROWS), their buffers {d} MiB", .{ b.rows, b.arena.buf.len >> 20 });
-        errdefer if (e.bs) |*b| b.deinit();
+        // e.bs and what TF_GLM_OVN_SHARED_ROWS sizes come last, at the first verify (cuda_engine_shared.ensure)
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
         errdefer e.pairs.free();
         try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
@@ -492,6 +491,7 @@ pub const Engine = struct {
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
         if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
+        try @import("cuda_engine_shared.zig").ensure(e); // DRAW1's buffers, after the page pool
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;

@@ -25,6 +25,7 @@ pub const Settings = struct {
     head_bits: u8 = 16, // TF_GLM_HEAD_BITS: the head, likewise
     ovn_comms: u32 = 0, // the comms lane's TF_GLM_OVN_* knobs as one word (ovnComms): every rank exchanges alike
     shared_rows: u32 = least_shared_rows, // TF_GLM_OVN_SHARED_ROWS: a shared verify's rows at most (0: auto, unresolved)
+    shared_bs_rows: u32 = 0, // TF_GLM_OVN_SHARED_BS_ROWS: the shared buffers' rows, 32 to 64 (0: the setting's)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -113,6 +114,13 @@ pub const Settings = struct {
             problem.* = "TF_GLM_OVN_SHARED_ROWS: a shared verify's rows, 32, 40, 48, 56 or 64; or auto (64 above 4 streams)";
             return error.BadSetting;
         };
+        if (get("TF_GLM_OVN_SHARED_BS_ROWS")) |v| {
+            s.shared_bs_rows = sharedRows(v) catch 0; // auto (0) is refused too: the buffers take a number
+            if (s.shared_bs_rows == 0) {
+                problem.* = "TF_GLM_OVN_SHARED_BS_ROWS: the shared buffers' rows, 32, 40, 48, 56 or 64";
+                return error.BadSetting;
+            }
+        }
         s.ovn_comms = ovnComms() catch {
             problem.* = "TF_GLM_OVN_ROCE_RAILS: 1 or 2; TF_GLM_OVN_ROCE_RAILS_KB: under 1048576";
             return error.BadSetting;
@@ -154,6 +162,13 @@ pub fn validRows(n: u32) bool {
 pub fn autoRows(rows: u32, streams: u32) u32 {
     if (rows != 0) return rows;
     return if (streams > 4) most_shared_rows else least_shared_rows;
+}
+
+/// The shared buffers' rows: TF_GLM_OVN_SHARED_BS_ROWS, else the resolved TF_GLM_OVN_SHARED_ROWS; never under it.
+pub fn bufferRows(s: Settings) error{BadSharedRows}!u32 {
+    const rows = if (s.shared_bs_rows != 0) s.shared_bs_rows else s.shared_rows;
+    if (!validRows(s.shared_rows) or !validRows(rows) or rows < s.shared_rows) return error.BadSharedRows;
+    return rows;
 }
 
 /// The most ranks a world holds: rank 0's greedy pick gathers every rank's top-1 into one host array of this size.
@@ -261,7 +276,7 @@ pub const Fingerprint = extern struct {
             .mtp = @intFromBool(mtp),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .ovn_comms = s.ovn_comms,
-            .shared_rows = s.shared_rows,
+            .shared_rows = s.shared_rows | (bufferRows(s) catch 0) << 8, // the cap, then the buffers' rows
             .capacity = capacity,
             .heat_high = if (s.heat) |b| b.high_c else 0,
             .heat_low = if (s.heat) |b| b.low_c else 0,

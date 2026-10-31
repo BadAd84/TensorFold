@@ -18,17 +18,9 @@ pub fn open(e: *Engine, gpa: std.mem.Allocator, io: std.Io) !void {
     }
     if (cuda.ovn.on("LINEAGE")) @import("cuda_lineage.zig").on = true; // kept and live rows' tags (cuda_lineage)
     if (cuda.ovn.on("SHARED_PROF")) e.shared_prof = try @import("cuda_engine_prof.zig").Shared.create(gpa, e.d, io);
-    if (cuda.ovn.on("DRAW1")) e.draw1 = try @import("cuda_draw1.zig").Draw1.init(e);
-    if (e.bs != null and cuda.ovn.on("SEG_KDA")) { // glm_kda is fw.Modules.load's module 0, glm_glue its 6
-        e.seg_kda = try @import("cuda_kda_seg.zig").SegKda.init(e.d, e.m.mods[0]);
-        e.bs.?.seg.kda = &e.seg_kda.?;
-    }
-    if (e.bs != null and cuda.ovn.on("SEG_COMMIT")) e.seg_commit = try @import("cuda_commit_seg.zig").SegCommit.init(e.d, e.m.mods[0], e.m.mods[6]);
-    if (e.bs != null and cuda.ovn.on("SEG_DSA")) { // glm_glue is module 6, glm_ops module 1
-        const b = &e.bs.?;
-        e.seg_dsa = try @import("cuda_dsa_seg.zig").SegDsa.init(gpa, e.d, e.m.mods[6], e.m.mods[1], &e.w, b.rows, b.nch, e.capacity);
-        b.seg.dsa = &e.seg_dsa.?;
-    }
+    // DRAW1 and SEG_DSA are sized by the shared rows: made after the page pool (cuda_engine_shared.ensure)
+    if (e.mtp and cuda.ovn.on("SEG_KDA")) e.seg_kda = try @import("cuda_kda_seg.zig").SegKda.init(e.d, e.m.mods[0]);
+    if (e.mtp and cuda.ovn.on("SEG_COMMIT")) e.seg_commit = try @import("cuda_commit_seg.zig").SegCommit.init(e.d, e.m.mods[0], e.m.mods[6]);
 }
 
 /// Frees what `open` made (before the buffers and the sampler go).
