@@ -25,29 +25,8 @@ pub const dense_reach = 2560;
 /// A paired step's two chunks fit from its rebase (prompt_pair.ringsAgree).
 pub const index_ring = 2 * prefill_rows;
 
-/// Sub-allocations of one device allocation, 256-byte aligned like the driver's own.
-const Arena = struct {
-    buf: cuda.DeviceBuffer,
-    used: usize = 0,
-
-    fn take(a: *Arena, bytes: usize) u64 {
-        const at = std.mem.alignForward(usize, a.used, 256);
-        a.used = at + bytes;
-        std.debug.assert(a.used <= a.buf.len);
-        return a.buf.ptr + at;
-    }
-};
-
-/// Allocates `sizes` (bytes) in one zeroed device buffer and hands out each field's address in order.
-fn arena(d: *const cuda.Driver, sizes: []const usize, out: []u64) !Arena {
-    var total: usize = 0;
-    for (sizes) |n| total += std.mem.alignForward(usize, n, 256);
-    var a: Arena = .{ .buf = try cuda.DeviceBuffer.alloc(d, @max(total, 256)) };
-    errdefer a.buf.free();
-    try a.buf.fill8(0, null);
-    for (sizes, out) |n, *p| p.* = a.take(n);
-    return a;
-}
+const Arena = @import("cuda_arena.zig").Arena;
+const arena = @import("cuda_arena.zig").arena;
 
 /// Rows a KV page holds: one dense latent chunk (latent.chunk), and the keys of its 128 pools.
 pub const page_rows = latent.chunk;
@@ -230,6 +209,12 @@ pub const Buffers = struct {
         return make(d, w, rows, false, capacity, window_rows, null);
     }
 
+    /// The device bytes initShared allocates: its arena and, with TF_GLM_OVN_GLUE_FUSE, its fused-glue buffer.
+    pub fn sharedBytes(w: *const weights.Weights, rows: usize, capacity: usize) !usize {
+        const glue_rows = if (try cuda.ovn.int("GLUE_FUSE", 0) == 0) 0 else std.mem.alignForward(usize, rows * w.config.hc * w.config.hidden * 2, 256) + rows * 4;
+        return @import("cuda_arena.zig").total(&(try plan(w, rows, false, capacity, window_rows)).sizes) + glue_rows;
+    }
+
     /// A paired step's second chunk: its own rows across sites and streams, and `of`'s scratch for one site's work.
     pub fn initTwin(d: *const cuda.Driver, w: *const weights.Weights, of: *const Buffers, capacity: usize) !Buffers {
         return make(d, w, of.rows, of.prefill, capacity, of.rows, of);
@@ -246,8 +231,10 @@ pub const Buffers = struct {
         return false;
     }
 
-    /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
-    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, twin: ?*const Buffers) !Buffers {
+    const Plan = struct { sizes: [twin_checked]usize, part_rows: usize, nch: usize };
+
+    /// make's field sizes in bytes; `seg`: the most rows one stream's attention takes (a window or a shared segment).
+    fn plan(w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize) !Plan {
         const c = &w.config;
         const s = &w.share;
         const D: usize = c.hidden;
@@ -316,11 +303,18 @@ pub const Buffers = struct {
             x3[0], x3[1], x3[2], x3[3], // EXL3 experts: 8-slot picks, rotated inputs, a decode window's partials
             if (split) rows * @max(3 * n, kw - 3 * n) * 2 else 4, // a split KDA stack's part rows
         };
-        var held = sizes;
+        return .{ .sizes = sizes, .part_rows = part_rows, .nch = nch };
+    }
+
+    fn make(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, prefill: bool, capacity: usize, seg: usize, twin: ?*const Buffers) !Buffers {
+        const z = try plan(w, rows, prefill, capacity, seg);
+        const part_rows = z.part_rows;
+        const nch = z.nch;
+        var held = z.sizes;
         if (twin != null) for (&held, 0..) |*bytes, i| { // a twin allocates its own rows only
             if (!twinHolds(i)) bytes.* = 0;
         };
-        var p: [sizes.len]u64 = undefined;
+        var p: [held.len]u64 = undefined;
         const a = try arena(d, &held, &p);
         var out: Buffers = .{
             .arena = a,
@@ -382,7 +376,7 @@ pub const Buffers = struct {
             inline for (@typeInfo(@TypeOf(twin_at)).@"struct".field_names) |f| @field(t, f) = @field(out, f);
             return t;
         }
-        if (!prefill) out.glueAlt(d, S * D * 2) catch |err| {
+        if (!prefill) out.glueAlt(d, w.config.hc * w.config.hidden * 2) catch |err| {
             out.arena.buf.free();
             return err;
         };

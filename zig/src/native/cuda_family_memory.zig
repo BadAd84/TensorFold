@@ -71,8 +71,16 @@ pub fn read(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
 }
 
+/// Device bytes the room leaves aside: a learner's (`learn_bytes`) and those made after the pool (`later_bytes`).
 pub fn learnBytes(loaded: anytype) u64 {
-    return if (@hasField(@TypeOf(loaded), "learn_bytes")) loaded.learn_bytes else 0;
+    const L = @TypeOf(loaded);
+    return (if (@hasField(L, "learn_bytes")) loaded.learn_bytes else 0) + (if (@hasField(L, "later_bytes")) loaded.later_bytes else 0);
+}
+
+test "the room leaves aside a learner's bytes and those a family makes after the pool" {
+    try std.testing.expectEqual(@as(u64, 7), learnBytes(.{ .learn_bytes = @as(usize, 4), .later_bytes = @as(u64, 3) }));
+    try std.testing.expectEqual(@as(u64, 3), learnBytes(.{ .later_bytes = @as(u64, 3) }));
+    try std.testing.expectEqual(@as(u64, 0), learnBytes(.{ .rows = @as(u32, 8) }));
 }
 
 pub fn toGib(bytes: u64) f64 {

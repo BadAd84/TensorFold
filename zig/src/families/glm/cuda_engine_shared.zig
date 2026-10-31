@@ -1,10 +1,51 @@
-//! Engine.verifyShared: several streams' windows in one forward, then each part's draws.
+//! Engine.verifyShared and what the shared rows size (e.bs, DRAW1, SEG_DSA), made last: at the first verify.
 const std = @import("std");
+const cuda = @import("cuda");
 const fw = @import("cuda_forward.zig");
 const engine = @import("cuda_engine.zig");
 const draw1 = @import("cuda_draw1.zig");
+const ranks = @import("cuda_ranks.zig");
 const Engine = engine.Engine;
 const Part = engine.Part;
+
+/// Device bytes `ensure` will allocate on this rank (SEG_DSA's tables aside): the rooms reserve them at load.
+pub fn laterBytes(e: *const Engine) !u64 {
+    const rows = try ranks.bufferRows(e.settings);
+    const bs: u64 = if (e.mtp) try fw.Buffers.sharedBytes(&e.w, rows, e.capacity) else 0;
+    return bs + if (cuda.ovn.on("DRAW1")) draw1.deviceBytes(e.share.world, rows, e.c.vocab) else 0;
+}
+
+/// The shared buffers, DRAW1's and SEG_DSA's, once, at each rank's first verify: nothing a prompt reads moves.
+pub fn ensure(e: *Engine) !void {
+    if (e.shared_made) return;
+    errdefer release(e);
+    const rows = try ranks.bufferRows(e.settings);
+    const held = cuda.usage(false).device;
+    if (e.mtp) {
+        e.bs = try fw.Buffers.initShared(e.d, &e.w, rows, e.capacity);
+        const b = &e.bs.?;
+        if (e.seg_kda) |*k| b.seg.kda = k;
+        if (cuda.ovn.on("SEG_DSA")) { // glm_glue is module 6, glm_ops module 1
+            e.seg_dsa = try @import("cuda_dsa_seg.zig").SegDsa.init(e.gpa, e.d, e.m.mods[6], e.m.mods[1], &e.w, b.rows, b.nch, e.capacity);
+            b.seg.dsa = &e.seg_dsa.?;
+        }
+    }
+    if (cuda.ovn.on("DRAW1")) e.draw1 = try draw1.Draw1.init(e);
+    e.shared_made = true;
+    const made = cuda.usage(false).device - held;
+    if (e.share.rank == 0) std.log.info("glm: shared windows of {d} rows (cap {d}) made after the load: {d} MiB, {d} MiB held before them", .{ rows, e.settings.shared_rows, made >> 20, held >> 20 });
+}
+
+/// Frees what `ensure` made; the next verify makes it again (TF_GLM_OVN_COST_TIME's load-time passes end here).
+pub fn release(e: *Engine) void {
+    if (e.seg_dsa) |*x| x.deinit();
+    e.seg_dsa = null;
+    if (e.draw1) |*x| x.deinit();
+    e.draw1 = null;
+    if (e.bs) |*b| b.deinit();
+    e.bs = null;
+    e.shared_made = false;
+}
 
 /// The parts' total rows; refused past `cap` (TF_GLM_OVN_SHARED_ROWS), max_shared streams, a window, or a slot twice.
 pub fn rowsOf(parts: []const Part, cap: usize) !usize {
@@ -20,9 +61,10 @@ pub fn rowsOf(parts: []const Part, cap: usize) !usize {
 
 /// Several streams' windows in one forward: shared row ops, per-part attention and KDA.
 pub fn verifyShared(e: *Engine, parts: []const Part) !void {
-    const b = if (e.bs) |*x| x else return error.NoSharedWindows;
-    std.debug.assert(b.rows == e.settings.shared_rows); // Engine.init sized e.bs by the setting
     _ = try rowsOf(parts, e.settings.shared_rows);
+    try ensure(e);
+    const b = if (e.bs) |*x| x else return error.NoSharedWindows;
+    std.debug.assert(b.rows >= e.settings.shared_rows); // ensure sized e.bs by bufferRows
     var segs: [engine.max_shared]fw.Seg = undefined;
     var ids: [engine.max_shared_rows]u32 = undefined;
     var rows: usize = 0;
@@ -103,4 +145,14 @@ test "an engine refuses shared rows TF_GLM_OVN_SHARED_ROWS does not allow (auto 
         const o: engine.Options = .{ .capacity = 4096, .mtp = true, .settings = .{ .shared_rows = rows } };
         try std.testing.expectError(error.BadSharedRows, Engine.init(std.testing.allocator, std.testing.io, undefined, undefined, "/no-such-glm", undefined, null, 0, 1, o));
     }
+}
+
+test "release frees what ensure made and lets the next verify make it again" {
+    var e: Engine = undefined;
+    e.bs = null;
+    e.draw1 = null;
+    e.seg_dsa = null;
+    e.shared_made = true;
+    release(&e);
+    try std.testing.expect(!e.shared_made and e.bs == null and e.draw1 == null and e.seg_dsa == null);
 }

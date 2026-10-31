@@ -75,6 +75,7 @@ pub const Loaded = struct {
     stream_bytes: usize,
     free_streams: u32 = 1,
     learn_bytes: usize = 0, // no learner: the streams keep all the room
+    later_bytes: u64 = 0, // made after the page pool (cuda_engine_shared.ensure): the pool's room leaves them aside
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
@@ -308,7 +309,8 @@ fn finishRank(a: OpenArgs) !Loaded {
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
-    const mine: u64 = if (o.room) |r| r.read(r.ctx) orelse 0 else std.math.maxInt(u64);
+    const later = try @import("cuda_engine_shared.zig").laterBytes(own.e); // each rank's own, set aside in its room
+    const mine: u64 = if (o.room) |r| (r.read(r.ctx) orelse 0) -| later else std.math.maxInt(u64);
     try ranks.gather(u64, ctx.d, &own.group.lib, own.group.comm, own.e.stream, p.rank, mine, rooms);
     var peer: ?Peer = null;
     for (rooms[1..], 1..) |r, q| if (peer == null or r < peer.?.bytes) {
@@ -317,6 +319,10 @@ fn finishRank(a: OpenArgs) !Loaded {
     // every rank loaded and agreed (cuda_ranks) before the first step; the digest names what they agreed on
     if (p.world > 1) try cuda.tp_watch.ready(io, own.e.checkpoint_digest);
     cuda.memory_receipt.emit(@intCast(p.rank), .load_end, false);
+    // TF_GLM_OVN_SHARED_ROWS moves nothing before the pool: this count is the same at 32 and 64 rows, and what the rows
+    // size is made at the first verify (cuda_engine_shared.ensure), never during the load
+    if (own.e.shared_made or own.e.bs != null or own.e.draw1 != null) return error.SharedMadeBeforePool;
+    std.log.info("glm: rank {d} holds {d} bytes at the load's end; the pool, then the shared windows ({d} bytes set aside)", .{ p.rank, cuda.usage(false).device, later });
     if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, frees what it owns, then leaves the process
         follow.follow(own.e, &own.link) catch |err| {
             std.log.err("rank {d}: following rank 0 stopped ({s})", .{ p.rank, @errorName(err) });
@@ -353,6 +359,7 @@ fn finishRank(a: OpenArgs) !Loaded {
         .rows = glm_lanes.max_rows,
         .stream_bytes = own.e.seqBytes() + extra, // each stream past the first makes its own sequence on every rank
         .free_streams = 1, // the first is the sequence the engine made
+        .later_bytes = later,
         .ctx = own,
         .deinit = close,
         .target = own.e,
