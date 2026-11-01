@@ -184,10 +184,6 @@ pub fn attend(k: Kernels, stream: cuda.Stream, l: Layer, c: Caches, s: Scratch, 
         if (set.onepass_pipe) |fp| {
             if (onepass.takesExact(set.prompt, c.ls, l.heads, l.lw, rows)) return onepass.runPipe(fp, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.ol, rows, l.heads, scale);
         }
-        // TF_GLM_OVN_ONEPASS_EXACT: the same shapes in one pass a row, bit-identical to the chunk programs and merge
-        if (set.onepass_exact) |fe| {
-            if (onepass.takesExact(set.prompt, c.ls, l.heads, l.lw, rows)) return onepass.runExact(fe, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.ol, rows, l.heads, scale);
-        }
         // TF_GLM_OVN_SPARSE_ONEPASS: prompt rows in one pass a row (production's kernel and bits), no partials or merge
         if (k.set.onepass) |f| {
             if (onepass.takes(set.prompt, c.ls, l.heads, l.lw)) return onepass.run(f, stream, v.qa, c.lc, c.ls, t, v.tokens, v.counts, sparse.width, v.ol, rows, l.heads, scale);

@@ -1,4 +1,4 @@
-//! TF_GLM_OVN_ONEPASS_EXACT accumulation-order reference (host, no GPU): three scalar fp32 models of one attention row.
+//! Onepass accumulation-order reference (host, no GPU): three scalar fp32 models of one attention row's softmax.
 
 const std = @import("std");
 
@@ -145,7 +145,7 @@ fn chunkOrder(row: Row) [lw]f32 {
     return out;
 }
 
-// TF_GLM_OVN_ONEPASS_EXACT: one pass a row, each chunk's partial folded into the running merge as it is produced.
+// The pipe's CHUNK switch: one pass a row, each chunk's partial folded into the running merge as it is produced.
 fn exactOrder(row: Row) [lw]f32 {
     const nch = nchunks(row.n);
     var run: Partial = .{};

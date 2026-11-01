@@ -39,11 +39,6 @@ pub fn wanted() bool {
     return cuda.ovn.on("SPARSE_ONEPASS");
 }
 
-/// TF_GLM_OVN_ONEPASS_EXACT, read at load: the bit-identical one-pass path (tf_glm_onepass_exact), default off.
-pub fn wantedExact() bool {
-    return cuda.ovn.on("ONEPASS_EXACT");
-}
-
 /// TF_GLM_OVN_ONEPASS_PIPE, read at load: the one-pass pipeline whose exact variant equals the fused kernel.
 pub fn wantedPipe() bool {
     return cuda.ovn.on("ONEPASS_PIPE");
@@ -116,16 +111,6 @@ pub fn run(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, scales: u
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = threads }, .shared = smem }, stream, &a);
 }
 
-/// The exact one-pass path (tf_glm_onepass_exact): glm_attn_ovn::chunks<32,true,true> in registers, one block a row.
-pub fn runExact(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: latent.Table, tokens: u64, counts: u64, w: usize, out: u64, rows: usize, heads: usize, scale: f32) !void {
-    if (rows == 0) return;
-    if (heads < min_heads or heads > max_heads) return error.OnepassHeads;
-    const nch: c_int = @intCast(latent.chunksFor(w));
-    var a: cuda.Args = .{};
-    inline for (.{ qa, cache, scales, tokens, counts, out, @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(w)), scale, t.pt, @as(i64, @intCast(t.ps)), nch }) |v| a.add(v);
-    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(rows), .y = 1 }, .block = .{ .x = 256 }, .shared = glue.chunksSmem(32) }, stream, &a);
-}
-
 /// A pipeline variant (tf_glm_onepass_pipe_*): the same arguments and launch as `run`, SmemPipe's shared size.
 pub fn runPipe(f: cuda.Function, stream: cuda.Stream, qa: u64, cache: u64, scales: u64, t: latent.Table, tokens: u64, counts: u64, w: usize, out: u64, rows: usize, heads: usize, scale: f32) !void {
     if (rows == 0) return;
@@ -146,14 +131,15 @@ test "onepass: prompt rows on an FP8 cache at TP=3's head counts only" {
     try std.testing.expectEqual(@as(u32, 100416), smem); // glm_onepass.cu's static_assert
 }
 
-test "onepass exact: the knob gates the path and the 32-head-block shapes take it" {
-    cuda.ovn.fake("ONEPASS_EXACT", null);
-    try std.testing.expect(!wantedExact());
-    cuda.ovn.fake("ONEPASS_EXACT", "0");
-    try std.testing.expect(!wantedExact());
-    cuda.ovn.fake("ONEPASS_EXACT", "1");
-    try std.testing.expect(wantedExact());
-    // the exact path takes the onepass shapes only where the default uses 32-head blocks (rows >= 5 at 17-24 heads)
+test "onepass pipe: the knob gates the pipeline and takesExact admits the 32-head-block shapes" {
+    cuda.ovn.fake("ONEPASS_PIPE", null);
+    try std.testing.expect(!wantedPipe());
+    cuda.ovn.fake("ONEPASS_PIPE", "0");
+    try std.testing.expect(!wantedPipe());
+    cuda.ovn.fake("ONEPASS_PIPE", "1");
+    try std.testing.expect(wantedPipe());
+    try std.testing.expectEqual(@as(u32, 100512), pipe_smem); // glm_onepass_pipe.cuh's SmemPipe static_assert
+    // the pipeline takes the onepass shapes only where the default uses 32-head blocks (rows >= 5 at 17-24 heads)
     try std.testing.expect(takesExact(true, 0x1000, 22, 512, 64)); // a prompt chunk
     try std.testing.expect(takesExact(true, 0x1000, 21, 512, 5)); // the five-row wide-block floor
     try std.testing.expect(!takesExact(true, 0x1000, 22, 512, 4)); // four rows: the default uses 16-head blocks
@@ -161,17 +147,5 @@ test "onepass exact: the knob gates the path and the 32-head-block shapes take i
     try std.testing.expect(!takesExact(true, 0, 22, 512, 64)); // a BF16 cache keeps the chunk programs
     try std.testing.expect(!takesExact(false, 0x1000, 22, 512, 64)); // decode windows too
     try std.testing.expect(!takesExact(true, 0x1000, 32, 512, 64)); // TP=2's 32 heads
-    cuda.ovn.fake("ONEPASS_EXACT", null);
-}
-
-test "onepass pipe: the knob gates the pipeline and its smem matches SmemPipe" {
-    cuda.ovn.fake("ONEPASS_PIPE", null);
-    try std.testing.expect(!wantedPipe());
-    cuda.ovn.fake("ONEPASS_PIPE", "1");
-    try std.testing.expect(wantedPipe());
-    try std.testing.expectEqual(@as(u32, 100512), pipe_smem); // glm_onepass_pipe.cuh's SmemPipe static_assert
-    // the pipeline takes the same 32-head-block shapes the exact path does, bit-identical to the chunk programs
-    try std.testing.expect(takesExact(true, 0x1000, 22, 512, 64));
-    try std.testing.expect(!takesExact(true, 0x1000, 22, 512, 4));
     cuda.ovn.fake("ONEPASS_PIPE", null);
 }

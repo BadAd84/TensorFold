@@ -6,7 +6,7 @@ const mm_mod = @import("cuda_mm.zig");
 const index_mod = @import("cuda_index.zig");
 
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
-pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{}, onepass: ?cuda.Function = null, onepass_exact: ?cuda.Function = null, onepass_pipe: ?cuda.Function = null };
+pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{}, onepass: ?cuda.Function = null, onepass_pipe: ?cuda.Function = null };
 
 /// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _LATENT_MMA, _SEG_PASS); the defaults launch today's.
 pub const Mla = struct {
@@ -112,8 +112,6 @@ pub const Kernels = struct {
     rmsnorm_1536_pdl: cuda.Function,
     rmsnorm_512_pdl: cuda.Function,
     rmsnorm_4096_f32w_pdl: cuda.Function,
-    // TF_GLM_OVN_ONEPASS_EXACT (glm_onepass_exact.cuh): the fused chunked path as a named prompt kernel, loaded always
-    onepass_exact: cuda.Function,
     // TF_GLM_OVN_* forms (glm_glue_attn_ovn.cuh, glm_glue_latent_ovn.cuh), launched only with their knob on
     chunks_16_skip: cuda.Function,
     chunks_32_skip: cuda.Function,
@@ -158,7 +156,6 @@ pub const Kernels = struct {
         try k.chunks_32.allowDynamicShared(chunksSmem(32));
         try k.chunks_16_fp8.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_fp8.allowDynamicShared(chunksSmem(32));
-        try k.onepass_exact.allowDynamicShared(chunksSmem(32));
         if (!ovn) return k;
         try k.chunks_16_skip.allowDynamicShared(chunksSmem(16));
         try k.chunks_32_skip.allowDynamicShared(chunksSmem(32));

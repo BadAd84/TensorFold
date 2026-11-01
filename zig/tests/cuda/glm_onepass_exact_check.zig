@@ -1,4 +1,4 @@
-//! glm-onepass-exact-check (GPU): tf_glm_onepass_exact == chunk programs + merge byte for byte; one-pass red control.
+//! glm-onepass-exact-check (GPU): tf_glm_onepass_pipe_exact == chunk programs + merge byte for byte; one-pass control.
 const std = @import("std");
 const cuda = @import("cuda");
 const check = @import("check.zig");
@@ -31,7 +31,7 @@ fn caches(r: *Rig, set: glue.Set) !Cache {
     return .{ .fp = fp, .scales = scales };
 }
 
-/// One case: exact and pipe-exact equal the default, pipe-off equals the production one-pass, which differs (control).
+/// One case: pipe-exact equals the default (chunks + merge), pipe-off equals the production one-pass, which differs.
 fn one(r: *Rig, ks: *const glue.Kernels, onepass_f: cuda.Function, pipe_off: cuda.Function, pipe_exact: cuda.Function, c: Cache, rows: usize, heads: usize) !usize {
     const counts = [_]i32{ 0, 1, 31, 32, 33, 511, 512, 513, 1024, 2048, 2051, 3 }; // chunk and tile edges, count 0
     const tok = try r.a.alloc(i32, rows * width);
@@ -50,16 +50,11 @@ fn one(r: *Rig, ks: *const glue.Kernels, onepass_f: cuda.Function, pipe_off: cud
     const out_def = try r.zeros(bytes);
     const part: latent.Partials = .{ .po = try r.zeros(nch * rows * heads * lw * 4), .pm = try r.zeros(nch * rows * heads * 4), .pl = try r.zeros(nch * rows * heads * 4) };
     try latent.sparseAttentionFormat(off, r.s, dq, c.fp, c.scales, .{}, dtok, dcnt, width, part, out_def, rows, heads, lw, scale);
-    const out_exact = try r.zeros(bytes);
-    try op.runExact(ks.onepass_exact, r.s, dq, c.fp, c.scales, .{}, dtok, dcnt, width, out_exact, rows, heads, scale);
     const out_op = try r.zeros(bytes);
     try op.run(onepass_f, r.s, dq, c.fp, c.scales, .{}, dtok, dcnt, width, out_op, rows, heads, scale);
     var name: [96]u8 = undefined;
     const want = try r.back(out_def, bytes);
     var fails: usize = 0;
-    check.sameBytes(try std.fmt.bufPrint(&name, "exact one-pass == chunk programs + merge, {d} rows {d} heads", .{ rows, heads }), try r.back(out_exact, bytes), want) catch {
-        fails += 1;
-    };
     const out_pipe = try r.zeros(bytes);
     try op.runPipe(pipe_exact, r.s, dq, c.fp, c.scales, .{}, dtok, dcnt, width, out_pipe, rows, heads, scale);
     check.sameBytes(try std.fmt.bufPrint(&name, "pipe exact == chunk programs + merge, {d} rows {d} heads", .{ rows, heads }), try r.back(out_pipe, bytes), want) catch {
@@ -102,5 +97,5 @@ pub fn run(gpu: check.Gpu) !void {
     // rows >= 5 at 17-24 heads: the default uses 32-head blocks (takesExact's shapes); one and four rows stay on chunks
     for ([_][2]usize{ .{ 5, 22 }, .{ 5, 21 }, .{ 16, 24 }, .{ 24, 17 }, .{ 70, 22 } }) |x| fails += try one(&r, &ks, opk.f, ppk.off, ppk.exact, c, x[0], x[1]);
     try check.expect(fails == 0, "glm-onepass-exact-check: {d} checks failed", .{fails});
-    check.pass("glm-onepass-exact-check: tf_glm_onepass_exact equals the chunk programs plus merge byte for byte; the existing one-pass differs", .{});
+    check.pass("glm-onepass-exact-check: pipe exact == chunk programs + merge byte for byte on {d} shapes; pipe off == the one-pass; the one-pass differs", .{5});
 }

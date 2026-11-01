@@ -10,7 +10,6 @@
 #include "glm_glue_bmm.cuh"
 #include "glm_glue_attn.cuh"
 #include "glm_glue_attn_ovn.cuh"
-#include "glm_onepass_exact.cuh"
 #include "glm_glue_attn_seg.cuh"
 #include "glm_glue_latent_ovn.cuh"
 #include "glm_glue_latent_mma.cuh"
