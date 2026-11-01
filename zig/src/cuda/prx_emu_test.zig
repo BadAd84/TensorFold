@@ -169,7 +169,7 @@ fn runWorld(o: Opts) !Outcome {
     }
     if (o.exit_ns > 0) while (exits.load(.acquire) < o.world and now() - t0 < 10 * std.time.ns_per_s) std.Thread.yield() catch {};
     out.exits = exits.load(.acquire);
-    // stopped first: a probe call posted to a live proxy would sit unsent while the bytes are checked, and its watch fire
+    // stopped first: a probe posted to a live proxy sits unsent while the bytes are checked, and its watch fires
     w.stop();
     stopped = true;
     for (w.nics[0..o.world]) |n| out.stall_ns = @max(out.stall_ns, n.gap.most); // read once the proxies stopped
