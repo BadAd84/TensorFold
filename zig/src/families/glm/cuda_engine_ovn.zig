@@ -20,6 +20,10 @@ pub fn open(e: *Engine, gpa: std.mem.Allocator, io: std.Io) !void {
     if (cuda.ovn.on("SHARED_PROF")) e.shared_prof = try @import("cuda_engine_prof.zig").Shared.create(gpa, e.d, io);
     // DRAW1 and SEG_DSA are sized by the shared rows: made after the page pool (cuda_engine_shared.ensure)
     if (e.mtp and cuda.ovn.on("SEG_KDA")) e.seg_kda = try @import("cuda_kda_seg.zig").SegKda.init(e.d, e.m.mods[0]);
+    if (cuda.ovn.on("KDA_PIECES")) { // a multi-prompt chunk's KDA chains in one launch (cuda_kda_pieces); e.bp's table
+        e.pieces_kda = try @import("cuda_kda_pieces.zig").PiecesKda.init(e.d, e.m.mods[0]);
+        e.bp.seg.pieces = &e.pieces_kda.?;
+    }
     if (e.mtp and cuda.ovn.on("SEG_COMMIT")) e.seg_commit = try @import("cuda_commit_seg.zig").SegCommit.init(e.d, e.m.mods[0], e.m.mods[6]);
 }
 
@@ -46,6 +50,11 @@ pub fn close(e: *Engine) void {
         x.deinit();
         e.seg_kda = null;
         if (e.bs) |*b| b.seg.kda = null;
+    }
+    if (e.pieces_kda) |*x| {
+        x.deinit();
+        e.pieces_kda = null;
+        e.bp.seg.pieces = null;
     }
     if (e.draw1) |*x| {
         x.deinit();

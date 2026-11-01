@@ -19,6 +19,7 @@ pub const index_shard = @import("cuda_index_shard.zig");
 pub const onepass = @import("cuda_onepass.zig");
 pub const moe = @import("cuda_moe.zig");
 pub const kda_block = @import("cuda_kda_block.zig");
+pub const kda_pieces = @import("cuda_kda_pieces.zig"); // TF_GLM_OVN_KDA_PIECES: a multi-prompt chunk's chains in one launch
 pub const dsa_block = @import("cuda_dsa_block.zig");
 pub const dsa_seg = @import("cuda_dsa_seg.zig");
 pub const mlp = @import("cuda_mlp.zig");
@@ -92,6 +93,7 @@ test {
     _ = onepass;
     _ = moe;
     _ = kda_block;
+    _ = kda_pieces;
     _ = dsa_block;
     _ = mlp;
     _ = shard;

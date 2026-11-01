@@ -91,6 +91,7 @@ pub const Engine = struct {
     seg_kda: ?@import("cuda_kda_seg.zig").SegKda = null, // TF_GLM_OVN_SEG_KDA: e.bs's segment table (cuda_engine_ovn)
     seg_commit: ?@import("cuda_commit_seg.zig").SegCommit = null, // TF_GLM_OVN_SEG_COMMIT: a round's commits at once
     seg_dsa: ?@import("cuda_dsa_seg.zig").SegDsa = null, // TF_GLM_OVN_SEG_DSA: e.bs's DSA segment table
+    pieces_kda: ?@import("cuda_kda_pieces.zig").PiecesKda = null, // TF_GLM_OVN_KDA_PIECES: e.bp's prompt-pieces table
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024 and prompt_rows rows
     slices: ?*prompt_slices.Slices = null, // TF_GLM_OVN_FILL_SLICE_MS: a prompt chunk's layer slices (cuda_engine_ovn)
     one: ?*@import("cuda_one_chunk.zig").Capture = null, // TF_GLM_OVN_ONE_CHUNK: marks kept from inside a chunk (read only on)

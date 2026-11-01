@@ -15,6 +15,9 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
     b.step("test-glm-shared-first-host", "TF_GLM_OVN_SHARED_FIRST's MoE order and paced prefetch through recorded launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_SHARED_FIRST"} })).step);
     b.step("test-glm-hc-host", "TF_GLM_OVN_HC_ROWS and _HC_DEC: the mixing kernels' choice, grid and args through recorded launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_HC_"} })).step);
+    const pieces_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_KDA_PIECES"} }));
+    b.step("test-glm-kda-pieces-host", "TF_GLM_OVN_KDA_PIECES: a multi-prompt chunk's pieces, when they batch into one launch and the table each builds").dependOn(&pieces_run.step);
+    step.dependOn(&pieces_run.step);
     const prx_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_PRX"} }));
     b.step("test-glm-prx-host", "TF_GLM_OVN_PRX's exchanges against relay's NCCL postings, its pick and its rank agreement").dependOn(&prx_run.step);
     step.dependOn(&prx_run.step);

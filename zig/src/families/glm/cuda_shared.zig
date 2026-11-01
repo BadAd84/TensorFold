@@ -28,6 +28,7 @@ pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
         g.st.prompt = r.b.prefill;
     }
     if (r.b.seg.kda) |x| if (!r.b.prefill) try x.fill(r.segs, stream);
+    if (r.b.seg.pieces) |x| if (r.b.prefill) try x.fillPrompt(r.segs, r.b.kda.saves, stream); // TF_GLM_OVN_KDA_PIECES
     if (r.b.seg.dsa) |x| if (!r.b.prefill) try x.fill(r.segs, stream); // TF_GLM_OVN_SEG_DSA
 }
 
@@ -51,7 +52,9 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             s.p = b.kproj;
             try kda_block.project(f.set(), f.stream, k, s, b.normed, c.hidden, rows);
             const seg = if (r.b.seg.kda) |x| (if (!b.prefill and x.segs == r.segs.len) x else null) else null;
+            const pieces = if (r.b.seg.pieces) |x| (if (b.prefill and x.segs == r.segs.len) x else null) else null; // TF_GLM_OVN_KDA_PIECES
             if (f.paced()) |p| try p.fork(f.stream, li + di, .o); // TF_GLM_OVN_L2PF_PACED: o into L2 while the chains run
+            if (pieces) |x| try x.chains(&f.m.kda, f.stream, k, s, li, rows); // the pieces' chains in one launch; the loop keeps each conv window
             for (r.segs) |g| {
                 const st = g.st;
                 const cur = st.cur[li];
@@ -63,7 +66,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 const conv = st.conv + li * 3 * st.conv_c * 2;
                 if (b.prefill) { // a whole prompt: its rows in place, the layer committed now (as Forward.mixer)
                     v.p = b.kproj + g.row0 * w * 2;
-                    try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false, kda_chunk.prompt(&f.m.chunked, st.pos));
+                    if (pieces == null) try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), false, kda_chunk.prompt(&f.m.chunked, st.pos));
                     try glue.convShift(f.set(), f.stream, conv, v.p, g.rows, g.rows * w, w, 1, 3 * n);
                     st.cur[li] = 1 - cur;
                     continue;
