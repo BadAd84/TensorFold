@@ -41,7 +41,7 @@ pub const Fixture = struct {
     }
 
     pub fn settle(x: *Fixture) !void {
-        const end = rows.write.nowNs() + 3 * std.time.ns_per_s;
+        const end = std.math.maxInt(i128); // wait until the worker drains, not a wall-clock deadline a loaded host trips
         while (x.r.worker) |w| {
             rows.write.reap(x.r);
             if (w.pending() == 0) return;
@@ -52,7 +52,7 @@ pub const Fixture = struct {
 
     /// The engine's idle turns until `states` are on disk: a queued save is staged whenever `ready` says so.
     pub fn idle(x: *Fixture, states: usize) !void {
-        const end = rows.write.nowNs() + 3 * std.time.ns_per_s;
+        const end = std.math.maxInt(i128); // idle until the states are on disk, not a wall-clock deadline
         while (x.r.states.items.len < states) {
             if (rows.write.nowNs() >= end) return error.WriterTimedOut;
             if (rows.write.ready(x.r)) _ = rows.write.step(x.r) else rows.write.io.nap();

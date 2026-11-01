@@ -56,6 +56,7 @@ pub const Nic = struct {
     halted: std.atomic.Value(bool) = .init(false),
     peer_freed: [plan.max_world]u64 = @splat(0), // each peer's calls its GPU freed (consumed words), as last read
     occupied_max: u64 = 0, // the most calls in a peer's slots at a write here, by the peer's own consumed words
+    gap: Gap = .{}, // the proxy's longest time between two polls: the host took its thread away that long
 
     /// At a write of `call` to rank `to`: calls in its slots not yet freed by its GPU (its consumed words, read now).
     fn occupy(n: *Nic, to: usize, call: u64) void {
@@ -83,6 +84,7 @@ pub const Nic = struct {
     }
     pub fn poll(n: *Nic, out: []proxy_mod.Done) !usize {
         n.polls += 1;
+        n.gap.tick();
         if (n.freeze_after) |f| if (n.polls >= f) while (!n.w.thawed.load(.acquire)) std.Thread.yield() catch {};
         var k: usize = 0;
         if (n.halted.load(.acquire) or n.polls % n.slow != 0) return 0;
@@ -112,6 +114,26 @@ pub const Nic = struct {
 
 pub const Proxy = proxy_mod.Proxy(Nic);
 
+fn clock() u64 {
+    return @intCast(std.Io.Clock.awake.now(std.testing.io).toNanoseconds());
+}
+
+/// A thread's longest time between two of its own steps: a wall-clock watch can see only the host's stalls there.
+pub const Gap = struct {
+    last: u64 = 0,
+    most: u64 = 0,
+
+    pub fn tick(g: *Gap) void {
+        const t = clock();
+        if (g.last != 0) g.most = @max(g.most, t - g.last);
+        g.last = t;
+    }
+    /// After an intended pause (a slow GPU's): the next step's gap counts from here.
+    pub fn restart(g: *Gap) void {
+        g.last = clock();
+    }
+};
+
 /// A stream's recorded GPU work, run later in order; `signal`/`await_`: events between one rank's streams.
 pub const Op = union(enum) { wait: [2]u64, write: [2]u64, stage: [3]u64, unstage: [3]u64, signal: usize, await_: usize };
 
@@ -124,6 +146,7 @@ pub const Stream = struct {
     hung: bool = false,
     hung_at: [3]u64 = @splat(0), // the wait that never passed: its offset, its value and the word's last value
     slot_waits: u64 = 0, // send_done waits that had to wait: a slot restaged before the NICs had read it out
+    gap: Gap = .{}, // this stream's thread: its longest time between two steps or spins (its pauses excluded)
 
     pub fn wait(s: *Stream, at: usize, v: u32) !void {
         try s.ops.append(s.gpa, .{ .wait = .{ at, v } });
@@ -154,6 +177,7 @@ pub const Stream = struct {
                 s.hung_at = .{ at, v, @atomicLoad(u32, w, .acquire) };
                 return false;
             }
+            s.gap.tick();
             std.Thread.yield() catch {};
         }
         return true;
@@ -162,6 +186,7 @@ pub const Stream = struct {
     pub fn execute(s: *Stream) void {
         const r = s.w.regions[s.rank];
         for (s.ops.items) |o| {
+            s.gap.tick();
             switch (o) {
                 .wait => |a| {
                     const w: *u32 = @ptrCast(@alignCast(r.ptr + a[0]));
@@ -183,11 +208,15 @@ pub const Stream = struct {
                             s.hung_at = .{ 1 << 40 | e, 0, 0 };
                             return;
                         }
+                        s.gap.tick();
                         std.Thread.yield() catch {};
                     }
                 },
             }
-            if (s.pause_ns > 0) std.Io.sleep(std.testing.io, .fromNanoseconds(s.pause_ns), .awake) catch {};
+            if (s.pause_ns > 0) {
+                std.Io.sleep(std.testing.io, .fromNanoseconds(s.pause_ns), .awake) catch {};
+                s.gap.restart();
+            }
         }
     }
 };

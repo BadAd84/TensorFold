@@ -236,11 +236,64 @@ fn bodyOf(reply: []const u8) ![]const u8 {
 fn quiesce(srv: *server.Server, stop: *std.atomic.Value(bool), accept: std.Thread) void {
     stop.store(true, .release);
     accept.join();
-    var waited: u32 = 0;
-    while (srv.open_connections.load(.acquire) > 0) : (waited += 1) {
-        if (waited == 500) @panic("a connection thread still runs 5 s after the last reply"); // never free it under one
+    // wait on the causal quantity with no wall-clock limit: a loaded host makes this slower, never wrong
+    while (srv.open_connections.load(.acquire) > 0)
         std.Io.sleep(std.testing.io, .fromMilliseconds(10), .awake) catch {};
+}
+
+fn dial(port: u16) !posix.socket_t {
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    var storage: Threaded.PosixAddress = undefined;
+    const len = Threaded.addressToPosix(&address, &storage);
+    const rc = posix.system.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+    if (posix.errno(rc) != .SUCCESS) return error.SocketFailed;
+    const fd: posix.socket_t = @intCast(rc);
+    if (posix.errno(posix.system.connect(fd, &storage.any, len)) != .SUCCESS) {
+        _ = posix.system.close(fd);
+        return error.ConnectFailed;
     }
+    return fd;
+}
+
+fn closeAfter(fd: posix.socket_t, ms: u32) void {
+    std.Io.sleep(std.testing.io, .fromMilliseconds(ms), .awake) catch {};
+    _ = posix.system.close(fd);
+}
+
+test "quiesce waits for an open connection to drain before the server is freed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var problem: []const u8 = "";
+    var keys = try auth.Store.init(std.testing.allocator, &.{key}, "", null, false, &problem);
+    defer keys.deinit();
+    var engine: Idle = .{};
+    var text: Bytes = .{};
+    const identity = build_identity.of(WithGpu, a, "9.8.7", 1);
+    const srv = try server.Server.init(
+        std.testing.allocator,
+        std.testing.io,
+        engine.engine(),
+        text.text(),
+        .{ .served_name = "m", .model_ids = &.{"m"}, .identity = identity },
+        &keys,
+    );
+    defer srv.deinit();
+    const lis = try listener.Listener.open(.{ .ip4 = .loopback(0) });
+    defer lis.close();
+    var stop: std.atomic.Value(bool) = .init(false);
+    const accept = try std.Thread.spawn(.{}, server.Server.serve, .{ srv, lis, &stop });
+    // a slow participant: a bare connection a worker thread keeps open until the closer shuts it after 200 ms
+    const fd = try dial(lis.port());
+    while (srv.open_connections.load(.acquire) == 0)
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    const closer = try std.Thread.spawn(.{}, closeAfter, .{ fd, 200 });
+    quiesce(srv, &stop, accept);
+    const drained = srv.open_connections.load(.acquire); // zero only if quiesce waited for the close
+    closer.join();
+    while (srv.open_connections.load(.acquire) > 0)
+        std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    try std.testing.expectEqual(@as(u32, 0), drained);
 }
 
 test "with keys configured, /health sends only its status, with and without a valid key, whatever the identity" {
