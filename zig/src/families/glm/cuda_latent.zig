@@ -13,6 +13,10 @@ pub const heads_tile_wide = 32;
 pub const prompt_rows = 64;
 pub const prompt_rb = 64;
 
+/// TF_GLM_OVN_LATENT_TILE: the tile kernels' strips a block (must equal glm_latent_tile::G) and rows a block.
+pub const prompt_tile_g = 4;
+pub const prompt_tile_rb = 128; // rows a tile block: bit-neutral, fewer weight reloads than prompt_rb
+
 /// latent.head_block: 32 heads a program in prompt chunks (each key read once) and, from five rows, when a rank
 /// carries 17-24 heads; 16 otherwise. The second rule is patch 0104: 0.3-0.5 ms a round at three Sparks' 22/21/21.
 pub fn headBlock(rows: usize, heads: usize) usize {
@@ -29,16 +33,41 @@ fn cdiv(a: usize, b: usize) u32 {
     return @intCast((a + b - 1) / b);
 }
 
+/// Which kernel an absorb / expand launch picks, decided on the host so routing and precedence are unit-testable.
+pub const Latent = enum { mma, mma8, kvb8, tile, vec, base };
+
+/// absorbQ's choice: LATENT_MMA first (today's precedence), then KVB8, then LATENT_TILE (prompt, aligned), then VEC.
+fn absorbPick(set: glue.Set, sk: u64, q: u64, wk: u64) Latent {
+    if (set.prompt and set.mla.mma) return if (sk != 0) .mma8 else .mma;
+    if (sk != 0) return .kvb8;
+    if (set.prompt and set.mla.tile and q % 16 == 0 and wk % 16 == 0) return .tile;
+    if (set.mla.vec and wk % 16 == 0) return .vec;
+    return .base;
+}
+
+/// expandV's choice, the same precedence; VEC and TILE both need o_lat and wv on 16 bytes.
+fn expandPick(set: glue.Set, sv: u64, ol: u64, wv: u64) Latent {
+    if (set.prompt and set.mla.mma) return if (sv != 0) .mma8 else .mma;
+    if (sv != 0) return .kvb8;
+    if (set.prompt and set.mla.tile and ol % 16 == 0 and wv % 16 == 0) return .tile;
+    if (set.mla.vec and wv % 16 == 0 and ol % 16 == 0) return .vec;
+    return .base;
+}
+
 /// latent.absorb_q: out [rows][heads][lw] bf16 = q [rows][heads][d] . wk [heads][d][lw], fp32 sums; sk: E4M3 kv_b's.
 pub fn absorbQ(set: glue.Set, stream: cuda.Stream, q: u64, wk: u64, sk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
     if (d != 256 or lw != 512) return error.LatentShape;
-    if (set.prompt and set.mla.mma) return mmaBlocks(if (sk != 0) set.glue.absorb_mma8 else set.glue.absorb_mma, stream, q, wk, sk, out, rows, heads, lw);
-    if (sk != 0) { // TF_GLM_OVN_KVB8: wk E4M3 [heads][d][lw], sk fp32 [heads][d][lw / 128]
-        if (wk % 8 != 0) return error.LatentShape;
-        return rowBlocks(set.glue.absorb_q8, stream, .{ q, wk, sk, out }, rows, heads, lw / 32);
+    switch (absorbPick(set, sk, q, wk)) {
+        .mma => return mmaBlocks(set.glue.absorb_mma, stream, q, wk, 0, out, rows, heads, lw),
+        .mma8 => return mmaBlocks(set.glue.absorb_mma8, stream, q, wk, sk, out, rows, heads, lw),
+        .kvb8 => { // TF_GLM_OVN_KVB8: wk E4M3 [heads][d][lw], sk fp32 [heads][d][lw / 128]
+            if (wk % 8 != 0) return error.LatentShape;
+            return rowBlocks(set.glue.absorb_q8, stream, .{ q, wk, sk, out }, rows, heads, lw / 32);
+        },
+        .tile => return tileBlocks(set.glue.absorb_tile, stream, .{ q, wk, out }, rows, heads, lw / 32),
+        .vec => return rowBlocks(set.glue.absorb_q_vec, stream, .{ q, wk, out }, rows, heads, lw / 32),
+        .base => return rowBlocks(set.glue.absorb_q, stream, .{ q, wk, out }, rows, heads, lw / 32),
     }
-    const f = if (set.mla.vec and wk % 16 == 0) set.glue.absorb_q_vec else set.glue.absorb_q; // TF_GLM_OVN_ABSORB_VEC
-    try rowBlocks(f, stream, .{ q, wk, out }, rows, heads, lw / 32);
 }
 
 /// The absorb and expand launches (pointers, then rows, heads, rb): rows in one block in decode, prompt_rb in prompts.
@@ -48,6 +77,15 @@ fn rowBlocks(f: cuda.Function, stream: cuda.Stream, ptrs: anytype, rows: usize, 
     inline for (ptrs) |v| a.add(@as(u64, v));
     inline for (.{ @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(rb)) }) |v| a.add(v);
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(heads), .y = @intCast(cols), .z = cdiv(rows, rb) }, .block = .{ .x = 128 } }, stream, &a);
+}
+
+/// A tile launch (absorb_tile / expand_tile, or a check control): G strips a block, prompt_tile_rb rows.
+pub fn tileBlocks(f: cuda.Function, stream: cuda.Stream, ptrs: anytype, rows: usize, heads: usize, cols: usize) !void {
+    const rb = if (rows >= prompt_rows) prompt_tile_rb else rows;
+    var a: cuda.Args = .{};
+    inline for (ptrs) |v| a.add(@as(u64, v));
+    inline for (.{ @as(i64, @intCast(rows)), @as(i64, @intCast(heads)), @as(i64, @intCast(rb)) }) |v| a.add(v);
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(heads), .y = cdiv(cols, prompt_tile_g), .z = cdiv(rows, rb) }, .block = .{ .x = 128 * prompt_tile_g } }, stream, &a);
 }
 
 /// latent.MMA_TILE's rows and columns: a block's 64 prompt rows by 128 output columns of one head.
@@ -70,13 +108,17 @@ fn mmaBlocks(f: cuda.Function, stream: cuda.Stream, x: u64, w: u64, s: u64, out:
 /// latent.expand_v: out [rows][heads][dv] bf16 = o_lat [rows][heads][lw] . wv [heads][dv][lw]; sv: E4M3 kv_b's.
 pub fn expandV(set: glue.Set, stream: cuda.Stream, ol: u64, wv: u64, sv: u64, out: u64, rows: usize, heads: usize, dv: usize, lw: usize) !void {
     if (dv != 256 or lw != 512) return error.LatentShape;
-    if (set.prompt and set.mla.mma) return mmaBlocks(if (sv != 0) set.glue.expand_mma8 else set.glue.expand_mma, stream, ol, wv, sv, out, rows, heads, dv);
-    if (sv != 0) { // TF_GLM_OVN_KVB8: wv E4M3 [heads][dv][lw], sv fp32 [heads][dv][lw / 128]
-        if (wv % 8 != 0) return error.LatentShape;
-        return rowBlocks(set.glue.expand_v8, stream, .{ ol, wv, sv, out }, rows, heads, dv / 16);
+    switch (expandPick(set, sv, ol, wv)) {
+        .mma => return mmaBlocks(set.glue.expand_mma, stream, ol, wv, 0, out, rows, heads, dv),
+        .mma8 => return mmaBlocks(set.glue.expand_mma8, stream, ol, wv, sv, out, rows, heads, dv),
+        .kvb8 => { // TF_GLM_OVN_KVB8: wv E4M3 [heads][dv][lw], sv fp32 [heads][dv][lw / 128]
+            if (wv % 8 != 0) return error.LatentShape;
+            return rowBlocks(set.glue.expand_v8, stream, .{ ol, wv, sv, out }, rows, heads, dv / 16);
+        },
+        .tile => return tileBlocks(set.glue.expand_tile, stream, .{ ol, wv, out }, rows, heads, dv / 16),
+        .vec => return rowBlocks(set.glue.expand_v_vec, stream, .{ ol, wv, out }, rows, heads, dv / 16),
+        .base => return rowBlocks(set.glue.expand_v, stream, .{ ol, wv, out }, rows, heads, dv / 16),
     }
-    const vec = set.mla.vec and wv % 16 == 0 and ol % 16 == 0; // TF_GLM_OVN_ABSORB_VEC: kv_b and o by 16-byte loads
-    try rowBlocks(if (vec) set.glue.expand_v_vec else set.glue.expand_v, stream, .{ ol, wv, out }, rows, heads, dv / 16);
 }
 
 /// A latent cache holds BF16 rows, or E4M3 rows followed by one FP32 scale per row.
@@ -238,4 +280,48 @@ test "latent.py's tiling rules" {
     try std.testing.expectEqual(@as(usize, 16), headBlock(4, 22)); // below five rows it stays narrow
     try std.testing.expectEqual(@as(usize, 3), chunksFor(1025));
     try std.testing.expectEqual(@as(usize, 1), chunksFor(512));
+}
+
+test "TF_GLM_OVN_LATENT_TILE knob parsing" {
+    const ovn = cuda.ovn;
+    inline for (.{ "MLA_FUSEMERGE", "ABSORB_VEC", "LATENT_MMA", "SEG_PASS", "KVB8", "DECODE_SHARD", "PK8", "LATENT_TILE" }) |k| ovn.fake(k, null);
+    try std.testing.expect(!(try glue.Mla.read()).tile);
+    try std.testing.expect(!glue.Mla.wanted());
+    ovn.fake("LATENT_TILE", "1");
+    try std.testing.expect((try glue.Mla.read()).tile);
+    try std.testing.expect(glue.Mla.wanted());
+    ovn.fake("LATENT_TILE", "0"); // "0" reads as off, like every knob
+    try std.testing.expect(!(try glue.Mla.read()).tile);
+    ovn.fake("LATENT_TILE", null); // leave the cache unset for later tests
+}
+
+test "TF_GLM_OVN_LATENT_TILE routing and precedence" {
+    const Set = glue.Set;
+    const a16: u64 = 16; // a 16-byte-aligned pointer; absorbPick / expandPick never read set.glue
+    const a8: u64 = 8; // not 16-byte aligned
+    const tile = Set{ .glue = undefined, .prompt = true, .mla = .{ .tile = true } };
+    try std.testing.expectEqual(Latent.tile, absorbPick(tile, 0, a16, a16)); // prompt + aligned: the tile replaces base
+    try std.testing.expectEqual(Latent.tile, expandPick(tile, 0, a16, a16));
+    const tv = Set{ .glue = undefined, .prompt = true, .mla = .{ .tile = true, .vec = true } };
+    try std.testing.expectEqual(Latent.tile, absorbPick(tv, 0, a16, a16)); // the tile replaces the vec path too
+    try std.testing.expectEqual(Latent.tile, expandPick(tv, 0, a16, a16));
+    const dec = Set{ .glue = undefined, .prompt = false, .mla = .{ .tile = true } };
+    try std.testing.expectEqual(Latent.base, absorbPick(dec, 0, a16, a16)); // decode: today's path stands
+    try std.testing.expectEqual(Latent.base, expandPick(dec, 0, a16, a16));
+    try std.testing.expectEqual(Latent.base, absorbPick(tile, 0, a8, a16)); // q not aligned: the tile declines
+    try std.testing.expectEqual(Latent.base, absorbPick(tile, 0, a16, a8)); // wk not aligned
+    try std.testing.expectEqual(Latent.base, expandPick(tile, 0, a8, a16)); // o_lat not aligned
+    try std.testing.expectEqual(Latent.base, expandPick(tile, 0, a16, a8)); // wv not aligned
+    try std.testing.expectEqual(Latent.vec, absorbPick(tv, 0, a8, a16)); // declined tile, vec still takes aligned wk
+    const ev = Set{ .glue = undefined, .prompt = true, .mla = .{ .vec = true } };
+    try std.testing.expectEqual(Latent.vec, absorbPick(ev, 0, a16, a16)); // vec alone: aligned wk
+    try std.testing.expectEqual(Latent.vec, expandPick(ev, 0, a16, a16)); // vec alone: aligned o_lat and wv
+    const both = Set{ .glue = undefined, .prompt = true, .mla = .{ .tile = true, .mma = true } };
+    try std.testing.expectEqual(Latent.mma, absorbPick(both, 0, a16, a16)); // LATENT_MMA keeps today's precedence
+    try std.testing.expectEqual(Latent.mma, expandPick(both, 0, a16, a16));
+    try std.testing.expectEqual(Latent.kvb8, absorbPick(tile, a16, a16, a16)); // E4M3 kv_b: the bf16 tile declines
+    try std.testing.expectEqual(Latent.kvb8, expandPick(tile, a16, a16, a16));
+    const off = Set{ .glue = undefined, .prompt = true };
+    try std.testing.expectEqual(Latent.base, absorbPick(off, 0, a16, a16)); // knob off: nothing changes
+    try std.testing.expectEqual(Latent.base, expandPick(off, 0, a16, a16));
 }

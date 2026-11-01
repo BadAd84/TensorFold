@@ -1,3 +1,6 @@
+# Harness scratch for this worktree (lean baselines, mutant backups): never committed.
+work/
+
 __pycache__/
 *.py[cod]
 *.egg-info/

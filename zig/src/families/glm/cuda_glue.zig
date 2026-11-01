@@ -8,24 +8,25 @@ const index_mod = @import("cuda_index.zig");
 /// What the forward's kernels launch from: our glue's, glm_mm's when tiled, qlinear's lane for FP8 kinds, copy_rows.
 pub const Set = struct { glue: *const Kernels, index: ?*const index_mod.Kernels = null, mm: ?*const mm_mod.Kernels = null, packs: ?*const mm_mod.Packed = null, prompt: bool = false, linear: cuda.qlinear.Linear = .{}, copy_rows: ?cuda.Function = null, pdl_early: bool = false, mla: Mla = .{}, onepass: ?cuda.Function = null, onepass_pipe: ?cuda.Function = null };
 
-/// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _LATENT_MMA, _SEG_PASS); the defaults launch today's.
+/// The MLA launch choices (TF_GLM_OVN_MLA_FUSEMERGE, _ABSORB_VEC, _LATENT_MMA, _LATENT_TILE, _SEG_PASS).
 pub const Mla = struct {
     fuse_rows: usize = 0, // attention launches of this many rows or more, 32-head blocks: chunks and merge in one
     skip: bool = false, // chunk launches stop at the chunk's last live key tile
     vec: bool = false, // absorb_q and expand_v read bf16 kv_b by 16-byte loads
     mma: bool = false, // a prompt buffer's absorb and expand on the tensor cores (latent.py's PROMPT_MMA, a trade)
+    tile: bool = false, // prompt absorb_q and expand_v register-tiled: today's bytes, q / o reused across strips
     seg: bool = false, // decode chunk launches on glm_glue_attn_seg.cuh's warp-specialised pass (same partials)
 
     /// MLA_FUSEMERGE: unset or 0 off; 1 fuses from latent.prompt_rows rows (prompt chunks); N > 1 from N rows.
     pub fn read() error{BadOvnKnob}!Mla {
         const fuse: usize = @intCast(try cuda.ovn.int("MLA_FUSEMERGE", 0));
-        return .{ .fuse_rows = if (fuse == 1) @import("cuda_latent.zig").prompt_rows else fuse, .skip = fuse != 0, .vec = cuda.ovn.on("ABSORB_VEC"), .mma = cuda.ovn.on("LATENT_MMA"), .seg = cuda.ovn.on("SEG_PASS") };
+        return .{ .fuse_rows = if (fuse == 1) @import("cuda_latent.zig").prompt_rows else fuse, .skip = fuse != 0, .vec = cuda.ovn.on("ABSORB_VEC"), .mma = cuda.ovn.on("LATENT_MMA"), .tile = cuda.ovn.on("LATENT_TILE"), .seg = cuda.ovn.on("SEG_PASS") };
     }
 
     /// Whether a TF_GLM_OVN knob whose kernels sit in glm_glue is set (MLA_FUSEMERGE, ABSORB_VEC, KVB8, DECODE_SHARD,
-    /// LATENT_MMA, PK8, SEG_PASS).
+    /// LATENT_MMA, LATENT_TILE, PK8, SEG_PASS).
     pub fn wanted() bool {
-        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD") or cuda.ovn.on("LATENT_MMA") or cuda.ovn.on("PK8") or cuda.ovn.on("SEG_PASS");
+        return cuda.ovn.on("MLA_FUSEMERGE") or cuda.ovn.on("ABSORB_VEC") or cuda.ovn.on("KVB8") or cuda.ovn.on("DECODE_SHARD") or cuda.ovn.on("LATENT_MMA") or cuda.ovn.on("LATENT_TILE") or cuda.ovn.on("PK8") or cuda.ovn.on("SEG_PASS");
     }
 };
 
@@ -123,6 +124,11 @@ pub const Kernels = struct {
     expand_v_vec: cuda.Function,
     absorb_q8: cuda.Function,
     expand_v8: cuda.Function,
+    // TF_GLM_OVN_LATENT_TILE (glm_glue_latent_tile.cuh): prompt absorb / expand, q / o reused across four strips
+    absorb_tile: cuda.Function,
+    expand_tile: cuda.Function,
+    absorb_tile_red: cuda.Function, // glm-latent-tile-check controls: a reversed butterfly, so the bytes must differ
+    expand_tile_red: cuda.Function,
     index_shard_pick: cuda.Function, // TF_GLM_OVN_DECODE_SHARD (glm_glue_shard.cuh): a rank's share, then the merge
     index_shard_merge: cuda.Function,
     absorb_mma: cuda.Function, // TF_GLM_OVN_LATENT_MMA (glm_glue_latent_mma.cuh): prompt rows on the tensor cores
