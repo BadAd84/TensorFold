@@ -18,6 +18,9 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const router_warm_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_ROUTER_WARM"} }));
     b.step("test-glm-router-warm-host", "TF_GLM_OVN_ROUTER_WARM: the row classes, the knob, the layer pick and the router warm launches").dependOn(&router_warm_run.step);
     step.dependOn(&router_warm_run.step);
+    const pieces_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_KDA_PIECES"} }));
+    b.step("test-glm-kda-pieces-host", "TF_GLM_OVN_KDA_PIECES: a multi-prompt chunk's pieces, when they batch into one launch and the table each builds").dependOn(&pieces_run.step);
+    step.dependOn(&pieces_run.step);
     const prx_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_PRX"} }));
     b.step("test-glm-prx-host", "TF_GLM_OVN_PRX's exchanges against relay's NCCL postings, its pick and its rank agreement").dependOn(&prx_run.step);
     step.dependOn(&prx_run.step);

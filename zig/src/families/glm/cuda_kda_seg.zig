@@ -11,8 +11,8 @@ const window_rows = @import("cuda_state.zig").window_rows;
 /// The most segments a table holds (Engine.max_shared).
 const max_segs = 16;
 
-/// glm_kda.cu's KdaSeg: a segment's rows, its conv window, states and saved rows at layer 0.
-const Seg = extern struct { row0: i64, rows: i64, cs: u64, state_in: u64, state_out: u64, k: u64, v: u64, g: u64, b: u64 };
+/// glm_kda.cu's KdaSeg: a segment's rows, conv window, states and saved rows at layer 0 (also cuda_kda_pieces.zig).
+pub const Seg = extern struct { row0: i64, rows: i64, cs: u64, state_in: u64, state_out: u64, k: u64, v: u64, g: u64, b: u64 };
 
 pub const SegKda = struct {
     prep: cuda.Function,

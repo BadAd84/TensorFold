@@ -321,7 +321,6 @@ const usage =
     \\  glm-loader-gate <ckpt>   every rank's uploads at TP 1, 2 and 3 against the checkpoint cut on the host, byte for byte
     \\  glm-fp8g-shares          block-FP8 TP shares packed as GLM's loader packs them, on the lane, against FP64 of the cut
     \\  aot-fallback <dir>        a launch's 1 from the runtime-parameter variant: the folded variant's bits (#1003)
-    \\
 ;
 
 pub fn main(init: std.process.Init) !u8 {
@@ -450,6 +449,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-index-check")) return glm_index_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-draw1")) return glm_draw1_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-kda-seg")) return glm_kda_seg_check.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-kda-pieces")) return @import("glm_kda_pieces_check.zig").run(gpu);
     if (std.mem.eql(u8, cmd, "glm-dsa-seg")) return glm_dsa_seg_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mla-ovn-check")) return glm_mla_ovn_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-seg-pass")) return glm_seg_pass_check.run(gpu);

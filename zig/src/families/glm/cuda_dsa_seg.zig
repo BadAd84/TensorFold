@@ -15,8 +15,8 @@ const window_rows = state.window_rows;
 /// The most segments a table holds (Engine.max_shared).
 pub const max_segs = 16;
 
-/// Buffers.seg: a shared window's segment tables (TF_GLM_OVN_SEG_KDA, _SEG_DSA), the engine's; null when off.
-pub const Tables = struct { kda: ?*@import("cuda_kda_seg.zig").SegKda = null, dsa: ?*SegDsa = null };
+/// Buffers.seg: a shared window's segment tables (TF_GLM_OVN_SEG_KDA, _SEG_DSA, _KDA_PIECES), the engine's; null off.
+pub const Tables = struct { kda: ?*@import("cuda_kda_seg.zig").SegKda = null, dsa: ?*SegDsa = null, pieces: ?*@import("cuda_kda_pieces.zig").PiecesKda = null };
 
 /// glm_seg_table.cuh's Seg: rows, device position, dense chunks, pool bucket, score blocks, first score.
 const Seg = extern struct { row0: i64, rows: i64, pos: u64, nch: i64, np: i64, nb: i64, soff: i64, pad: i64 = 0 };
