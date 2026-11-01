@@ -9,8 +9,7 @@ pub fn clock(io: std.Io) std.Io.Clock {
     return if (r.nanoseconds > 0 and r.nanoseconds <= std.time.ns_per_us) .cpu_thread else .awake;
 }
 
-/// On Windows the thread CPU clock is a coarse 15 ms tick, so the measure is the thread's exact CPU cycle
-/// count instead (immune to other work on the machine); elsewhere the fine thread CPU clock is already used.
+/// On Windows the thread CPU clock is a coarse tick, so measure exact CPU cycles instead (immune to machine load).
 pub const cycles = builtin.os.tag == .windows;
 
 const win = if (cycles) struct {

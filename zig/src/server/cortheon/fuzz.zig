@@ -354,8 +354,7 @@ const shapes = blk: {
     break :blk out;
 };
 
-/// 8x the bytes in near 8x the time, not 64x: within 24x. Exact CPU cycles need only the ratio; wall time
-/// also passes a run quick enough that a scheduler tick, not the work, decided it.
+/// 8x the bytes in near 8x the time, not 64x: within 24x for exact cycles, or a tick decided it for wall time.
 fn linear(ns: [2]u64) bool {
     if (linear_time.cycles) return ns[1] <= 24 * ns[0];
     return ns[1] <= 20 * std.time.ns_per_ms or ns[1] <= 24 * ns[0];
