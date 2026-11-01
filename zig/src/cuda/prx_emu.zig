@@ -97,7 +97,7 @@ pub const Nic = struct {
             const refused = n.dead or n.w.nics[wr.to_rank].halted.load(.acquire); // or its queue pair is in error
             const bad = refused or (n.fail_call != null and wr.id & 0xf == 1 and wr.id >> 11 == n.fail_call.? and i == 0);
             if (!refused) {
-                if (wr.flag_at != null and wr.id & 0xf == 1) n.occupy(wr.to_rank, wr.id >> 11); // a call's write (kind_send)
+                if (wr.flag_at != null and wr.id & 0xf == 1) n.occupy(wr.to_rank, wr.id >> 11); // a call's write
                 const dst = n.w.regions[wr.to_rank];
                 if (wr.n > 0) @memcpy(dst[wr.to .. wr.to + wr.n], n.w.regions[n.rank][wr.from .. wr.from + wr.n]);
                 @atomicStore(u32, @as(*u32, @ptrCast(@alignCast(dst.ptr + (wr.flag_at orelse wr.to)))), wr.value, .release);
