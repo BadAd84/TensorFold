@@ -24,6 +24,8 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const prx_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_PRX"} }));
     b.step("test-glm-prx-host", "TF_GLM_OVN_PRX's exchanges against relay's NCCL postings, its pick and its rank agreement").dependOn(&prx_run.step);
     step.dependOn(&prx_run.step);
+    // the full glm module test (line below) runs these under test-cuda-host; this named step is the mutant harness's
+    b.step("test-multifill-host", "TF_GLM_OVN_MULTI_FILL grouping, cap, fallback and piece descriptors without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"multifill"} })).step);
     // TF_GLM_INDEX_CUDA: the launch rules, and (its own slower step) glm_index_*.cuh as host C++ against plain models
     const index_run = b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM index:"} }));
     b.step("test-glm-index-host", "GLM's prompt indexer launch rules without devices").dependOn(&index_run.step);

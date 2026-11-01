@@ -147,3 +147,29 @@ test "a pass's pieces cross the wire whole: resumed ids past 32 bits, marks, a p
     const bad = [_]Piece{.{ .slot = 1, .start = 2, .rows = 3, .len = 9, .part = ids[2..5] }}; // part one id short
     try std.testing.expect(!fits(&bad, 1 << 16));
 }
+
+test "multifill fits: per-piece descriptors - rows, bounds, part length, resume row, distinct slots, capacity" {
+    const cap = 1 << 16;
+    const ids = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    // a resumed piece: start 3, four rows, its ids from 3 plus the one lookahead; a kept state at its start row
+    try std.testing.expect(fits(&.{.{ .slot = 0, .start = 3, .rows = 4, .len = 8, .part = ids[3..8], .from = .{ .id = 9, .at = 3 } }}, cap));
+    // a piece that ends its prompt carries no lookahead id (part.len == rows)
+    try std.testing.expect(fits(&.{.{ .slot = 0, .start = 4, .rows = 4, .len = 8, .part = ids[4..8] }}, cap));
+    // rows == 0 is rejected
+    try std.testing.expect(!fits(&.{.{ .slot = 0, .start = 0, .rows = 0, .len = 8, .part = ids[0..1] }}, cap));
+    // start + rows past the prompt is rejected
+    try std.testing.expect(!fits(&.{.{ .slot = 0, .start = 6, .rows = 4, .len = 8, .part = ids[6..8] }}, cap));
+    // the part must be exactly the rows plus the one lookahead id (here one short)
+    try std.testing.expect(!fits(&.{.{ .slot = 0, .start = 0, .rows = 4, .len = 8, .part = ids[0..4] }}, cap));
+    // a resume row must equal the piece's start, and never be 0 (position 0 is a fresh prompt, not a resume)
+    try std.testing.expect(!fits(&.{.{ .slot = 0, .start = 3, .rows = 4, .len = 8, .part = ids[3..8], .from = .{ .id = 9, .at = 2 } }}, cap));
+    try std.testing.expect(!fits(&.{.{ .slot = 0, .start = 0, .rows = 4, .len = 8, .part = ids[0..5], .from = .{ .id = 9, .at = 0 } }}, cap));
+    // two pieces may not share a stream slot
+    const two = [_]Piece{
+        .{ .slot = 1, .start = 0, .rows = 2, .len = 8, .part = ids[0..3] },
+        .{ .slot = 1, .start = 0, .rows = 2, .len = 8, .part = ids[0..3] },
+    };
+    try std.testing.expect(!fits(&two, cap));
+    // a prompt whose kept state plus a decode window would not fit the capacity is rejected
+    try std.testing.expect(!fits(&.{.{ .slot = 0, .start = 0, .rows = 4, .len = 8, .part = ids[0..5] }}, 8 + fw.window_rows));
+}

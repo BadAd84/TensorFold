@@ -42,6 +42,7 @@ pub const open_owner = @import("cuda_open_owner.zig");
 pub const images = @import("cuda_images.zig");
 pub const follow = @import("cuda_follow.zig");
 pub const lanes = @import("cuda_lanes.zig");
+pub const prompt_pieces = @import("cuda_prompt_pieces.zig"); // TF_GLM_OVN_MULTI_FILL: a batched resumed prompt pass
 pub const reply_prefill = @import("cuda_reply_prefill.zig");
 pub const native = @import("cuda_native.zig");
 pub const snapshots = @import("cuda_snapshots.zig");
