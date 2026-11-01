@@ -5,13 +5,13 @@
 //!
 //! Upstream's lanes core already carries a copy proposer (`lanes.proposer.SuffixLookup`, a 3-gram index with a
 //! silence rule) and the family hook for one (`LaneHost.proposers`, as deepseek_v41's priced lookup uses). GLM's
-//! three rules differ from it, so this family brings its own behind the same `Proposer` interface:
+//! four rules differ from it, so this family brings its own behind the same `Proposer` interface:
 //! - which occurrence: the latest one with `k` tokens after it, else the earliest (not the longest match);
 //! - an occurrence that starts inside the reply must match `reply_match` tokens (COPY_CODE: 16), not `match` (8):
 //!   code replies repeat short boilerplate whose continuations differ;
-//! - a window of 9 to 15 rows is padded to the CUDA-graph width (16) by repeating its last draft, when the room
-//!   allows. Upstream's GLM family has no CUDA-graph replay (the graphs knob was not ported), so the pad is off
-//!   unless TF_GLM_COPY_PAD asks for it.
+//! - a window of 9 to 15 rows is padded to the CUDA-graph width (16) by repeating its last draft, when room allows
+//!   (TF_GLM_COPY_PAD; off by default, the GLM family runs no CUDA-graph replay so the pad is off unless asked);
+//! - TF_GLM_OVN_COPY_AGREE (off): the occurrence agreeing furthest back past the match, capped when agreement is weak.
 //! There is no silence, and a copy of one token is a copy (the lanes core wants two): the proposer is `priced`,
 //! so the round loop takes its drafts as given.
 const std = @import("std");
@@ -21,12 +21,17 @@ const lanes = @import("lanes");
 /// The most drafts a round: a 16-row window (the GLM family's max_rows - 1).
 pub const max_drafts = 15;
 
+const agree_hits = 64; // TF_GLM_OVN_COPY_AGREE L=1: the latest this many occurrences with room are compared (AGREE_HITS)
+
 pub const Settings = struct {
     on: bool = true, // TF_GLM_COPY_DRAFTS (production: 1)
     match: usize = 8, // TF_GLM_COPY_MATCH
     most: usize = max_drafts, // TF_GLM_COPY_MAX (production: 15; Python's own default is 5)
     reply_match: usize = 16, // TF_GLM_COPY_REPLY_MATCH (production COPY_CODE=1: 16; 0: the prompt's rule everywhere)
     pad: usize = 0, // TF_GLM_COPY_PAD (the old graph width, 16; 0: no padding, upstream's family runs no graphs)
+    agree: usize = 0, // TF_GLM_OVN_COPY_AGREE LO: agreement tokens past the match trusted (0: off, today's choice)
+    agree_most: usize = 0, // K: a proposal agreeing for under LO tokens proposes at most this many drafts
+    agree_longest: bool = true, // L: propose the occurrence agreeing furthest back (0: keep the baseline occurrence)
 
     /// The production settings, from the TF_GLM_COPY_* variables.
     pub fn fromEnv() !Settings {
@@ -47,6 +52,18 @@ pub const Settings = struct {
             std.log.err("TF_GLM_COPY_REPLY_MATCH is 0 (off) or more than TF_GLM_COPY_MATCH ({d}), not {d}", .{ s.match, s.reply_match });
             return error.BadCopySettings;
         }
+        if (std.c.getenv("TF_GLM_OVN_COPY_AGREE")) |v| {
+            const t = std.mem.trim(u8, std.mem.span(v), " ");
+            const a = parseAgreeSpec(t, s.most) catch {
+                std.log.err("TF_GLM_OVN_COPY_AGREE is 0 (off) or LO:K[:L], LO 1 to 64, K 1 to TF_GLM_COPY_MAX, L 0 or 1, not {s}", .{t});
+                return error.BadCopySettings;
+            };
+            if (a) |spec| {
+                s.agree = spec.lo;
+                s.agree_most = spec.k;
+                s.agree_longest = spec.longest;
+            }
+        }
         return s;
     }
 
@@ -60,6 +77,31 @@ pub const Settings = struct {
             return error.BadCopySettings;
         }
         return n;
+    }
+
+    const AgreeSpec = struct { lo: usize, k: usize, longest: bool };
+
+    /// Parse a trimmed TF_GLM_OVN_COPY_AGREE value: null when off ("" or "0"), else LO:K[:L] (copy_drafts.py:77-85).
+    fn parseAgreeSpec(t: []const u8, most: usize) !?AgreeSpec {
+        if (t.len == 0 or std.mem.eql(u8, t, "0")) return null;
+        var it = std.mem.splitScalar(u8, t, ':');
+        const lo = decimalPart(it.next()) orelse return error.BadCopySettings;
+        const k = decimalPart(it.next()) orelse return error.BadCopySettings;
+        var longest = true;
+        if (it.next()) |l| {
+            if (std.mem.eql(u8, l, "0")) longest = false else if (!std.mem.eql(u8, l, "1")) return error.BadCopySettings;
+        }
+        if (it.next() != null) return error.BadCopySettings; // LO:K[:L] is two or three fields, no more
+        if (lo < 1 or lo > 64 or k < 1 or k > most) return error.BadCopySettings;
+        return .{ .lo = lo, .k = k, .longest = longest };
+    }
+
+    /// A non-empty run of ASCII digits as a usize (Python's str.isdecimal), else null: no sign, separator or empty.
+    fn decimalPart(part: ?[]const u8) ?usize {
+        const t = part orelse return null;
+        if (t.len == 0) return null;
+        for (t) |c| if (c < '0' or c > '9') return null;
+        return std.fmt.parseInt(usize, t, 10) catch null;
     }
 
     /// Whether `ctx[i .. i + match]` is an earlier occurrence of the context's last `match` tokens (`prompt` leading
@@ -76,23 +118,68 @@ pub const Settings = struct {
         return true;
     }
 
+    /// Whether TF_GLM_OVN_COPY_AGREE is active: the agreement rule acts only with a cap set (copy_drafts.py:125).
+    fn agreeOn(s: Settings) bool {
+        return s.agree != 0 and s.agree_most != 0;
+    }
+
+    /// Tokens before `start` equal to those before the matched suffix, back from the match up to `agree` (py:135-151).
+    fn agreement(s: Settings, ctx: []const u32, start: usize, len: usize) usize {
+        const n = s.match;
+        var got: usize = 0;
+        var j: usize = 1;
+        while (j <= s.agree) : (j += 1) {
+            if (len < n + j or start < j) break;
+            if (ctx[start - j] != ctx[len - n - j]) break;
+            got += 1;
+        }
+        return got;
+    }
+
+    /// The occurrence to copy from and the draft cap when `agree` is on (copy_drafts.py:169-175).
+    fn agreeChoose(s: Settings, ctx: []const u32, prompt: usize, last: u32, k: *usize, baseline: usize, has_room: bool, len: usize) usize {
+        const n = s.match;
+        var start = baseline;
+        var best_ag = s.agreement(ctx, baseline, len);
+        if (s.agree_longest and has_room) {
+            // the latest agree_hits occurrences with room: the one agreeing furthest back, ties the latest
+            var count: usize = 1; // the baseline is the latest occurrence with room
+            var i = baseline;
+            while (count < agree_hits and i > 0) {
+                i -= 1;
+                if (ctx[i + n - 1] == last and s.occurs(ctx, prompt, i)) {
+                    count += 1;
+                    const ag = s.agreement(ctx, i, len);
+                    if (ag > best_ag) { // strictly greater, so a tie keeps the later occurrence
+                        best_ag = ag;
+                        start = i;
+                    }
+                }
+            }
+        }
+        if (best_ag < s.agree) k.* = @min(k.*, s.agree_most);
+        return start;
+    }
+
     /// CopyDrafts.propose: up to `min(most, room)` drafts, what followed the latest earlier occurrence that has that many
     /// tokens after it, else the most after any occurrence (the earliest); none when the suffix never occurred before. A
     /// window of more than `graphed` (8) rows short of the `pad` width is filled up to it by repeating the last draft,
     /// when `room` allows. `ctx` is the prompt, the reply so far and the pending token; the result lives in `buf`.
     pub fn propose(s: Settings, ctx: []const u32, prompt: usize, room: usize, buf: *[max_drafts]u32) []const u32 {
-        const k = @min(s.most, room);
+        var k = @min(s.most, room);
         const n = s.match;
         const len = ctx.len;
         if (!s.on or k < 1 or len <= n) return buf[0..0];
         const last = ctx[len - 1];
         var found: ?usize = null;
+        var has_room = false; // the latest start found has k tokens after its match (production's full.size > 0)
         if (len >= n + k) { // the latest start with k tokens after its match
             var i = len - n - k + 1;
             while (i > 0) {
                 i -= 1;
                 if (ctx[i + n - 1] == last and s.occurs(ctx, prompt, i)) {
                     found = i;
+                    has_room = true;
                     break;
                 }
             }
@@ -106,7 +193,9 @@ pub const Settings = struct {
                 }
             }
         }
-        const at = (found orelse return buf[0..0]) + n;
+        var start = found orelse return buf[0..0];
+        if (s.agreeOn()) start = s.agreeChoose(ctx, prompt, last, &k, start, has_room, len);
+        const at = start + n;
         const count = @min(k, len - at);
         @memcpy(buf[0..count], ctx[at..][0..count]);
         const rows = 1 + count;
@@ -279,4 +368,108 @@ test "the proposer rejoins the history and the pending token into one context" {
     const none = try p.proposer().proposeAfter(&.{ 5, 6, 7, 8 }, &.{9}, 10);
     try std.testing.expectEqual(@as(usize, 0), none.len);
     try std.testing.expectEqual(@as(i64, 0), p.matched);
+}
+
+// Shared agree vector: (1 2) occurs at 3 (preceded by 7 8 9, agrees 3 back) and 9 (preceded by 40, agrees 0 back).
+const agree_ctx = [_]u32{ 7, 8, 9, 1, 2, 30, 31, 32, 40, 1, 2, 33, 34, 7, 8, 9, 1, 2 };
+
+test "TF_GLM_OVN_COPY_AGREE off reproduces today's choice exactly" {
+    var buf: [max_drafts]u32 = undefined;
+    const off: Settings = .{ .match = 2, .most = 5, .reply_match = 0 };
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34, 7, 8, 9 }, off.propose(&agree_ctx, 0, 32, &buf));
+    // agree 0 is off even with a cap set: the baseline (latest, start 9) is kept whole
+    const lo_zero: Settings = .{ .match = 2, .most = 5, .reply_match = 0, .agree = 0, .agree_most = 7, .agree_longest = true };
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34, 7, 8, 9 }, lo_zero.propose(&agree_ctx, 0, 32, &buf));
+    // a zero cap is also off (copy_drafts.py:125 gates agree on agree_most): no re-choice, no cap
+    const cap_zero: Settings = .{ .match = 2, .most = 5, .reply_match = 0, .agree = 3, .agree_most = 0, .agree_longest = true };
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34, 7, 8, 9 }, cap_zero.propose(&agree_ctx, 0, 32, &buf));
+}
+
+test "TF_GLM_OVN_COPY_AGREE proposes the occurrence agreeing furthest back" {
+    var buf: [max_drafts]u32 = undefined;
+    const off: Settings = .{ .match = 2, .most = 5, .reply_match = 0 };
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34, 7, 8, 9 }, off.propose(&agree_ctx, 0, 32, &buf)); // latest, start 9
+    // lo 3: start 3 agrees 3 (>= lo), so it is chosen and left uncapped; its drafts are 30 31 32 40 1
+    const on: Settings = .{ .match = 2, .most = 5, .reply_match = 0, .agree = 3, .agree_most = 3, .agree_longest = true };
+    try std.testing.expectEqualSlices(u32, &.{ 30, 31, 32, 40, 1 }, on.propose(&agree_ctx, 0, 32, &buf));
+    // room 2 keeps the furthest-back choice (start 3) and trims the draft to the round's room
+    try std.testing.expectEqualSlices(u32, &.{ 30, 31 }, on.propose(&agree_ctx, 0, 2, &buf));
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34 }, off.propose(&agree_ctx, 0, 2, &buf));
+}
+
+test "TF_GLM_OVN_COPY_AGREE caps a weakly agreeing occurrence" {
+    var buf: [max_drafts]u32 = undefined;
+    // L=0 keeps the baseline occurrence (start 9, agrees 0 < 3) but caps its draft at agree_most 2
+    const l0: Settings = .{ .match = 2, .most = 5, .reply_match = 0, .agree = 3, .agree_most = 2, .agree_longest = false };
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34 }, l0.propose(&agree_ctx, 0, 32, &buf));
+    // longest among two weak occurrences (both under lo 5): start 3 wins and is still capped at 2
+    const weak: Settings = .{ .match = 2, .most = 5, .reply_match = 0, .agree = 5, .agree_most = 2, .agree_longest = true };
+    try std.testing.expectEqualSlices(u32, &.{ 30, 31 }, weak.propose(&agree_ctx, 0, 32, &buf));
+}
+
+test "TF_GLM_OVN_COPY_AGREE breaks agreement ties in favour of the latest" {
+    var buf: [max_drafts]u32 = undefined;
+    // (1 2) occurs at 2 and 8, each preceded by 9 (agreement 1); the tie goes to the later occurrence (start 8)
+    const tie = [_]u32{ 9, 1, 2, 70, 71, 72, 73, 9, 1, 2, 80, 81, 9, 1, 2 };
+    const on: Settings = .{ .match = 2, .most = 3, .reply_match = 0, .agree = 1, .agree_most = 1, .agree_longest = true };
+    try std.testing.expectEqualSlices(u32, &.{ 80, 81, 9 }, on.propose(&tie, 0, 32, &buf));
+}
+
+test "TF_GLM_OVN_COPY_AGREE reproduces production's 16:7 longest choice" {
+    var ctx: [130]u32 = undefined;
+    var i: usize = 0;
+    var x: u32 = 50;
+    while (x < 100) : (x += 1) { // deep lead-in 50..99 (matches the final suffix's lead-in, so it agrees 50 back)
+        ctx[i] = x;
+        i += 1;
+    }
+    x = 100;
+    while (x < 108) : (x += 1) { // the deep occurrence of the 8-token match 100..107
+        ctx[i] = x;
+        i += 1;
+    }
+    for ([_]u32{ 777, 778, 779, 900, 901 }) |t| {
+        ctx[i] = t;
+        i += 1;
+    }
+    x = 100;
+    while (x < 108) : (x += 1) { // the near occurrence of the match, preceded by 901 (agrees 0 back)
+        ctx[i] = x;
+        i += 1;
+    }
+    ctx[i] = 888;
+    i += 1;
+    x = 50;
+    while (x < 100) : (x += 1) { // the final suffix's lead-in 50..99
+        ctx[i] = x;
+        i += 1;
+    }
+    x = 100;
+    while (x < 108) : (x += 1) { // the final suffix 100..107 (the query)
+        ctx[i] = x;
+        i += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 130), i);
+    var buf: [max_drafts]u32 = undefined;
+    const off: Settings = .{ .match = 8, .most = 15, .reply_match = 16 };
+    const on: Settings = .{ .match = 8, .most = 15, .reply_match = 16, .agree = 16, .agree_most = 7, .agree_longest = true };
+    // off takes the latest occurrence (start 63); on takes the deep one (start 50, agreeing 16 or more back)
+    try std.testing.expectEqualSlices(u32, &.{ 888, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63 }, off.propose(&ctx, 130, 64, &buf));
+    try std.testing.expectEqualSlices(u32, &.{ 777, 778, 779, 900, 901, 100, 101, 102, 103, 104, 105, 106, 107, 888, 50 }, on.propose(&ctx, 130, 64, &buf));
+}
+
+test "TF_GLM_OVN_COPY_AGREE parsing matches production" {
+    try std.testing.expect((try Settings.parseAgreeSpec("", 15)) == null);
+    try std.testing.expect((try Settings.parseAgreeSpec("0", 15)) == null);
+    // the production specs from test_copy_agree.py
+    try std.testing.expectEqual(Settings.AgreeSpec{ .lo = 16, .k = 7, .longest = true }, (try Settings.parseAgreeSpec("16:7", 15)).?);
+    try std.testing.expectEqual(Settings.AgreeSpec{ .lo = 16, .k = 7, .longest = false }, (try Settings.parseAgreeSpec("16:7:0", 15)).?);
+    try std.testing.expectEqual(Settings.AgreeSpec{ .lo = 24, .k = 7, .longest = true }, (try Settings.parseAgreeSpec("24:7", 15)).?);
+    try std.testing.expectEqual(Settings.AgreeSpec{ .lo = 4, .k = 3, .longest = true }, (try Settings.parseAgreeSpec("4:3", 15)).?);
+    try std.testing.expectEqual(Settings.AgreeSpec{ .lo = 64, .k = 15, .longest = true }, (try Settings.parseAgreeSpec("64:15", 15)).?);
+    try std.testing.expectEqual(Settings.AgreeSpec{ .lo = 16, .k = 1, .longest = true }, (try Settings.parseAgreeSpec("16:1", 15)).?);
+    // the production refusals (len, decimal, LO, K and L bounds)
+    for ([_][]const u8{ "16", "0:7", "65:7", "16:0", "16:16", "16:7:2", "a:b", "16:7:1:1", "-1:3", "00", "16:7:" }) |bad| {
+        try std.testing.expectError(error.BadCopySettings, Settings.parseAgreeSpec(bad, 15));
+    }
 }
