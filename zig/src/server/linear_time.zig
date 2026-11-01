@@ -1,5 +1,7 @@
 //! Timing for linear-time tests: two sizes run in turn on the thread's CPU clock, each keeping its fastest run.
 const std = @import("std");
+const builtin = @import("builtin");
+const windows = std.os.windows;
 
 /// The thread's CPU clock where it counts to the microsecond, so other work on the machine adds nothing; else awake.
 pub fn clock(io: std.Io) std.Io.Clock {
@@ -7,11 +9,33 @@ pub fn clock(io: std.Io) std.Io.Clock {
     return if (r.nanoseconds > 0 and r.nanoseconds <= std.time.ns_per_us) .cpu_thread else .awake;
 }
 
+/// On Windows the thread CPU clock is a coarse 15 ms tick, so the measure is the thread's exact CPU cycle
+/// count instead (immune to other work on the machine); elsewhere the fine thread CPU clock is already used.
+pub const cycles = builtin.os.tag == .windows;
+
+const win = if (cycles) struct {
+    extern "kernel32" fn GetCurrentThread() callconv(.winapi) windows.HANDLE;
+    extern "kernel32" fn QueryThreadCycleTime(thread: windows.HANDLE, out: *u64) callconv(.winapi) windows.BOOL;
+    fn now() u64 {
+        var out: u64 = 0;
+        _ = QueryThreadCycleTime(GetCurrentThread(), &out);
+        return out;
+    }
+} else struct {};
+
 /// The fastest of `rounds` runs each of `run(ctx, 0)` and `run(ctx, 1)`, taken in turn so load slows both alike.
 pub fn fastest(rounds: usize, ctx: anytype, comptime run: fn (@TypeOf(ctx), usize) anyerror!void) ![2]u64 {
+    var ns: [2]u64 = @splat(std.math.maxInt(u64));
+    if (cycles) {
+        for (0..rounds) |_| for (&ns, 0..) |*best, i| {
+            const start = win.now();
+            try run(ctx, i);
+            best.* = @min(best.*, win.now() - start);
+        };
+        return ns;
+    }
     const io = std.testing.io;
     const c = clock(io);
-    var ns: [2]u64 = @splat(std.math.maxInt(u64));
     for (0..rounds) |_| for (&ns, 0..) |*best, i| {
         const start = c.now(io);
         try run(ctx, i);

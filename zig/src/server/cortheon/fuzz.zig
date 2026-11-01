@@ -354,14 +354,17 @@ const shapes = blk: {
     break :blk out;
 };
 
-/// 8x the bytes in near 8x the time, not 64x: within 24x, or quick enough that a scheduler tick decides it.
+/// 8x the bytes in near 8x the time, not 64x: within 24x. Exact CPU cycles need only the ratio; wall time
+/// also passes a run quick enough that a scheduler tick, not the work, decided it.
 fn linear(ns: [2]u64) bool {
+    if (linear_time.cycles) return ns[1] <= 24 * ns[0];
     return ns[1] <= 20 * std.time.ns_per_ms or ns[1] <= 24 * ns[0];
 }
 
 test "cortheon fuzz: every reader takes linear time on long inputs" {
     const small: usize = if (builtin.mode == .debug) 16 << 10 else 128 << 10;
-    const ms = std.time.ns_per_ms;
+    const div: u64 = if (linear_time.cycles) 1_000_000 else std.time.ns_per_ms;
+    const unit = if (linear_time.cycles) "Mcyc" else "ms";
     var slow: usize = 0;
     for (shapes) |shape| {
         const pages = [2][]u8{ try longPage(shape[0], shape[1], small), try longPage(shape[0], shape[1], 8 * small) };
@@ -372,8 +375,8 @@ test "cortheon fuzz: every reader takes linear time on long inputs" {
             // a load spike (wall clock where the CPU clock is coarse) slows a run or two; a quadratic reader every run
             if (!linear(ns)) ns = try linear_time.fastest(9, &t, Timed.run);
             if (linear(ns)) continue;
-            const what = "\nfuzz: {s} took {d} ms on {d} KiB and {d} ms on {d} KiB of \"";
-            std.debug.print(what, .{ r.name, ns[0] / ms, small >> 10, ns[1] / ms, (8 * small) >> 10 });
+            const what = "\nfuzz: {s} took {d} {s} on {d} KiB and {d} {s} on {d} KiB of \"";
+            std.debug.print(what, .{ r.name, ns[0] / div, unit, small >> 10, ns[1] / div, unit, (8 * small) >> 10 });
             show(shape[0]);
             show(shape[1][0..@min(shape[1].len, 120)]);
             std.debug.print("\" repeated\n", .{});
