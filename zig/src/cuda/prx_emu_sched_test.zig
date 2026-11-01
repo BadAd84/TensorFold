@@ -19,11 +19,14 @@ const Opts = struct {
     sites: usize = 4, // two layers' mixer and ffn sites
     chunks: usize = 2,
     own_later: bool = false, // TF_GLM_OVN_PEER_FIRST's own rows, copied into the block when the glue takes the call
+    slow_side_ns: u64 = 0, // rank 1's side stream this long after every operation (its frees of copied calls late)
+    slow_glue_ns: u64 = 0, // rank 1's main stream likewise (pieced: the glue, so its frees of ZC calls late)
 
     pub fn adjust(_: *const Opts, _: usize, _: *emu.Proxy, _: *emu.Nic) void {}
 };
 
-pub const Stats = struct { bad_bytes: usize = 0, hung: bool = false, in_use_max: u64 = 0, credit_stalls: u64 = 0, slot_waits: u64 = 0, zc_calls: usize = 0 };
+/// occupied_max: by the receivers' own consumed words (the bound); in_use_max, credit_stalls: by the credit words.
+pub const Stats = struct { bad_bytes: usize = 0, hung: bool = false, occupied_max: u64 = 0, in_use_max: u64 = 0, credit_stalls: u64 = 0, slot_waits: u64 = 0, zc_calls: usize = 0 };
 
 /// One exchange's buffers on one rank: what it sends each peer (or its own rows) and where each rank's lands.
 const Bufs = struct { src: [plan.max_world][]u8, dst: [plan.max_world][]u8 };
@@ -48,8 +51,8 @@ fn run(o: Opts) !Stats {
     var side: [world]emu.Stream = undefined;
     var calls: [world]usize = @splat(0);
     for (0..world) |r| {
-        main[r] = .{ .gpa = a, .w = w, .rank = r };
-        side[r] = .{ .gpa = a, .w = w, .rank = r };
+        main[r] = .{ .gpa = a, .w = w, .rank = r, .pause_ns = if (r == 1) o.slow_glue_ns else 0 };
+        side[r] = .{ .gpa = a, .w = w, .rank = r, .pause_ns = if (r == 1) o.slow_side_ns else 0 };
         bufs[r] = try a.alloc(Bufs, n_ex);
     }
     // every rank's host, alike, in cuda_forward_pieces' order (pieced) or cuda_forward_pair's (pair)
@@ -95,6 +98,7 @@ fn run(o: Opts) !Stats {
         out.hung = out.hung or side[r].hung or main[r].hung;
         out.slot_waits += side[r].slot_waits + main[r].slot_waits;
         out.in_use_max = @max(out.in_use_max, w.proxies[r].in_use_max);
+        out.occupied_max = @max(out.occupied_max, w.nics[r].occupied_max);
         out.credit_stalls += w.proxies[r].credit_stalls;
         out.zc_calls += calls[r];
     }
@@ -167,14 +171,28 @@ test "PRX schedule: pieced and paired chunks, copied and read in place, every by
     _ = try expectExact(.{ .mode = .pieced, .zc = true, .slots = 4, .own_later = true });
 }
 
+// Stream order bounds it: R frees call c - 1 before readying c; S sends c + 1 only once R's flag of call c arrived.
 test "PRX schedule: the slots in use at once (pair: two, pieced read in place: pieces + 1), measured at eight" {
     for ([_]Mode{ .pieced, .pair }) |m| for ([_]bool{ false, true }) |zc| {
         const most = try expectExact(.{ .mode = m, .zc = zc, .slots = 8 });
         const two = try expectExact(.{ .mode = m, .zc = zc, .slots = 2 });
         const four = try expectExact(.{ .mode = m, .zc = zc, .slots = 4 });
-        std.debug.print("PRX schedule {t} zc {}: at most {d} calls in a peer's slots (8 slots); credit stalls at 2 slots {d}, at 4 {d}; slot waits at 2 {d}, at 4 {d}\n", .{ m, zc, most.in_use_max, two.credit_stalls, four.credit_stalls, two.slot_waits, four.slot_waits });
+        // the credit words lag the peers' frees, so a loaded host inflates their view: printed, never asserted
+        std.debug.print("PRX schedule {t} zc {}: at most {d} calls in a peer's slots (8 slots; {d} by the credit words); credit stalls at 2 slots {d}, at 4 {d}; slot waits at 2 {d}, at 4 {d}\n", .{ m, zc, most.occupied_max, most.in_use_max, two.credit_stalls, four.credit_stalls, two.slot_waits, four.slot_waits });
+        // pieced ZC: the glue frees a piece's call (zcDone) before its glued rows, so a site's pieces wait too
         const bound: u64 = if (zc and m == .pieced) 3 + 1 else 2;
-        try std.testing.expect(most.in_use_max <= bound);
-        if (bound <= 4) try std.testing.expectEqual(@as(u64, 0), four.credit_stalls);
+        try std.testing.expect(most.occupied_max >= 1 and most.occupied_max <= bound);
+        try std.testing.expect(four.occupied_max <= @min(bound, 4)); // four slots: never more than the schedule needs
+        try std.testing.expect(two.occupied_max <= 2); // the credit check holds a call back when two are held
     };
+}
+
+test "PRX schedule: a rank that frees late changes nothing: the bound holds, and two slots hold two by the credit" {
+    // copied calls freed late by rank 1's side stream: its peers still send c + 1 only after its flag of call c
+    const late = try expectExact(.{ .mode = .pieced, .zc = false, .slots = 8, .slow_side_ns = 2 * std.time.ns_per_ms });
+    try std.testing.expect(late.occupied_max >= 1 and late.occupied_max <= 2);
+    // ZC calls freed late by rank 1's glue: four would wait, so two slots hold a peer's next call until the credit
+    const held = try expectExact(.{ .mode = .pieced, .zc = true, .slots = 2, .slow_glue_ns = 5 * std.time.ns_per_ms });
+    std.debug.print("PRX schedule late frees: {d} calls in a peer's slots (8 slots, copied); {d} (2 slots, ZC), {d} credit stalls\n", .{ late.occupied_max, held.occupied_max, held.credit_stalls });
+    try std.testing.expect(held.occupied_max >= 1 and held.occupied_max <= 2);
 }
