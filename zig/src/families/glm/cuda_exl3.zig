@@ -70,7 +70,7 @@ fn ovnKnobs() !cuda.exl3_experts.Ovn {
     const nc = cuda.ovn.text("X3_NC") orelse "0";
     const eql = std.mem.eql;
     const loads: cuda.exl3_experts.Ovn.Loads = if (eql(u8, nc, "0")) .off else if (eql(u8, nc, "1")) .nc1 else if (eql(u8, nc, "2")) .nc2 else if (eql(u8, nc, "w")) .word else return error.BadOvnKnob;
-    return .{ .loads = loads, .fuse_down = cuda.ovn.on("X3_FUSEDOWN"), .xrow = cuda.ovn.on("X3_XROW") };
+    return .{ .loads = loads, .fuse_down = cuda.ovn.on("X3_FUSEDOWN"), .xrow = cuda.ovn.on("X3_XROW"), .items = cuda.ovn.on("ITEMS") };
 }
 
 /// TF_GLM_OVN_X3_ROTEXPERT (a numerics trade): rank r holds share (r - e mod world) mod world of expert e, the
@@ -191,6 +191,10 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, share: 
     out.k2 = try L.put("layers.{d}.moe.exl3.k2", .{i});
     out.ovn = try ovnKnobs();
     out.rot = rot;
+    if (out.ovn.items and rot.on()) { // the item plan's grouped kernels have no per-expert share (rotexpert) path
+        std.log.err("TF_GLM_OVN_ITEMS with TF_GLM_OVN_X3_ROTEXPERT: unsupported together", .{});
+        return error.BadOvnKnob;
+    }
     return out;
 }
 
@@ -257,7 +261,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     while (at < rows) : (at += chunk_rows) {
         const n: usize = @min(chunk_rows, rows - at);
         if (!prompt and (w.ovn.any() or w.rot.on())) { // TF_GLM_OVN_X3_ROTEXPERT runs only the variants' kernels
-            try decodeOvn(k, stream, l, w.ovn, sc.picks, arena, cap, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, ey + at * slots * dims * 4);
+            try decodeOvn(k, stream, l, w.ovn, sc.picks, arena, cap, x + at * x_stride * 2, x_stride, picks + at * slots * 4, n, ey + at * slots * dims * 4, &ek.router, plan_buf);
             continue;
         }
         try copyRows(stream, sc.picks, top_k * 4, picks + at * slots * 4, slots * 4, top_k * 4, n, "EXL3 compact route rows");
@@ -277,19 +281,26 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
 }
 
 /// A decode window's routed experts through the TF_GLM_OVN_X3_* variants: ey's routed slot rows get the same bytes.
-fn decodeOvn(k: *const Kernels, stream: cuda.Stream, l: common.Layer, o: common.Ovn, compact: u64, arena: u64, cap: usize, x: u64, x_stride: usize, picks: u64, n: usize, ey: u64) !void {
+fn decodeOvn(k: *const Kernels, stream: cuda.Stream, l: common.Layer, o: common.Ovn, compact: u64, arena: u64, cap: usize, x: u64, x_stride: usize, picks: u64, n: usize, ey: u64, router: *const cuda.grouped.Router, plan: cuda.grouped.Plan) !void {
     const slots = top_k + 1;
     const d = l.dims;
+    // TF_GLM_OVN_ITEMS: route the 9-slot picks and run the grouped kernels on items; the 9-slot layout (no y)
+    // fits the arena the plain 8-slot path was sized for, and the down epilogue writes ey's slot rows in place.
+    if (o.items) {
+        if ((try common.fusedBytes(l, cap, slots)) > (try common.scratchBytes(l, cap, top_k))) return error.TileNotBuilt;
+        const scratch = try common.fusedScratch(arena, l, cap, slots);
+        return k.runWith(stream, l, x, x_stride, .bf16, picks, 0, n, 0, scratch, o, ey, .{ .router = router, .plan = plan });
+    }
     // the fused layout (slots 9, no y) fits inside the plain one this arena was sized for
     if (o.fuse_down and common.fusable(l) and (try common.fusedBytes(l, cap, slots)) <= (try common.scratchBytes(l, cap, top_k))) {
         const scratch = try common.fusedScratch(arena, l, cap, slots);
-        return k.runWith(stream, l, x, x_stride, .bf16, picks, 0, n, 0, scratch, o, ey);
+        return k.runWith(stream, l, x, x_stride, .bf16, picks, 0, n, 0, scratch, o, ey, null);
     }
     var plain = o;
     plain.fuse_down = false;
     try copyRows(stream, compact, top_k * 4, picks, slots * 4, top_k * 4, n, "EXL3 compact route rows");
     const scratch = try common.scratch(arena, l, cap, top_k);
-    try k.runWith(stream, l, x, x_stride, .bf16, compact, 0, n, 0, scratch, plain, 0);
+    try k.runWith(stream, l, x, x_stride, .bf16, compact, 0, n, 0, scratch, plain, 0, null);
     try copyRows(stream, ey, slots * d * 4, scratch.y, top_k * d * 4, top_k * d * 4, n, "EXL3 routed output slots");
 }
 
@@ -377,4 +388,25 @@ test "an expert's share of a trellis and of its scales is the plain loader's byt
     host.clearRetainingCapacity();
     try scaleShare(gpa, &host, src[0..512], cut, cut.len()); // off: no padding
     try t.expectEqualSlices(u8, src[256..512], host.items);
+}
+
+test "TF_GLM_OVN_ITEMS: off by default, and on it reaches the experts Ovn options" {
+    cuda.ovn.fake("ITEMS", null);
+    try std.testing.expect(!(try ovnKnobs()).items);
+    cuda.ovn.fake("ITEMS", "1");
+    try std.testing.expect((try ovnKnobs()).items);
+    cuda.ovn.fake("ITEMS", null); // leave it unset for any later test that reads the knob
+}
+
+test "TF_GLM_OVN_ITEMS: the decode plan sized for the largest shared window covers every smaller window" {
+    const slots = top_k + 1; // 9 (top-8 plus the shared expert)
+    const n_exp = 288; // GLM-5.3-Flash's routed experts; the shared id is `n_exp`, so the plan counts n_exp + 1
+    const cap = 64; // the largest shared decode window
+    // cuda_state sizes the plan members as rows * slots and the items as maxItems(rows * slots, n_exp + 1, 16)
+    const members_cap = cap * slots;
+    const items_cap = cuda.grouped.maxItems(cap * slots, n_exp + 1, 16);
+    for (1..cap + 1) |rows| {
+        try std.testing.expect(rows * slots <= members_cap);
+        try std.testing.expect(cuda.grouped.maxItems(rows * slots, n_exp + 1, 16) <= items_cap);
+    }
 }

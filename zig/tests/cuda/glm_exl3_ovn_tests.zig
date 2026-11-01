@@ -60,17 +60,21 @@ fn commonLayer(w: glm.exl3.Experts, n: usize) ex.Layer {
     return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = E, .dims = D, .width = n, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx, .gate_base = w.gb, .up_base = w.ub, .down_base = w.db };
 }
 
-/// Each row's 8 distinct routed picks, then the shared expert's id.
-fn picks(r: *Rig, rows: usize) ![]i32 {
+/// Each row's 8 distinct routed picks (lockstep: every row the same picks), then the shared expert's id.
+fn picks(r: *Rig, rows: usize, lockstep: bool) ![]i32 {
     const out = try r.a.alloc(i32, rows * slots);
+    var first: [top]i32 = undefined; // row 0's routed picks, reused every row under lockstep
     for (0..rows) |row| {
-        var seen: [E]bool = @splat(false);
-        for (0..slots - 1) |j| {
-            var e = r.rng.uintLessThan(usize, E);
-            while (seen[e]) e = r.rng.uintLessThan(usize, E);
-            seen[e] = true;
-            out[row * slots + j] = @intCast(e);
+        if (row == 0 or !lockstep) {
+            var seen: [E]bool = @splat(false);
+            for (0..top) |j| {
+                var e = r.rng.uintLessThan(usize, E);
+                while (seen[e]) e = r.rng.uintLessThan(usize, E);
+                seen[e] = true;
+                first[j] = @intCast(e);
+            }
         }
+        for (0..top) |j| out[row * slots + j] = first[j];
         out[row * slots + slots - 1] = E;
     }
     return out;
@@ -78,12 +82,12 @@ fn picks(r: *Rig, rows: usize) ![]i32 {
 
 /// The family's decode dispatch with `w.ovn`: ey [rows][slots][D] fp32 bytes, the shared slot left as the canary.
 fn decode(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, w: glm.exl3.Experts, n: usize, x: []const u16, pk: []const i32, rows: usize) ![]u8 {
-    const P = rows * top;
+    const P = rows * slots; // the item plan groups all 9 slots (TF_GLM_OVN_ITEMS); covers the old rows*top plan too
     const plan: cuda.grouped.Plan = .{
         .members = try r.zeros(P * 4),
-        .items = try r.zeros(cuda.grouped.maxItems(P, E, glm.experts.tile) * 12),
+        .items = try r.zeros(cuda.grouped.maxItems(P, E + 1, glm.experts.tile) * 12),
         .counts = try r.zeros(8),
-        .rank = try r.zeros(4),
+        .rank = try r.zeros(P * 4),
         .hist = try r.zeros(4),
     };
     const sz = glm.exl3.scratchBytes(rows, D, n, false, w.shx, .{});
@@ -100,7 +104,7 @@ fn stages(r: *Rig, k: *const glm.exl3.Kernels, l: ex.Layer, x: []const u16, pk: 
     const p8 = try r.a.alloc(i32, rows * top);
     for (0..rows) |row| @memcpy(p8[row * top ..][0..top], pk[row * slots ..][0..top]);
     const sc = try ex.scratch(try r.zeros(try ex.scratchBytes(l, rows, top)), l, rows, top);
-    try k.runWith(r.s, l, try r.dev(std.mem.sliceAsBytes(x)), D, .bf16, try r.dev(std.mem.sliceAsBytes(p8)), 0, rows, 0, sc, o, 0);
+    try k.runWith(r.s, l, try r.dev(std.mem.sliceAsBytes(x)), D, .bf16, try r.dev(std.mem.sliceAsBytes(p8)), 0, rows, 0, sc, o, 0, null);
     const P = rows * top;
     return .{ .xg = try r.back(sc.xg, P * D * 2), .xd = try r.back(sc.xd, P * l.width * 2), .y = try r.back(sc.y, P * D * 4) };
 }
@@ -162,6 +166,15 @@ const variants = [_]Ovn{
     .{ .loads = .word, .fuse_down = true, .xrow = true },
     .{ .loads = .nc1, .fuse_down = true, .xrow = true },
     .{ .loads = .nc2, .fuse_down = true, .xrow = true },
+    // TF_GLM_OVN_ITEMS: the 16-pair item plan (standard mode). A wrong plan (a members offset off by one, a
+    // bad item first/count, the shared item not skipped) routes a slot to the wrong expert, so ey's bytes differ.
+    .{ .items = true },
+    .{ .items = true, .fuse_down = true },
+    .{ .items = true, .xrow = true },
+    .{ .items = true, .loads = .nc1 },
+    .{ .items = true, .loads = .nc2 },
+    .{ .items = true, .loads = .word },
+    .{ .items = true, .loads = .nc2, .fuse_down = true, .xrow = true },
 };
 
 pub fn run_(gpu: Gpu) !void {
@@ -186,10 +199,17 @@ pub fn run_(gpu: Gpu) !void {
     for ([_]usize{ 256, 640 }) |n| for ([_]bool{ true, false }) |one| { // 640: a TP=3 rank's 5 blocks, 10 down steps
         var w = try weights(&r, n, one);
         const l = commonLayer(w, n);
-        for ([_]usize{ 1, 2, 3, 8, 17 }) |rows| { // decode windows; 17 rows take two member tiles
+        const cases = [_]struct { rows: usize, lock: bool }{
+            .{ .rows = 1, .lock = false }, .{ .rows = 2, .lock = false }, .{ .rows = 3, .lock = false },
+            .{ .rows = 8, .lock = false }, .{ .rows = 17, .lock = false }, // distinct windows; 17 rows: two tiles
+            .{ .rows = 16, .lock = true }, .{ .rows = 32, .lock = true }, // lockstep: every row the same picks,
+            .{ .rows = 48, .lock = true }, .{ .rows = 64, .lock = true }, // so an expert spans many 16-pair items
+        };
+        for (cases) |cs| { // distinct and lockstep decode windows
+            const rows = cs.rows;
             const x = try r.bfs(rows * D, 1.0);
-            const pk = try picks(&r, rows);
-            const case = try std.fmt.allocPrint(r.a, "width {d}, one rotation {any}, {d} rows", .{ n, one, rows });
+            const pk = try picks(&r, rows, cs.lock);
+            const case = try std.fmt.allocPrint(r.a, "width {d}, one rotation {any}, {d} rows {s}", .{ n, one, rows, if (cs.lock) "lockstep" else "distinct" });
             w.ovn = .{};
             const want = try decode(&r, &k, &ek, w, n, x, pk, rows);
             same(&t, try std.fmt.allocPrint(r.a, "glm-exl3-ovn {s}: plain twice (control)", .{case}), try decode(&r, &k, &ek, w, n, x, pk, rows), want, 4, D);
@@ -205,11 +225,11 @@ pub fn run_(gpu: Gpu) !void {
             const base = try stages(&r, &k, l, x, pk, rows, .{});
             for (variants) |o| {
                 w.ovn = o;
-                const tag = try std.fmt.allocPrint(r.a, "glm-exl3-ovn {s}, loads {t}, fuse {any}, xrow {any}", .{ case, o.loads, o.fuse_down, o.xrow });
+                const tag = try std.fmt.allocPrint(r.a, "glm-exl3-ovn {s}, loads {t}, fuse {any}, xrow {any}, items {any}", .{ case, o.loads, o.fuse_down, o.xrow, o.items });
                 same(&t, try std.fmt.allocPrint(r.a, "{s}: ey", .{tag}), try decode(&r, &k, &ek, w, n, x, pk, rows), want, 4, D);
                 var so = o; // the stages run unfused: Z, xd and y exist only there
                 so.fuse_down = false;
-                if (!so.any()) continue;
+                if (so.items or !so.any()) continue; // items: ey-only (the 9-slot scratch has no separate y stage)
                 const got = try stages(&r, &k, l, x, pk, rows, so);
                 if (so.xrow and one) { // one rotated row a token, each equal to the plain path's every pick of that row
                     for (0..rows) |row| same(&t, try std.fmt.allocPrint(r.a, "{s}: stage xg row {d}", .{ tag, row }), got.xg[row * D * 2 ..][0 .. D * 2], base.xg[row * top * D * 2 ..][0 .. D * 2], 2, D);

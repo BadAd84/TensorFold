@@ -5,6 +5,7 @@ const module = @import("module.zig");
 const launch_ = @import("launch.zig");
 const stream_ = @import("stream.zig");
 const kernels = @import("kernels.zig");
+const grouped = @import("grouped.zig");
 const exl3 = @import("exl3.zig");
 const Driver = driver.Driver;
 const Module = module.Module;
@@ -68,10 +69,17 @@ pub const Ovn = struct {
     loads: Loads = .off, // X3_NC: 1, 2 (16-byte staged loads 1 or 2 k steps ahead), w (one word a lane plus a shuffle)
     fuse_down: bool = false, // X3_FUSEDOWN: the down kernel writes the slot rows itself (fusedScratch, slots 9)
     xrow: bool = false, // X3_XROW: one gate/up input rotation a row when every expert shares it
+    items: bool = false, // ITEMS: group the 9-slot picks into 16-pair items, the grouped kernels in standard mode
     pub const Loads = enum { off, nc1, nc2, word };
     pub fn any(o: Ovn) bool {
-        return o.loads != .off or o.fuse_down or o.xrow;
+        return o.loads != .off or o.fuse_down or o.xrow or o.items;
     }
+};
+
+/// The item plan a decode window takes under TF_GLM_OVN_ITEMS: the family's Router and the plan buffer run() holds.
+pub const Items = struct {
+    router: *const grouped.Router,
+    plan: grouped.Plan,
 };
 
 /// Words of one expert's trellis of a K x N projection (the loader's contiguous [K/16][N/16][32] layout).
@@ -268,7 +276,7 @@ pub const Experts = struct {
 
     /// The routed experts of `rows` rows: group, rotate in, grouped gate/up, SwiGLU, grouped down, wts-weighted sum.
     pub fn run(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch) !void {
-        try e.runWith(s, l, x, x_stride, x_dtype, pick, wts, rows, out, sc, .{}, 0);
+        try e.runWith(s, l, x, x_stride, x_dtype, pick, wts, rows, out, sc, .{}, 0, null);
     }
 
     /// The TF_GLM_OVN_X3_* kernel of one grouped launch, or null for run()'s own (the variants are mcg only).
@@ -288,7 +296,7 @@ pub const Experts = struct {
     }
 
     /// run() with the TF_GLM_OVN_X3_* variants `o` (all off: run()'s launches); a fused down writes `ey` [P][D].
-    pub fn runWith(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch, o: Ovn, ey: u64) !void {
+    pub fn runWith(e: *const Experts, s: Stream, l: Layer, x: u64, x_stride: usize, x_dtype: DType, pick: u64, wts: u64, rows: usize, out: u64, sc: Scratch, o: Ovn, ey: u64, it: ?Items) !void {
         const d = l.dims;
         const w = l.width;
         const slots = sc.slots;
@@ -312,17 +320,34 @@ pub const Experts = struct {
         const rot = l.rot.on();
         if (rot) try rotChecked(l, d_sk);
         const kn = if (rot) l.rot.wn else w; // a narrow expert's down K (TF_GLM_OVN_X3_ROTEXPERT)
+        // TF_GLM_OVN_ITEMS: the 9-slot picks grouped by the Router into 16-pair items, the grouped kernels in
+        // standard mode (triples + direct pair indices), the down epilogue writing ey in place. No per-expert
+        // share (rot), and the caller takes ey (wts and out stay 0).
+        const items = ov.items;
+        if (items and (it == null or rot or wts != 0 or out != 0)) return error.TileNotBuilt;
+        const nx: usize = if (items) grouped.maxItems(p, l.experts + 1, 16) else maxu; // grid x and nexp_max
+        const mtu: usize = if (items) 1 else mt; // member tiles a program (a 16-pair item, or ceil(rows/16))
+        const uids = if (items) it.?.plan.items else sc.ids;
+        const ucount = if (items) it.?.plan.counts else sc.count;
+        const members = if (items) it.?.plan.members else sc.members;
+        const maxm_a: i32 = if (items) 16 else i32d(rows);
+        const std_a: i32 = if (items) 1 else 0;
+        const skip_a: i32 = if (items) i32d(l.experts) else -1;
 
-        var a: launch_.Args = .{};
-        a.add(pick);
-        a.add(sc.ids);
-        a.add(sc.count);
-        a.add(sc.members);
-        a.add(i32d(rows));
-        a.add(i32d(slots));
-        a.add(i32d(l.experts));
-        a.add(i32d(rows));
-        try launch_.launch(e.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(rows * slots * 4) }, s, &a);
+        if (items) {
+            try it.?.router.route(s, pick, p, l.experts + 1, 16, it.?.plan);
+        } else {
+            var a: launch_.Args = .{};
+            a.add(pick);
+            a.add(sc.ids);
+            a.add(sc.count);
+            a.add(sc.members);
+            a.add(i32d(rows));
+            a.add(i32d(slots));
+            a.add(i32d(l.experts));
+            a.add(i32d(rows));
+            try launch_.launch(e.group, .{ .grid = .{ .x = 1, .y = 1, .z = 1 }, .block = .{ .x = 1024, .y = 1, .z = 1 }, .shared = @intCast(rows * slots * 4) }, s, &a);
+        }
 
         var r: launch_.Args = .{};
         r.add(x);
@@ -347,28 +372,28 @@ pub const Experts = struct {
         g.add(l.up);
         g.add(l.gate_k2);
         g.add(l.up_k2);
-        g.add(sc.ids);
-        g.add(sc.count);
-        g.add(sc.members);
+        g.add(uids);
+        g.add(ucount);
+        g.add(members);
         g.add(sc.z);
         g.add(i32d(d));
         g.add(i32d(w));
         g.add(i32d(p));
         g.add(i32d(g_sk));
-        g.add(i32d(rows));
+        g.add(maxm_a);
         g.add(i32d(slots));
-        g.add(i32d(maxu));
+        g.add(i32d(nx));
         g.add(@as(i32, 2));
         g.add(i32d(l.gu_stride));
-        g.add(@as(i32, 0));
-        g.add(@as(i32, -1));
+        g.add(std_a);
+        g.add(skip_a);
         g.add(i32d(decOrder()));
         const gk = e.ovnKernel(l, ov.loads, xrow, false, rot, d, d, g_sk, l.gu_stride, l.gate_base, l.up_base);
         if (gk != null) addTail(&g, l.gate_base, l.up_base, expertWords(d, w), 0, 0, xrow, false, l.rot, false, d);
         const ord_g: u32 = decOrder();
-        const gx: u32 = @intCast(if (ord_g == 1) w / 128 else maxu);
-        const gy: u32 = @intCast(if (ord_g == 1) maxu else w / 128);
-        try launch_.launch(if (gk) |f| f else if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = gx, .y = gy, .z = @intCast(2 * g_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
+        const gx: u32 = @intCast(if (ord_g == 1) w / 128 else nx);
+        const gy: u32 = @intCast(if (ord_g == 1) nx else w / 128);
+        try launch_.launch(if (gk) |f| f else if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = gx, .y = gy, .z = @intCast(2 * g_sk * mtu) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &g);
 
         var ep: launch_.Args = .{};
         ep.add(sc.z);
@@ -392,35 +417,35 @@ pub const Experts = struct {
         dn.add(l.down);
         dn.add(l.down_k2);
         dn.add(l.down_k2);
-        dn.add(sc.ids);
-        dn.add(sc.count);
-        dn.add(sc.members);
+        dn.add(uids);
+        dn.add(ucount);
+        dn.add(members);
         dn.add(sc.z);
         dn.add(i32d(w));
         dn.add(i32d(d));
         dn.add(i32d(p));
         dn.add(i32d(d_sk));
-        dn.add(i32d(rows));
+        dn.add(maxm_a);
         dn.add(i32d(slots));
-        dn.add(i32d(maxu));
+        dn.add(i32d(nx));
         dn.add(@as(i32, 1));
         dn.add(@as(i32, 0));
-        dn.add(@as(i32, 0));
-        dn.add(@as(i32, -1));
+        dn.add(std_a);
+        dn.add(skip_a);
         dn.add(i32d(decOrder()));
         const dk = e.ovnKernel(l, ov.loads, false, fuse, rot, w, kn, d_sk, 0, l.down_base, l.down_base);
         if (dk != null) addTail(&dn, l.down_base, l.down_base, expertWords(w, d), l.svh_d, ey, false, fuse, l.rot, true, d);
         const ord_d: u32 = decOrder();
-        const dx: u32 = @intCast(if (ord_d == 1) d / 128 else maxu);
-        const dy: u32 = @intCast(if (ord_d == 1) maxu else d / 128);
-        try launch_.launch(if (dk) |f| f else if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = dx, .y = dy, .z = @intCast(d_sk * mt) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
+        const dx: u32 = @intCast(if (ord_d == 1) d / 128 else nx);
+        const dy: u32 = @intCast(if (ord_d == 1) nx else d / 128);
+        try launch_.launch(if (dk) |f| f else if (pipe()) e.grouped_pipe[@backingInt(l.codebook)] else e.grouped[@backingInt(l.codebook)], .{ .grid = .{ .x = dx, .y = dy, .z = @intCast(d_sk * mtu) }, .block = .{ .x = 128, .y = 1, .z = 1 } }, s, &dn);
         if (fuse) return; // the down kernel wrote ey's slot rows: no Z, no down_combine
 
         var cb: launch_.Args = .{};
         cb.add(sc.z);
         cb.add(pick);
         cb.add(l.svh_d);
-        cb.add(sc.y);
+        cb.add(if (items) ey else sc.y); // items: write ey's routed slot rows in place (no copy back)
         cb.add(wts);
         cb.add(out);
         cb.add(i32d(p));

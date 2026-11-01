@@ -102,11 +102,14 @@ __device__ __forceinline__ void nc_body(const OvnArgs o, int u, int nblock, int 
     const int g = lane >> 2, t = lane & 3;
     const int nt0 = nblock * NT;
     const int total = a.ucount[0];
-    const int e = a.uids[u];
-    int code = -1;
-    const int m = mtile * 16 + (int)threadIdx.x;
-    if (threadIdx.x < 16 && m < a.maxm) code = a.members[u * a.maxm + m];
     if (u >= total) return;
+    const int e = a.standard ? a.uids[3 * u] : a.uids[u];
+    if (a.standard && e == a.skip) return; // the shared item: no routed output, no trellis past the last expert
+    const int m = mtile * 16 + (int)threadIdx.x;
+    const int count = a.standard ? a.uids[3 * u + 2] : a.maxm;
+    const int first = a.standard ? a.uids[3 * u + 1] : u * a.maxm;
+    int code = -1;
+    if (threadIdx.x < 16 && m < count) code = a.members[first + m];
     const int ncols = o.t.rm && !o.t.rk ? rot_cols(o.t, e, a.n) : a.n; // TF_GLM_OVN_X3_ROTEXPERT: this expert's share
     const int NTILES = a.ns > 0 ? a.ns : (ncols >> 4);
     const int per_warp = ((o.t.rm && o.t.rk ? rot_cols(o.t, e, a.k) : a.k) >> 4) / a.sk / W;
@@ -124,7 +127,7 @@ __device__ __forceinline__ void nc_body(const OvnArgs o, int u, int nblock, int 
 
     __shared__ int rows_sh[16];
     __shared__ __align__(16) float red[W][16][NT * 16];
-    if (threadIdx.x < 16) rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1;
+    if (threadIdx.x < 16) rows_sh[threadIdx.x] = a.standard ? code : (code >= 0 ? (code >> 5) * a.slots + (code & 31) : -1);
     __syncthreads();
     if (rows_sh[0] < 0) return; // members come first, so this tile is empty
     if (past) return rot_zero<NT>(a, rows_sh, mat, split, nt0);
