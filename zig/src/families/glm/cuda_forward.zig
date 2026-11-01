@@ -302,7 +302,7 @@ pub const Forward = struct {
     }
 
     /// `first`: the rank whose partial the sum takes first (rotlayer.first: a rotated MoE layer's owner, else 0).
-    fn post(f: *const Forward, r: Rank, x: u64, rows: usize, first: usize) !void {
+    pub fn post(f: *const Forward, r: Rank, x: u64, rows: usize, first: usize) !void {
         const stamp = prof_mod.span(f.prof, f.stream, .glue);
         defer stamp.end();
         const c = &r.w.config;

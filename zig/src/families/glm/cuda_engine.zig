@@ -267,6 +267,8 @@ pub const Engine = struct {
         errdefer e.shared_buf.free();
         errdefer @import("cuda_load_owner.zig").drain(stream, d);
         try e.stream.synchronize();
+        // TF_GLM_OVN_ROUTER_WARM: load the router (and, at 2, the prompt-path mixer) kernel variants on scratch now
+        _ = try @import("cuda_router_warm.zig").warm(e);
         return e;
     }
 

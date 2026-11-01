@@ -69,6 +69,8 @@ test {
     _ = @import("cuda_ranks_test.zig");
     _ = @import("cuda_l2pace.zig");
     _ = @import("cuda_moe_first_test.zig");
+    _ = @import("cuda_router_warm.zig");
+    _ = @import("cuda_router_warm_test.zig");
     _ = @import("cuda_lanes_test.zig");
     _ = prompt_pair;
     _ = @import("cuda_disk_image.zig");
