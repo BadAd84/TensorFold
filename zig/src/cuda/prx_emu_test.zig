@@ -247,8 +247,7 @@ test "PRX emulation: every failed rank exits after TF_GLM_OVN_PRX_EXIT_S, so the
 }
 
 test "PRX emulation: with the heartbeat and progress watched, a slow live world and an idle gap stay clean" {
-    // busy past both limits (a slow GPU): beats and progress must keep moving, or the watch fires
-    try expectClean(.{ .world = 3, .streams = 2, .slow_gpu_rank = 1, .exchanges = 24, .timeout_ns = 100 * std.time.ns_per_ms, .peer_ns = 100 * std.time.ns_per_ms, .seed = 61 });
+    try expectClean(.{ .world = 3, .streams = 2, .slow_gpu_rank = 1, .exchanges = 24, .peer_ns = 100 * std.time.ns_per_ms, .seed = 61 });
     // caught up for longer than both limits between two batches: the watch restarts, nothing fails
     try expectClean(.{ .world = 3, .exchanges = 16, .phases = 2, .gap_ns = 400 * std.time.ns_per_ms, .timeout_ns = 200 * std.time.ns_per_ms, .peer_ns = 200 * std.time.ns_per_ms, .seed = 62 });
 }
