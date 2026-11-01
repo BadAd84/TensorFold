@@ -220,13 +220,17 @@ fn picksBytes(rows: usize) usize {
 }
 /// The prompt path's TF_GLM_OVN_* switches (EY_DIRECT, X3_PROMPT_K64, _ORDER, X3_YBF16, X3_ROTEXPERT); all off.
 pub const Ovn = common.prompt.Ovn;
+/// A decode chunk's arena: the plain 8-slot layout or the 9-slot one without y (ITEMS, X3_FUSEDOWN), the larger.
+fn decodeBytes(l: common.Layer, n: usize) !usize {
+    return @max(try common.scratchBytes(l, n, top_k), try common.fusedBytes(l, n, top_k + 1));
+}
 /// `o`: the switches the kernels run with (Kernels' `prompt.ovn`; Ovn.fromEnv() before they load).
 pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, o: Ovn) [4]usize {
     const n: usize = @min(rows, chunk_rows);
     var l = shape(dims, width);
     l.shared_input = shx;
     if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k, o) catch unreachable), 4, 4, 4 };
-    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
+    return .{ picksBytes(rows) + (decodeBytes(shape(dims, width), n) catch unreachable), 4, 4, 4 };
 }
 /// scratchBytes for every routed width `share` holds (TF_GLM_OVN_EXPERT_ROTATE: per layer), each size the largest.
 pub fn heldScratch(rows: usize, dims: usize, share: shard.Share, c: *const Config, prefill: bool, shx: bool, o: Ovn) ![4]usize {
@@ -284,15 +288,13 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
 fn decodeOvn(k: *const Kernels, stream: cuda.Stream, l: common.Layer, o: common.Ovn, compact: u64, arena: u64, cap: usize, x: u64, x_stride: usize, picks: u64, n: usize, ey: u64, router: *const cuda.grouped.Router, plan: cuda.grouped.Plan) !void {
     const slots = top_k + 1;
     const d = l.dims;
-    // TF_GLM_OVN_ITEMS: route the 9-slot picks and run the grouped kernels on items; the 9-slot layout (no y)
-    // fits the arena the plain 8-slot path was sized for, and the down epilogue writes ey's slot rows in place.
+    // TF_GLM_OVN_ITEMS: route the 9-slot picks and run the grouped kernels on items; the down epilogue writes ey's
+    // slot rows in place. scratchBytes sizes a decode arena for the 9-slot layout too (decodeBytes).
     if (o.items) {
-        if ((try common.fusedBytes(l, cap, slots)) > (try common.scratchBytes(l, cap, top_k))) return error.TileNotBuilt;
         const scratch = try common.fusedScratch(arena, l, cap, slots);
         return k.runWith(stream, l, x, x_stride, .bf16, picks, 0, n, 0, scratch, o, ey, .{ .router = router, .plan = plan });
     }
-    // the fused layout (slots 9, no y) fits inside the plain one this arena was sized for
-    if (o.fuse_down and common.fusable(l) and (try common.fusedBytes(l, cap, slots)) <= (try common.scratchBytes(l, cap, top_k))) {
+    if (o.fuse_down and common.fusable(l)) {
         const scratch = try common.fusedScratch(arena, l, cap, slots);
         return k.runWith(stream, l, x, x_stride, .bf16, picks, 0, n, 0, scratch, o, ey, null);
     }
@@ -398,15 +400,11 @@ test "TF_GLM_OVN_ITEMS: off by default, and on it reaches the experts Ovn option
     cuda.ovn.fake("ITEMS", null); // leave it unset for any later test that reads the knob
 }
 
-test "TF_GLM_OVN_ITEMS: the decode plan sized for the largest shared window covers every smaller window" {
-    const slots = top_k + 1; // 9 (top-8 plus the shared expert)
-    const n_exp = 288; // GLM-5.3-Flash's routed experts; the shared id is `n_exp`, so the plan counts n_exp + 1
-    const cap = 64; // the largest shared decode window
-    // cuda_state sizes the plan members as rows * slots and the items as maxItems(rows * slots, n_exp + 1, 16)
-    const members_cap = cap * slots;
-    const items_cap = cuda.grouped.maxItems(cap * slots, n_exp + 1, 16);
-    for (1..cap + 1) |rows| {
-        try std.testing.expect(rows * slots <= members_cap);
-        try std.testing.expect(cuda.grouped.maxItems(rows * slots, n_exp + 1, 16) <= items_cap);
-    }
+test "TF_GLM_OVN_ITEMS: at GLM's shapes the decode arena is the plain layout's bytes, so no pool changes" {
+    for ([_]usize{ 640, 768, 1024, 2048 }) |width| for (1..65) |rows| { // TP=3 narrow and wide shares, TP=2, TP=1
+        const l = shape(4096, width);
+        const plain = try common.scratchBytes(l, rows, top_k);
+        try std.testing.expect(try common.fusedBytes(l, rows, top_k + 1) <= plain);
+        try std.testing.expectEqual(picksBytes(rows) + plain, scratchBytes(rows, 4096, width, false, false, .{})[0]);
+    };
 }
