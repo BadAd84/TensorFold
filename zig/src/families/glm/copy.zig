@@ -5,15 +5,15 @@
 //!
 //! Upstream's lanes core already carries a copy proposer (`lanes.proposer.SuffixLookup`, a 3-gram index with a
 //! silence rule) and the family hook for one (`LaneHost.proposers`, as deepseek_v41's priced lookup uses). GLM's
-//! four rules differ from it, so this family brings its own behind the same `Proposer` interface:
+//! five rules differ from it, so this family brings its own behind the same `Proposer` interface:
 //! - which occurrence: the latest one with `k` tokens after it, else the earliest (not the longest match);
 //! - an occurrence that starts inside the reply must match `reply_match` tokens (COPY_CODE: 16), not `match` (8):
 //!   code replies repeat short boilerplate whose continuations differ;
 //! - a window of 9 to 15 rows is padded to the CUDA-graph width (16) by repeating its last draft, when room allows
 //!   (TF_GLM_COPY_PAD; off by default, the GLM family runs no CUDA-graph replay so the pad is off unless asked);
 //! - TF_GLM_OVN_COPY_AGREE (off): the occurrence agreeing furthest back past the match, capped when agreement is weak.
-//! There is no silence, and a copy of one token is a copy (the lanes core wants two): the proposer is `priced`,
-//! so the round loop takes its drafts as given.
+//! - TF_GLM_OVN_COPY_MISS_MAX (off): after a copy round that kept fewer than all its drafts, the next caps at K.
+//! No silence, and a one-token copy counts (the proposer is `priced`), so the round loop takes its drafts as given.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const lanes = @import("lanes");
@@ -29,6 +29,7 @@ pub const Settings = struct {
     most: usize = max_drafts, // TF_GLM_COPY_MAX (production: 15; Python's own default is 5)
     reply_match: usize = 16, // TF_GLM_COPY_REPLY_MATCH (production COPY_CODE=1: 16; 0: the prompt's rule everywhere)
     pad: usize = 0, // TF_GLM_COPY_PAD (the old graph width, 16; 0: no padding, upstream's family runs no graphs)
+    miss_most: usize = 0, // TF_GLM_OVN_COPY_MISS_MAX: a copy round after one that missed proposes at most this many
     agree: usize = 0, // TF_GLM_OVN_COPY_AGREE LO: agreement tokens past the match trusted (0: off, today's choice)
     agree_most: usize = 0, // K: a proposal agreeing for under LO tokens proposes at most this many drafts
     agree_longest: bool = true, // L: propose the occurrence agreeing furthest back (0: keep the baseline occurrence)
@@ -48,6 +49,7 @@ pub const Settings = struct {
         s.most = try number("TF_GLM_COPY_MAX", s.most, 1, max_drafts);
         s.reply_match = try number("TF_GLM_COPY_REPLY_MATCH", s.reply_match, 0, 64);
         s.pad = try number("TF_GLM_COPY_PAD", s.pad, 0, max_drafts + 1);
+        s.miss_most = try number("TF_GLM_OVN_COPY_MISS_MAX", 0, 0, s.most);
         if (s.reply_match != 0 and s.reply_match <= s.match) {
             std.log.err("TF_GLM_COPY_REPLY_MATCH is 0 (off) or more than TF_GLM_COPY_MATCH ({d}), not {d}", .{ s.match, s.reply_match });
             return error.BadCopySettings;
@@ -218,6 +220,7 @@ pub const GlmProposer = struct {
     out: std.ArrayList(u32) = .empty,
     gpa: Allocator,
     matched: i64 = 0, // the last proposal's match length (0: none)
+    missed: bool = false, // the last settled copy round kept fewer than all its drafts (TF_GLM_OVN_COPY_MISS_MAX)
 
     pub fn deinit(p: *GlmProposer) void {
         p.out.deinit(p.gpa);
@@ -233,7 +236,9 @@ pub const GlmProposer = struct {
         defer p.gpa.free(ctx);
         @memcpy(ctx[0..history.len], history);
         @memcpy(ctx[history.len..], tail);
-        const got = p.settings.propose(ctx, p.prompt, room, &p.buf);
+        var eff = p.settings;
+        if (p.missed and eff.miss_most != 0) eff.most = @min(eff.most, eff.miss_most); // miss cap: narrow after a miss
+        const got = eff.propose(ctx, p.prompt, room, &p.buf);
         p.matched = if (got.len > 0) @intCast(n) else 0;
         p.out.clearRetainingCapacity();
         try p.out.appendSlice(p.gpa, got);
@@ -255,11 +260,18 @@ pub const GlmProposer = struct {
         return p.matched;
     }
 
+    fn observeFn(ptr: *anyopaque, proposed: i64, accepted: i64) void {
+        const p: *GlmProposer = @ptrCast(@alignCast(ptr));
+        // the engine settles a copy round here (p.context_copy): it missed when fewer drafts were kept than proposed
+        if (proposed > 0) p.missed = accepted < proposed;
+    }
+
     pub const vtable: lanes.proposer.Proposer.VTable = .{
         .propose = proposeFn,
         .propose_after = afterFn,
         .last_match = lastMatchFn,
         .priced = true, // the rules set their own length: a one-token copy is a copy, no core gate
+        .observe = observeFn,
     };
 
     pub fn proposer(p: *GlmProposer) lanes.proposer.Proposer {
@@ -472,4 +484,90 @@ test "TF_GLM_OVN_COPY_AGREE parsing matches production" {
     for ([_][]const u8{ "16", "0:7", "65:7", "16:0", "16:16", "16:7:2", "a:b", "16:7:1:1", "-1:3", "00", "16:7:" }) |bad| {
         try std.testing.expectError(error.BadCopySettings, Settings.parseAgreeSpec(bad, 15));
     }
+}
+
+// Drive the GlmProposer round by round (test_copy_agree.drive): propose, keep the matching prefix, observe, advance.
+fn driveMiss(s: Settings, prompt: []const u32, reply: []const u32, gpa: Allocator, props: *std.ArrayList(u32)) !void {
+    var p: GlmProposer = .{ .settings = s, .prompt = prompt.len, .gpa = gpa };
+    defer p.deinit();
+    const pr = p.proposer();
+    var pos: usize = 0;
+    while (pos + 1 < reply.len) {
+        const hist = try gpa.alloc(u32, prompt.len + pos);
+        defer gpa.free(hist);
+        @memcpy(hist[0..prompt.len], prompt);
+        @memcpy(hist[prompt.len..], reply[0..pos]);
+        const got = try pr.proposeAfter(hist, reply[pos..][0..1], 1 << 20);
+        try props.appendSlice(gpa, got);
+        var keep: usize = 1;
+        for (got, 0..) |d, i| {
+            if (pos + 1 + i >= reply.len or reply[pos + 1 + i] != d) break;
+            keep += 1;
+        }
+        keep = @min(keep, reply.len - 1 - pos);
+        pr.observe(@intCast(got.len), @intCast(keep - 1)); // settle the round: proposed against accepted drafts
+        pos += keep;
+    }
+}
+
+const miss_prompt = [_]u32{ 9, 1, 2, 7, 7, 3, 4, 4 };
+const miss_reply = [_]u32{ 9, 1, 2, 5, 5, 5, 5, 9, 1, 2, 6, 7, 7, 3, 4, 4, 2, 2 };
+
+test "TF_GLM_OVN_COPY_MISS_MAX narrows a copy round after a miss (proposals differ, replies do not)" {
+    const gpa = std.testing.allocator;
+    var props: std.ArrayList(u32) = .empty;
+    defer props.deinit(gpa);
+    // off: today's proposals over the reply
+    try driveMiss(.{ .match = 2, .most = 5, .reply_match = 0, .miss_most = 0 }, &miss_prompt, &miss_reply, gpa, &props);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7, 7, 3, 4, 5, 2, 5, 5, 5, 5, 3, 4, 4, 9, 1 }, props.items);
+    // miss 2: a copy round after one that missed proposes at most 2, so the sequence differs
+    props.clearRetainingCapacity();
+    try driveMiss(.{ .match = 2, .most = 5, .reply_match = 0, .miss_most = 2 }, &miss_prompt, &miss_reply, gpa, &props);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7, 7, 3, 4, 5, 2, 5, 5, 5, 5, 3, 4, 9, 1, 2, 5, 5 }, props.items);
+}
+
+test "TF_GLM_OVN_COPY_MISS_MAX composes with TF_GLM_OVN_COPY_AGREE" {
+    const gpa = std.testing.allocator;
+    var props: std.ArrayList(u32) = .empty;
+    defer props.deinit(gpa);
+    const ag: Settings = .{ .match = 2, .most = 5, .reply_match = 0, .agree = 3, .agree_most = 3, .agree_longest = true };
+    // agree alone over the reply
+    try driveMiss(ag, &miss_prompt, &miss_reply, gpa, &props);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7, 7, 5, 2, 5, 5, 3, 4, 4 }, props.items);
+    // agree plus miss 2: the miss cap (2) binds tighter than agree's cap (3) at the capped round
+    props.clearRetainingCapacity();
+    var am = ag;
+    am.miss_most = 2;
+    try driveMiss(am, &miss_prompt, &miss_reply, gpa, &props);
+    try std.testing.expectEqualSlices(u32, &.{ 2, 7, 7, 5, 2, 5, 5, 3, 4, 9, 1, 2, 5, 5 }, props.items);
+}
+
+test "observe settles the miss flag; a non-copy round does not" {
+    const gpa = std.testing.allocator;
+    var p: GlmProposer = .{ .settings = .{ .match = 2, .most = 5, .miss_most = 2 }, .prompt = 0, .gpa = gpa };
+    defer p.deinit();
+    const pr = p.proposer();
+    pr.observe(5, 3); // 3 of 5 drafts kept: missed
+    try std.testing.expect(p.missed);
+    pr.observe(5, 5); // all kept: cleared
+    try std.testing.expect(!p.missed);
+    pr.observe(5, 1); // missed again
+    try std.testing.expect(p.missed);
+    pr.observe(0, 0); // a non-copy round settles nothing: the flag persists
+    try std.testing.expect(p.missed);
+}
+
+test "the miss cap applies only when missed and miss_most is set" {
+    const gpa = std.testing.allocator;
+    const hist = [_]u32{ 7, 8, 9, 1, 2, 30, 31, 32, 40, 1, 2, 33, 34, 7, 8, 9, 1 };
+    var p: GlmProposer = .{ .settings = .{ .match = 2, .most = 5, .reply_match = 0, .miss_most = 2 }, .prompt = 0, .gpa = gpa };
+    defer p.deinit();
+    // not missed: the baseline proposal of 5 (latest occurrence, start 9)
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34, 7, 8, 9 }, try p.proposer().proposeAfter(&hist, &.{2}, 32));
+    p.missed = true; // after a miss the same proposal caps at miss_most (2)
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34 }, try p.proposer().proposeAfter(&hist, &.{2}, 32));
+    var q: GlmProposer = .{ .settings = .{ .match = 2, .most = 5, .reply_match = 0, .miss_most = 0 }, .prompt = 0, .gpa = gpa };
+    defer q.deinit();
+    q.missed = true; // miss_most 0 is off: a miss never caps
+    try std.testing.expectEqualSlices(u32, &.{ 33, 34, 7, 8, 9 }, try q.proposer().proposeAfter(&hist, &.{2}, 32));
 }
