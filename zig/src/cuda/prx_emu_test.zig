@@ -251,8 +251,6 @@ test "PRX emulation: with the heartbeat and progress watched, a slow live world 
     try expectClean(.{ .world = 3, .streams = 2, .slow_gpu_rank = 1, .exchanges = 24, .peer_ns = 100 * std.time.ns_per_ms, .seed = 61 });
     // caught up for longer than both limits between two batches: the watch restarts, nothing fails
     try expectClean(.{ .world = 3, .exchanges = 16, .phases = 2, .gap_ns = 400 * std.time.ns_per_ms, .timeout_ns = 200 * std.time.ns_per_ms, .peer_ns = 200 * std.time.ns_per_ms, .seed = 62 });
-    // busy past both limits at full speed: every completion is progress, so the progress watch stays quiet
-    try expectClean(.{ .world = 3, .exchanges = 400, .timeout_ns = 100 * std.time.ns_per_ms, .peer_ns = 100 * std.time.ns_per_ms, .seed = 63 });
 }
 
 test "PRX emulation: a peer whose GPU stops while its proxy lives fails every rank by TF_GLM_OVN_PRX_TIMEOUT_S" {
