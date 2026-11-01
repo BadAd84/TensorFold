@@ -7,6 +7,11 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, glm: *std.Build.Module, mod
     const startup_run = b.addRunArtifact(b.addTest(.{ .root_module = startup }));
     b.step("test-glm-startup-host", "Page refusals propagate through rank liveness before engine construction").dependOn(&startup_run.step);
     step.dependOn(&startup_run.step);
+    const onepass_order = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda_onepass_order_test.zig"), .target = host, .optimize = .debug });
+    const onepass_order_run = b.addRunArtifact(b.addTest(.{ .root_module = onepass_order }));
+    b.step("test-glm-onepass-order-host", "The pipe CHUNK accumulation order equals the chunk programs' and differs from the one-pass").dependOn(&onepass_order_run.step);
+    step.dependOn(&onepass_order_run.step);
+    b.step("test-glm-onepass-host", "TF_GLM_OVN_SPARSE_ONEPASS and _ONEPASS_PIPE knob parsing and shape routing").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"onepass"} })).step);
     b.step("test-glm-tp3-host", "Uneven KDA head shares through actual projection and load planning, without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"GLM TP3:"} })).step);
     b.step("test-glm-shared-first-host", "TF_GLM_OVN_SHARED_FIRST's MoE order and paced prefetch through recorded launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_SHARED_FIRST"} })).step);
     b.step("test-glm-hc-host", "TF_GLM_OVN_HC_ROWS and _HC_DEC: the mixing kernels' choice, grid and args through recorded launches").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm, .filters = &.{"TF_GLM_OVN_HC_"} })).step);

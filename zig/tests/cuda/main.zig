@@ -52,6 +52,8 @@ const glm_index_ovn_check = @import("glm_index_ovn_check.zig");
 const glm_index_regroup_check = @import("glm_index_regroup_check.zig");
 const glm_shard_check = @import("glm_shard_check.zig");
 const glm_onepass_check = @import("glm_onepass_check.zig");
+const glm_onepass_exact_check = @import("glm_onepass_exact_check.zig");
+const glm_onepass_bench = @import("glm_onepass_bench.zig");
 const glm_pk8_check = @import("glm_pk8_check.zig");
 const carveout_tests = @import("carveout_tests.zig");
 const nvfp4_tests = @import("nvfp4_tests.zig");
@@ -456,6 +458,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-index-regroup-check")) return glm_index_regroup_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-shard-check")) return glm_shard_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-onepass-check")) return glm_onepass_check.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-onepass-exact-check")) return glm_onepass_exact_check.run(gpu);
+    if (std.mem.eql(u8, cmd, "glm-onepass-bench")) return glm_onepass_bench.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-pk8-check")) return glm_pk8_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-snap-gather")) return glm_snap_gather_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
