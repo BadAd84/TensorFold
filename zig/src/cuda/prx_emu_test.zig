@@ -169,6 +169,10 @@ fn runWorld(o: Opts) !Outcome {
     }
     if (o.exit_ns > 0) while (exits.load(.acquire) < o.world and now() - t0 < 10 * std.time.ns_per_s) std.Thread.yield() catch {};
     out.exits = exits.load(.acquire);
+    // stopped first: a probe call posted to a live proxy would sit unsent while the bytes are checked, and its watch fire
+    w.stop();
+    stopped = true;
+    for (w.nics[0..o.world]) |n| out.stall_ns = @max(out.stall_ns, n.gap.most); // read once the proxies stopped
     for (0..o.world) |r| {
         const p = w.proxies[r];
         if (p.failure()) |m| {
@@ -188,9 +192,6 @@ fn runWorld(o: Opts) !Outcome {
             for (d[guard + n ..]) |b| out.bad_guards += @intFromBool(b != 0xa5);
         };
     }
-    w.stop();
-    stopped = true;
-    for (w.nics[0..o.world]) |n| out.stall_ns = @max(out.stall_ns, n.gap.most); // read once the proxies stopped
     return out;
 }
 
@@ -250,6 +251,8 @@ test "PRX emulation: with the heartbeat and progress watched, a slow live world 
     try expectClean(.{ .world = 3, .streams = 2, .slow_gpu_rank = 1, .exchanges = 24, .peer_ns = 100 * std.time.ns_per_ms, .seed = 61 });
     // caught up for longer than both limits between two batches: the watch restarts, nothing fails
     try expectClean(.{ .world = 3, .exchanges = 16, .phases = 2, .gap_ns = 400 * std.time.ns_per_ms, .timeout_ns = 200 * std.time.ns_per_ms, .peer_ns = 200 * std.time.ns_per_ms, .seed = 62 });
+    // busy past both limits at full speed: every completion is progress, so the progress watch stays quiet
+    try expectClean(.{ .world = 3, .exchanges = 400, .timeout_ns = 100 * std.time.ns_per_ms, .peer_ns = 100 * std.time.ns_per_ms, .seed = 63 });
 }
 
 test "PRX emulation: a peer whose GPU stops while its proxy lives fails every rank by TF_GLM_OVN_PRX_TIMEOUT_S" {
