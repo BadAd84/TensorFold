@@ -62,8 +62,8 @@ pub fn Proxy(comptime Nic: type) type {
         beat_out: [plan.max_peers]bool = @splat(false), // a heartbeat to that link not completed yet
         seen: [plan.max_peers]u32 = @splat(0), // each peer's last heartbeat, and when it changed
         seen_ns: [plan.max_peers]u64 = @splat(0),
-        in_use_max: u64 = 0, // the most calls in a peer's receive slots at once (posted there, not yet freed by it)
-        credit_stalls: u64 = 0, // links whose payload was staged while the peer still held the slot
+        in_use_max: u64 = 0, // the most calls in a peer's slots by its credit as read here (lags its frees: an upper bound)
+        credit_stalls: u64 = 0, // links whose payload was staged while the peer's credit, as read here, held the slot
         stalled_mask: u32 = 0,
 
         fn word(p: *const P, at: usize) *u32 {

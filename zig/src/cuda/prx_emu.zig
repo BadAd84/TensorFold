@@ -54,6 +54,18 @@ pub const Nic = struct {
     dead_after: ?u64 = null, // a dead link: from this call's first write on, every write of this NIC fails unwritten
     dead: bool = false,
     halted: std.atomic.Value(bool) = .init(false),
+    peer_freed: [plan.max_world]u64 = @splat(0), // each peer's calls its GPU freed (consumed words), as last read
+    occupied_max: u64 = 0, // the most calls in a peer's slots at a write here, by the peer's own consumed words
+
+    /// At a write of `call` to rank `to`: calls in its slots not yet freed by its GPU (its consumed words, read now).
+    fn occupy(n: *Nic, to: usize, call: u64) void {
+        const l = &n.w.l;
+        const region = n.w.regions[to];
+        var f = n.peer_freed[to];
+        while (plan.geq(@atomicLoad(u32, @as(*u32, @ptrCast(@alignCast(region.ptr + l.consumed(@intCast(f % l.slots))))), .acquire), @truncate(f + 1))) f += 1;
+        n.peer_freed[to] = f;
+        n.occupied_max = @max(n.occupied_max, call + 1 -| f);
+    }
 
     fn push(n: *Nic, link: usize, i: usize, wr: Wr) !void {
         if (n.tail[link][i] - n.head[link][i] == max_q) return error.QueueFull;
@@ -85,6 +97,7 @@ pub const Nic = struct {
             const refused = n.dead or n.w.nics[wr.to_rank].halted.load(.acquire); // or its queue pair is in error
             const bad = refused or (n.fail_call != null and wr.id & 0xf == 1 and wr.id >> 11 == n.fail_call.? and i == 0);
             if (!refused) {
+                if (wr.flag_at != null and wr.id & 0xf == 1) n.occupy(wr.to_rank, wr.id >> 11); // a call's write (kind_send)
                 const dst = n.w.regions[wr.to_rank];
                 if (wr.n > 0) @memcpy(dst[wr.to .. wr.to + wr.n], n.w.regions[n.rank][wr.from .. wr.from + wr.n]);
                 @atomicStore(u32, @as(*u32, @ptrCast(@alignCast(dst.ptr + (wr.flag_at orelse wr.to)))), wr.value, .release);
