@@ -75,6 +75,7 @@ pub const Rule = struct {
     batched_heads: bool = false, // one batch drafts every stream of a shared round (its steps: the deepest stream's)
     full_depth: bool = false, // TF_GLM_OVN_DEPTH_FULL: budgets ask most_drafts, no last grant + draft_slack ratchet
     row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
+    fair_shared: bool = false, // TF_GLM_OVN_WIN_FAIR: shared rows go to the shallowest stream, so the streams finish together
     round_ms: Table = .{}, // a round's wall time by drafts, every stream's: what sampled streams price by
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
     greedy_ms: Table = .{}, // round_ms from greedy rounds alone: what greedy streams price by
@@ -338,9 +339,9 @@ pub const Rule = struct {
         const ones = try r.gpa.alloc(u32, whos.len);
         defer r.gpa.free(ones);
         @memset(ones, 1);
-        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled) };
+        const head: alloc.HeadCost = .{ .step_ms = r.mtp_step_ms, .batched = r.batched_heads, .row_ms = r.row_cost.extraMs(whos.len, sampled), .fair = r.fair_shared };
         const counts = if (r.draft_step_ms != 0)
-            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled) })
+            try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.overheadMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), .{ .step_ms = r.draft_step_ms, .batched = r.batched_heads and pricedBatched(), .free_first = true, .row_ms = r.row_cost.extraMs(whos.len, sampled), .fair = r.fair_shared })
         else
             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
         defer r.gpa.free(counts);

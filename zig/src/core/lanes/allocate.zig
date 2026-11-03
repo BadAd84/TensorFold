@@ -22,6 +22,7 @@ pub const HeadCost = struct {
     batched: bool = false,
     free_first: bool = false,
     row_ms: f64 = 0.0, // what each row past a stream's first costs past the table on this machine
+    fair: bool = false, // a row each stream in turn, shallowest first: streams advance together and finish together
 };
 
 /// allocate, each stream's drafts past its first costing one more head step.
@@ -53,7 +54,16 @@ pub fn allocateDrafts(gpa: Allocator, fixed: []const u32, probs: []const []const
         for (probs, 0..) |p, s| {
             if (counts[s] >= p.len) continue;
             const v = p[counts[s]];
-            if (pick == null or v > pick_p) {
+            if (pick) |b| {
+                // fair: the shallowest stream takes the row (ties to the likelier node), so eight streams keep step
+                if (head.fair and (counts[s] < counts[b] or (counts[s] == counts[b] and v > pick_p))) {
+                    pick = s;
+                    pick_p = v;
+                } else if (!head.fair and v > pick_p) {
+                    pick = s;
+                    pick_p = v;
+                }
+            } else {
                 pick = s;
                 pick_p = v;
             }
@@ -203,4 +213,26 @@ test "extendCosts interpolates and extrapolates" {
     try std.testing.expectEqual(@as(?f64, 4.0), t.get(1));
     try std.testing.expectEqual(@as(?f64, 6.0), t.get(3));
     try std.testing.expectEqual(@as(?f64, 12.0), t.get(6));
+}
+
+test "allocateDrafts: fair shares the rows, greedy spends them on the likeliest stream" {
+    const gpa = std.testing.allocator;
+    const a = [_]f64{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 };
+    const b = [_]f64{ 0.4, 0.4 };
+    const c = [_]f64{ 0.4, 0.4 };
+    const probs = [_][]const f64{ &a, &b, &c };
+    const flat: Table = .{};
+    const greedy = try allocateDrafts(gpa, &.{ 1, 1, 1 }, &probs, &flat, 0.0, 9, .{});
+    defer gpa.free(greedy);
+    const fair = try allocateDrafts(gpa, &.{ 1, 1, 1 }, &probs, &flat, 0.0, 9, .{ .fair = true });
+    defer gpa.free(fair);
+    // greedy: the confident stream takes the spare rows, so the streams end rows apart (they drift and finish apart)
+    const greedy_spread = @max(greedy[0], @max(greedy[1], greedy[2])) - @min(greedy[0], @min(greedy[1], greedy[2]));
+    try std.testing.expect(greedy_spread >= 3);
+    // fair: the spare rows go to the shallowest stream, so no stream trails another by more than one row
+    const fair_spread = @max(fair[0], @max(fair[1], fair[2])) - @min(fair[0], @min(fair[1], fair[2]));
+    try std.testing.expect(fair_spread <= 1);
+    // the counts are DRAFTS (the caller adds each stream's fixed row): six spare rows, three streams
+    try std.testing.expectEqual(@as(u32, 6), fair[0] + fair[1] + fair[2]);
+    try std.testing.expectEqual(@as(u32, 0), greedy[1] + greedy[2]); // greedy starves both shallow streams outright
 }

@@ -40,6 +40,7 @@ pub const Model = struct {
     max_streams: u32 = 0, // a shared forward's streams at most (0: 32)
     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
     free_shared: bool = false, // TF_GLM_OVN_WIN_FREE: shared windows allocate with no cost model
+    fair_shared: bool = false, // TF_GLM_OVN_WIN_FAIR: shared rows go to the shallowest stream
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     granted_depth: bool = false, // with draft_probabilities: every stream drafts its last grant plus a slack
     draft_slack: u32 = 0, // drafts past a stream's last grant, short or not (0: the Constants' own)
@@ -113,6 +114,7 @@ pub const Config = struct {
     shared_depth_full: bool = false, // Model.shared_depth_full
     shared_copy_width: bool = false, // Model.shared_copy_width
     free_shared: bool = false, // Model.free_shared: shared_costs is empty, windows.fill fills by chance alone
+    fair_shared: bool = false, // Model.fair_shared: rows go round the streams, shallowest first
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
@@ -200,6 +202,7 @@ pub const Config = struct {
             .shared_depth_full = m.shared_depth_full,
             .shared_copy_width = m.shared_copy_width,
             .free_shared = m.free_shared,
+            .fair_shared = m.fair_shared,
         };
     }
 

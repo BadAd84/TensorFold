@@ -145,6 +145,7 @@ pub const Lanes = struct {
             // TF_GLM_OVN_PLAIN_MARGIN: hundredths; a draft must beat plain rounds by this (0: the core's 105)
             .plain_margin = @as(f64, @floatFromInt(cuda.ovn.int("PLAIN_MARGIN", 0) catch 0)) / 100.0,
             .free_shared = block and cuda.ovn.on("WIN_FREE"), // a lone stream's window costs are untouched
+            .fair_shared = block and cuda.ovn.on("WIN_FAIR"),
             .hidden_rows = sharing,
             .batch_rows = if (sharing) self.x.e.settings.shared_rows else 0, // TF_GLM_OVN_SHARED_ROWS: the allocator's cap
             .max_streams = if (sharing) engine.max_shared else 1,
