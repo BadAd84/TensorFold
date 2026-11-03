@@ -105,6 +105,32 @@ test "TF_GLM_OVN_DEPTH_FULL and SHARED_COPY: each knob reaches the round loop's 
     }
 }
 
+test "TF_GLM_OVN_WIN_FREE: the knob empties the shared table and leaves the lone window costs, off by default" {
+    const gpa = std.testing.allocator;
+    const cuda = @import("cuda");
+    const cl = @import("cuda_lanes.zig");
+    defer cuda.ovn.fake("WIN_FREE", null);
+    var e: engine.Engine = undefined;
+    e.gpa = gpa;
+    e.mtp = true;
+    var dr: @import("dflash.zig").Drafter = undefined;
+    e.drafter = &dr;
+    e.settings = .{ .shared_rows = 32 };
+    for ([_]?[]const u8{ null, "0", "1" }) |v| {
+        cuda.ovn.fake("WIN_FREE", v);
+        var self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+        defer self.lanes.deinit(gpa);
+        var cfg = try lanes.Config.init(gpa, self.facts(), cl.max_rows, cl.max_rows - 1);
+        defer cfg.deinit(gpa);
+        const on = v != null and v.?[0] == '1';
+        try std.testing.expectEqual(on, cfg.free_shared);
+        try std.testing.expectEqual(on, cfg.shared_costs.empty()); // off: 76 + 4.1 ms a row to the load's rows
+        // a lone stream's window costs are untouched either way
+        try std.testing.expect(!cfg.family_costs.empty());
+        try std.testing.expectApproxEqAbs(52.0, cfg.family_costs.get(1).?, 1e-9);
+    }
+}
+
 test "structured output's grammar rows: a window past the load's shared rows is refused before the words are made" {
     var e: engine.Engine = undefined; // no device: a refusal allocates nothing
     e.c.vocab = 64; // two words a row

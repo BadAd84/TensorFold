@@ -138,6 +138,8 @@ pub const Lanes = struct {
             else if (block) null else self.mtp_confidence,
             .window_costs = if (block) (if (self.timed) |*t| &t.window else &gb10_window_costs) else &.{},
             .shared_costs = if (block) (if (self.timed) |*t| t.shared[0..self.x.e.settings.shared_rows] else gb10_shared_costs[0..self.x.e.settings.shared_rows]) else &.{},
+            // TF_GLM_OVN_WIN_FREE: no shared cost table, so each round's windows fill likeliest-first to its cap
+            .free_shared = block and cuda.ovn.on("WIN_FREE"), // a lone stream's window costs are untouched
             .hidden_rows = sharing,
             .batch_rows = if (sharing) self.x.e.settings.shared_rows else 0, // TF_GLM_OVN_SHARED_ROWS: the allocator's cap
             .max_streams = if (sharing) engine.max_shared else 1,

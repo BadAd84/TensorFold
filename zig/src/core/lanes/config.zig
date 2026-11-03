@@ -35,6 +35,7 @@ pub const Model = struct {
     batch_rows: u32 = 0, // a shared forward's rows at most (0: 32)
     max_streams: u32 = 0, // a shared forward's streams at most (0: 32)
     shared_costs: []const Cost = &.{}, // shared forwards' ms by total rows (timed at load)
+    free_shared: bool = false, // TF_GLM_OVN_WIN_FREE: shared windows allocate with no cost model
     draft_probabilities: bool = false, // the head gives each drafted node's chance of landing
     draft_streams: bool = false, // the head drafts every stream of a shared round in one batch
     head_trees: bool = false, // the head drafts trees of lanes (DraftRequest.lanes) and holds them
@@ -100,6 +101,7 @@ pub const Config = struct {
     first_tree: bool = true, // Model.first_tree
     shared_depth_full: bool = false, // Model.shared_depth_full
     shared_copy_width: bool = false, // Model.shared_copy_width
+    free_shared: bool = false, // Model.free_shared: shared_costs is empty, windows.fill fills by chance alone
     k: Constants = .{},
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
@@ -118,18 +120,21 @@ pub const Config = struct {
         for (m.window_costs) |c| {
             if (c.width >= 1 and c.width <= width) try family_costs.put(gpa, c.width, c.ms);
         }
-        // shared forwards: window costs then timed shared rows (a later table overrides), extended to batch_rows
+        // shared forwards: window costs then timed shared rows (a later table overrides), extended to batch_rows.
+        // free_shared: no table at all, so windows.allocate prices no row (window costs are a lone window's)
         var timed: std.ArrayList(Cost) = .empty;
         defer timed.deinit(gpa);
-        for ([_][]const Cost{ m.window_costs, m.shared_costs }) |table| {
-            for (table) |c| {
-                if (c.width < 1 or c.width > batch_rows) continue;
-                for (timed.items) |*t| {
-                    if (t.width == c.width) {
-                        t.ms = c.ms;
-                        break;
-                    }
-                } else try timed.append(gpa, c);
+        if (!m.free_shared) {
+            for ([_][]const Cost{ m.window_costs, m.shared_costs }) |table| {
+                for (table) |c| {
+                    if (c.width < 1 or c.width > batch_rows) continue;
+                    for (timed.items) |*t| {
+                        if (t.width == c.width) {
+                            t.ms = c.ms;
+                            break;
+                        }
+                    } else try timed.append(gpa, c);
+                }
             }
         }
         const depth_prior = try gpa.dupe(f64, prior);
@@ -171,6 +176,7 @@ pub const Config = struct {
             .draft_step_ms = m.draft_step_ms,
             .shared_depth_full = m.shared_depth_full,
             .shared_copy_width = m.shared_copy_width,
+            .free_shared = m.free_shared,
         };
     }
 
