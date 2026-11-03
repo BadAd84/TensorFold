@@ -39,6 +39,7 @@ pub const State = struct {
 /// What the rule reads of a stream when it decides.
 pub const Who = struct {
     state: *?State,
+    progress: u64 = 0, // tokens this stream has emitted: a stream that trails the round's leader is catching up
     draft_room: i64,
     finished: bool,
     forced: bool,
@@ -76,6 +77,7 @@ pub const Rule = struct {
     full_depth: bool = false, // TF_GLM_OVN_DEPTH_FULL: budgets ask most_drafts, no last grant + draft_slack ratchet
     row_cost: @import("row_cost.zig").RowCost = .{}, // what a row costs past shared_costs here, under k.learn_rows
     fair_shared: bool = false, // TF_GLM_OVN_WIN_FAIR: shared rows go to the shallowest stream, so the streams finish together
+    catchup: bool = false, // TF_GLM_OVN_WIN_CATCHUP: one row moves a round from the stream furthest ahead to the one furthest behind
     round_ms: Table = .{}, // a round's wall time by drafts, every stream's: what sampled streams price by
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
     greedy_ms: Table = .{}, // round_ms from greedy rounds alone: what greedy streams price by
@@ -346,6 +348,7 @@ pub const Rule = struct {
             try alloc.allocateDrafts(r.gpa, ones, probs, r.shared_costs, r.fixedMs(whos.len, sampled), r.row_cost.capRows(whos.len, sampled, @max(whos.len, r.batch_rows)), head);
         defer r.gpa.free(counts);
         r.probeShared(whos, most, counts);
+        if (r.catchup) catchUp(whos, most, counts);
         if (r.plain_guard) {
             // no draft where none pays; a probe after a growing run of plain rounds
             for (whos, counts) |w, *c| {
@@ -360,6 +363,25 @@ pub const Rule = struct {
             return;
         }
         for (whos, most, counts, out) |*w, m, c, *o| o.* = try r.headDepth(w, @min(m, @max(1, @as(i64, c))), probe);
+    }
+
+    /// One row a round moves from the stream furthest ahead to the one furthest behind, so drift cannot accumulate:
+    /// fair shares a round's rows evenly, but acceptance still differs, and only cross-round progress sees that.
+    pub fn catchUp(whos: []const Who, most: []const i64, counts: []u32) void {
+        if (whos.len < 2) return;
+        var lead: ?usize = null;
+        var lag: ?usize = null;
+        for (whos, 0..) |w, i| {
+            if (w.finished or w.forced) continue;
+            if (lead == null or w.progress > whos[lead.?].progress) lead = i;
+            if (lag == null or w.progress < whos[lag.?].progress) lag = i;
+        }
+        const l = lead orelse return;
+        const g = lag orelse return;
+        if (l == g or counts[l] <= 1 or @as(i64, counts[g]) >= most[g]) return;
+        if (whos[l].progress <= whos[g].progress) return;
+        counts[l] -= 1;
+        counts[g] += 1;
     }
 
     // One extra offered row, rotating streams; the normal window allocator still prices and trims it.
@@ -599,4 +621,26 @@ test "a granted hold stays only while its stream's expected drafts pay for the v
     out = .{ 4, 4, 2, 3 };
     try rule.payHolds(&whos, false, &out);
     try std.testing.expectEqualSlices(i64, &.{ 0, 0, 2, 0 }, &out); // a probe after a grant of none keeps its hold
+}
+
+test "catchUp moves a row from the stream furthest ahead to the one furthest behind" {
+    var a: ?State = null;
+    var b: ?State = null;
+    const whos = [_]Who{
+        .{ .state = &a, .progress = 900, .draft_room = 8, .finished = false, .forced = false },
+        .{ .state = &b, .progress = 400, .draft_room = 8, .finished = false, .forced = false },
+    };
+    const most = [_]i64{ 8, 8 };
+    var counts = [_]u32{ 4, 4 };
+    Rule.catchUp(&whos, &most, &counts);
+    try std.testing.expectEqual(@as(u32, 3), counts[0]);
+    try std.testing.expectEqual(@as(u32, 5), counts[1]);
+    // a leader with nothing to give changes nothing
+    var one = [_]u32{ 1, 4 };
+    Rule.catchUp(&whos, &most, &one);
+    try std.testing.expectEqual(@as(u32, 1), one[0]);
+    // a laggard already at its room changes nothing
+    var full = [_]u32{ 4, 8 };
+    Rule.catchUp(&whos, &most, &full);
+    try std.testing.expectEqual(@as(u32, 4), full[0]);
 }
