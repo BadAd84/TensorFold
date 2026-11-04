@@ -101,6 +101,7 @@ const glm_snap_gather_tests = @import("glm_snap_gather_tests.zig");
 const glm_solo_tests = @import("glm_solo_tests.zig");
 const glm_kv_host_slots = @import("glm_kv_host_slots.zig");
 const glm_tap_tests = @import("glm_tap_tests.zig");
+const kv_host_bw_tests = @import("kv_host_bw_tests.zig");
 const glm_synth = @import("glm_synth.zig");
 const tree_round_tests = @import("tree_round_tests.zig");
 const tree_tests = @import("tree_tests.zig");
@@ -312,6 +313,7 @@ const usage =
     \\  glm-pk8-check             TF_GLM_OVN_PK8's kv8 pooled keys: writer against kv8.quantize_rows, scorers against bf16 on their values (one GPU)
     \\  glm-snap-gather           TF_GLM_OVN_SNAP_GATHER's keep and restore by tf_glm_snap_copy against a memcpy a piece (one GPU)
     \\  glm-kv-host-slots         TF_GLM_KV_HOST's gather past its slots is refused as error.GlmKvHostSlots, then one within (one GPU)
+    \\  kvh-bw                   a 1 GiB checksum read from device memory against the same bytes in mapped pinned host memory (one GPU)
     \\  glm-ref                   GLM projections (matmuls, router, attention, indexer, hc) against float64 (synthetic)
     \\  glm-lanes-cover <ckpt> <dc.json> <rank> <world> <idfile>  copy drafts, cancels, discards, eos and max_new on one lanes.Engine across requests
     \\  glm-lanes-concurrent <ckpt> <dc.json> <rank> <world> <idfile>  concurrent streams on one lanes.Engine, each against its solo run
@@ -502,6 +504,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "glm-pk8-check")) return glm_pk8_check.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-snap-gather")) return glm_snap_gather_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-kv-host-slots")) return glm_kv_host_slots.run(gpu);
+    if (std.mem.eql(u8, cmd, "kvh-bw")) return kv_host_bw_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-vision")) return glm_vision_tests.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "modelopt")) return modelopt_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "moe")) return moe_tests.run(gpu);
