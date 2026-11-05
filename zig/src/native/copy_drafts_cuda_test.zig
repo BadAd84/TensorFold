@@ -97,6 +97,9 @@ const main_window_costs = mainCosts(16);
 const main_shared_costs = mainCosts(32);
 
 test "CUDA lane copies: default and serving drafts off keep literal main facts" {
+    const cuda = @import("cuda");
+    cuda.ovn.fake("SHARED_DRAFTS", "1"); // main's GLM facts: the core's shared allocator (our serve: the depth rule)
+    defer cuda.ovn.fake("SHARED_DRAFTS", null);
     for (families) |family| {
         const main = mainFacts(family);
         try std.testing.expectEqualDeep(main, facts(family, false));
