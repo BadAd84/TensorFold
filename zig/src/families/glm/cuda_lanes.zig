@@ -124,7 +124,7 @@ pub const Lanes = struct {
         const block = self.x.e.drafter != null;
         const sharing = drafting and !self.alone;
         return .{
-            .allocate_shared_drafts = drafting,
+            .allocate_shared_drafts = drafting and cuda.ovn.on("SHARED_DRAFTS"), // off: the depth rule
             .exact_width = if (drafting) max_rows else 1,
             .first_copy_rows = mtp_rows, // a first copy as wide as a head round; it grows as its tokens land
             .gpu_tokens = false,
