@@ -12,11 +12,14 @@ pub const Wait = struct {
     ns: i96 = @as(i96, default_ms) * std.time.ns_per_ms,
     waits: u64 = 0, // requests that waited for another fill's cut
     timeouts: u64 = 0, // of them, released at the bound with the cut not reached
+    min_rows: u32 = 0, // TENSORFOLD_PREFIX_WAIT_MIN_ROWS: a cut worth fewer rows than this is filled, not waited for (0: any)
 
     pub const default_ms: u32 = 60_000;
 
     pub fn fromEnv() Wait {
-        return fromText(std.mem.span(std.c.getenv("TENSORFOLD_PREFIX_WAIT_MS") orelse return .{}));
+        var w = fromText(std.mem.span(std.c.getenv("TENSORFOLD_PREFIX_WAIT_MS") orelse ""));
+        if (std.c.getenv("TENSORFOLD_PREFIX_WAIT_MIN_ROWS")) |v| w.min_rows = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0;
+        return w;
     }
 
     /// A bound from its text: whole milliseconds, 0 off; anything else is the default.
@@ -41,7 +44,8 @@ pub fn waits(h: *LaneHost, job: *Job) bool {
     if (!keyed(r)) return false;
     const spans = h.spans(r);
     const have: u32 = if (store.find(r.cacheKey(), r.chunks, spans)) |e| e.at else 0;
-    const least = have +| @max(store.rules.min_gap, 1); // a cut this far past what is kept already
+    // a cut the wait would save fewer than min_rows rows of: the prompt fills itself beside the leader instead
+    const least = @max(have +| @max(store.rules.min_gap, 1), have +| h.prefix.min_rows);
     var best: Waiting = .{};
     for (h.filling.items) |l| { // admitted fills never wait, so the oldest always runs
         if (!l.started or l.prefilled != null or l.request.background or !keyed(l.request)) continue;

@@ -78,6 +78,7 @@ const Hook = struct {
 
 const Setup = struct {
     wait_ms: ?u32 = null, // null: the default bound
+    min_rows: u32 = 0, // TENSORFOLD_PREFIX_WAIT_MIN_ROWS: a cut worth fewer rows is filled, not waited for
     stepped: bool = true, // prompts fill a chunk a step (prefill_step)
     requests: usize = 5,
     shared: u32 = system_len, // the shared block the requests name
@@ -120,6 +121,7 @@ fn fanout(su: Setup, out: *Run) !void {
     var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 8 });
     host.cache = &store;
     if (su.wait_ms) |ms| host.prefix.ns = @as(i96, ms) * std.time.ns_per_ms;
+    host.prefix.min_rows = su.min_rows;
     const e = host.engine();
     var hook = su.hook;
     hook.engine = e;
@@ -209,6 +211,19 @@ test "prefix wait: a shared cut under the store's min_gap is not waited for" {
     defer r.deinit();
     try fanout(.{ .requests = 2, .shared = 130 }, &r); // its cut, 128, adds under 256 tokens past the waiter's hit
     try std.testing.expectEqual(@as(u64, 0), r.waits);
+}
+
+test "prefix wait: under TENSORFOLD_PREFIX_WAIT_MIN_ROWS a shared cut is filled beside the leader, over it waited for" {
+    var low: Run = .{};
+    defer low.deinit();
+    try fanout(.{ .min_rows = cut + 1 }, &low); // the cut saves `cut` rows: fewer than asked, so nobody waits
+    try std.testing.expectEqual(@as(u64, 0), low.waits);
+    try std.testing.expectEqualSlices(?u32, &.{ 0, 0, 0, 0, 0 }, low.cached[0..5]);
+    var high: Run = .{};
+    defer high.deinit();
+    try fanout(.{ .min_rows = cut }, &high); // exactly worth it: the wait is as without the knob
+    try std.testing.expectEqual(@as(u64, 3), high.waits);
+    try std.testing.expectEqualSlices(?u32, &.{ 0, cut, cut, cut, 0 }, high.cached[0..5]);
 }
 
 test "prefix wait: TENSORFOLD_PREFIX_WAIT_MS is whole milliseconds, 0 off, anything else the default" {
