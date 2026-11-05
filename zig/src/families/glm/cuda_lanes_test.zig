@@ -106,6 +106,21 @@ test "TF_GLM_OVN_DEPTH_FULL and SHARED_COPY: each knob reaches the round loop's 
     }
 }
 
+test "TF_GLM_OVN_SHARED_DRAFTS: shared rounds draft by the depth rule unless the knob hands them to the core's allocator" {
+    const cuda = @import("cuda");
+    defer cuda.ovn.fake("SHARED_DRAFTS", null);
+    var e: engine.Engine = undefined;
+    e.mtp = true;
+    var dr: @import("dflash.zig").Drafter = undefined;
+    e.drafter = &dr;
+    e.settings = .{};
+    for ([_]?[]const u8{ null, "0", "1" }) |v| {
+        cuda.ovn.fake("SHARED_DRAFTS", v);
+        const self: Lanes = .{ .x = .{ .e = &e, .link = undefined } };
+        try std.testing.expectEqual(v != null and v.?[0] == '1', self.facts().allocate_shared_drafts);
+    }
+}
+
 test "TF_GLM_OVN_WIN_FREE: the knob empties the shared table and leaves the lone window costs, off by default" {
     const gpa = std.testing.allocator;
     const cuda = @import("cuda");
