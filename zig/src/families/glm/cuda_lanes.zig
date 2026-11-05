@@ -139,6 +139,8 @@ pub const Lanes = struct {
             .window_costs = if (block) (if (self.timed) |*t| &t.window else &gb10_window_costs) else &.{},
             .shared_costs = if (block) (if (self.timed) |*t| t.shared[0..self.x.e.settings.shared_rows] else gb10_shared_costs[0..self.x.e.settings.shared_rows]) else &.{},
             // TF_GLM_OVN_WIN_FREE: no shared cost table, so each round's windows fill likeliest-first to its cap
+            // TF_GLM_OVN_PLAIN_MARGIN: hundredths; a draft must beat plain rounds by this (0: the core's 105)
+            .plain_margin = @as(f64, @floatFromInt(cuda.ovn.int("PLAIN_MARGIN", 0) catch 0)) / 100.0,
             .free_shared = block and cuda.ovn.on("WIN_FREE"), // a lone stream's window costs are untouched
             .hidden_rows = sharing,
             .batch_rows = if (sharing) self.x.e.settings.shared_rows else 0, // TF_GLM_OVN_SHARED_ROWS: the allocator's cap
