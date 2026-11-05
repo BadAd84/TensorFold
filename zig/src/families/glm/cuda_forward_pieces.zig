@@ -34,12 +34,17 @@ pub fn piecedLayers(f: *const Forward, p: *const Pieces, R: usize, cut: []const 
     for (layers[lo..hi], lo..) |_, j| {
         prof.context(f.prof, j, null, .mixer);
         for (f.ranks) |r| if (r.segs.len > 0) try shared.mixer(f, r, r.w.layers[j], li, di, R, null) else try f.mixerFrom(r, r.w.layers[j], li, di, R, @min(latent.chunksFor(r.st.pos + R), r.b.nch), null, ahead and j > 0);
+        if (f.prof) |pr| pr.mark(f.stream, if (layers[j].mixer == .kda) .kda else .mla);
         try exchangePieces(f, p, j, .mixer, cut, false);
+        if (f.prof) |pr| pr.mark(f.stream, .gather_a);
         try gluePieces(f, p, j, .mixer, cut, R, ahead);
+        if (f.prof) |pr| pr.mark(f.stream, .glue);
         prof.context(f.prof, j, null, .ffn);
         for (f.ranks) |r| if (ahead) try fronts.ffnRest(f, r, r.w.layers[j], R) else try f.ffn(r, r.w.layers[j], R, null);
         try exchangePieces(f, p, j, .ffn, cut, ahead);
+        if (f.prof) |pr| pr.mark(f.stream, .gather_b);
         try gluePieces(f, p, j, .ffn, cut, R, ahead and j + 1 < layers.len);
+        if (f.prof) |pr| pr.mark(f.stream, .glue);
         if (f.taps) |t| try tapPieces(f, t, j, cut);
         switch (layers[j].mixer) {
             .kda => li += 1,
