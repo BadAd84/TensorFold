@@ -80,9 +80,34 @@ const Direct = struct {
     lo: usize,
     dims: usize,
 
+    /// TF_GLM_OVN_EXCHANGE_KB: a direct exchange's send and receive in pieces of at most this many KiB (0: whole);
+    /// a 4,096-row chunk's 11 MB share gathers at a seventh of the rate a 4 MB one does, and the pieces land where the
+    /// whole would, byte for byte.
+    fn pieceBytes() usize {
+        return @as(usize, @intCast(cuda.ovn.int("EXCHANGE_KB", 0) catch 0)) << 10; // ovn caches the read itself
+    }
     fn post(t: Direct, peer: usize, src: u64, out: usize, dst: u64, in: usize, ty: cuda.nccl.DataType) !void {
-        try t.lib.check(t.lib.api.ncclSend(src, out, ty, @intCast(peer), t.comm, t.side.handle), "ncclSend");
-        try t.lib.check(t.lib.api.ncclRecv(dst, in, ty, @intCast(peer), t.comm, t.side.handle), "ncclRecv");
+        const width: usize = if (ty == .f32) 4 else 2;
+        const piece = pieceBytes() / width; // elements a piece
+        if (piece == 0 or (out <= piece and in <= piece)) {
+            try t.lib.check(t.lib.api.ncclSend(src, out, ty, @intCast(peer), t.comm, t.side.handle), "ncclSend");
+            try t.lib.check(t.lib.api.ncclRecv(dst, in, ty, @intCast(peer), t.comm, t.side.handle), "ncclRecv");
+            return;
+        }
+        var so: usize = 0;
+        var ro: usize = 0;
+        while (so < out or ro < in) {
+            if (so < out) {
+                const n = @min(piece, out - so);
+                try t.lib.check(t.lib.api.ncclSend(src + so * width, n, ty, @intCast(peer), t.comm, t.side.handle), "ncclSend");
+                so += n;
+            }
+            if (ro < in) {
+                const n = @min(piece, in - ro);
+                try t.lib.check(t.lib.api.ncclRecv(dst + ro * width, n, ty, @intCast(peer), t.comm, t.side.handle), "ncclRecv");
+                ro += n;
+            }
+        }
     }
     fn partials(t: Direct) anyerror!void {
         const x = t.x;
@@ -106,8 +131,8 @@ const Direct = struct {
 /// NCCL for the relay's postings: each call in order, and the call numbered `fail` returns an error.
 const Fake = struct {
     const Kind = enum { start, end, send, recv };
-    const Call = struct { kind: Kind, peer: c_int = -1 };
-    var calls: [64]Call = undefined;
+    const Call = struct { kind: Kind, peer: c_int = -1, ptr: u64 = 0, count: usize = 0 };
+    var calls: [256]Call = undefined;
     var n: usize = 0;
     var fail: ?usize = null;
 
@@ -122,11 +147,11 @@ const Fake = struct {
     fn end() callconv(.c) cuda.nccl.Result {
         return note(.{ .kind = .end });
     }
-    fn send(_: cuda.abi.DevicePtr, _: usize, _: cuda.nccl.DataType, peer: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
-        return note(.{ .kind = .send, .peer = peer });
+    fn send(ptr: cuda.abi.DevicePtr, count: usize, _: cuda.nccl.DataType, peer: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+        return note(.{ .kind = .send, .peer = peer, .ptr = ptr, .count = count });
     }
-    fn recv(_: cuda.abi.DevicePtr, _: usize, _: cuda.nccl.DataType, peer: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
-        return note(.{ .kind = .recv, .peer = peer });
+    fn recv(ptr: cuda.abi.DevicePtr, count: usize, _: cuda.nccl.DataType, peer: c_int, _: cuda.nccl.Comm, _: cuda.abi.Stream) callconv(.c) cuda.nccl.Result {
+        return note(.{ .kind = .recv, .peer = peer, .ptr = ptr, .count = count });
     }
     fn library() cuda.nccl.Library {
         var api: cuda.nccl.Api = undefined;
@@ -185,4 +210,44 @@ test "a posting that fails, at each posting in turn, ends its group and posts no
             try std.testing.expectEqual(if (failed == .send or failed == .recv) k + 2 else k + 1, Fake.n);
         }
     };
+}
+
+test "TF_GLM_OVN_EXCHANGE_KB: a direct exchange in pieces covers each whole posting's bytes, per peer and kind, in order" {
+    const lib = Fake.library();
+    const x: Relay = .{ .world = 3, .rank = 1, .n = 4096 };
+    cuda.ovn.fake("EXCHANGE_KB", null);
+    Fake.n = 0;
+    Fake.fail = null;
+    try Fake.run(&lib, x, .split_partials);
+    const whole_n = Fake.n;
+    var whole: [256]Fake.Call = undefined;
+    @memcpy(whole[0..whole_n], Fake.calls[0..whole_n]);
+    cuda.ovn.fake("EXCHANGE_KB", "16"); // 16 KiB: a 1,366-row share of 8 dims at 4 bytes is 43 KiB, so three pieces
+    defer cuda.ovn.fake("EXCHANGE_KB", null);
+    Fake.n = 0;
+    try Fake.run(&lib, x, .split_partials);
+    try std.testing.expect(Fake.n > whole_n);
+    try std.testing.expectEqual(Fake.Kind.start, Fake.calls[0].kind);
+    try std.testing.expectEqual(Fake.Kind.end, Fake.calls[Fake.n - 1].kind);
+    // NCCL pairs postings per peer and kind in order: for each whole send (or receive) to a peer, the pieces of that
+    // kind to that peer, taken in order, start where it starts, stay within the piece size, and total its count
+    for (whole[0..whole_n]) |w| {
+        if (w.kind != .send and w.kind != .recv) continue;
+        var covered: usize = 0;
+        var at: u64 = w.ptr;
+        var seen_first = false;
+        for (Fake.calls[0..Fake.n]) |c| {
+            if (c.kind != w.kind or c.peer != w.peer) continue;
+            if (!seen_first) {
+                if (c.ptr != w.ptr) continue; // pieces of an earlier whole posting to the same peer
+                seen_first = true;
+            }
+            if (covered >= w.count) break;
+            try std.testing.expectEqual(at, c.ptr);
+            try std.testing.expect(c.count <= (16 << 10) / 4);
+            covered += c.count;
+            at += c.count * 4;
+        }
+        try std.testing.expectEqual(w.count, covered);
+    }
 }
