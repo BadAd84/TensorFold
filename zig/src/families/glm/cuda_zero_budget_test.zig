@@ -6,6 +6,9 @@ const dflash = @import("dflash.zig");
 const proposals = @import("dflash_proposals.zig");
 
 test "zero grant: GLM CUDA MTP and DFlash2 preserve tokens through a long skip" {
+    const cuda = @import("cuda");
+    cuda.ovn.fake("SHARED_DRAFTS", "1"); // the core's shared allocator, whose zero grants this checks
+    defer cuda.ovn.fake("SHARED_DRAFTS", null);
     var e: engine.Engine = undefined;
     e.mtp = true;
     e.settings = .{}; // the load's settings: facts sizes its shared cost table by its 32 shared rows
