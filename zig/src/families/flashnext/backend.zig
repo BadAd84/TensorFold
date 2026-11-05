@@ -100,7 +100,7 @@ pub const Backend = struct {
     }
 
     pub fn backend(b: *Backend) be.Backend {
-        return .{ .ptr = b, .vtable = &.{ .prefill = fill.Callbacks(Backend).whole, .prefill_step = fill.Callbacks(Backend).one, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .first_masked = grammar.firstMasked, .held = grammar.held } };
+        return .{ .ptr = b, .vtable = &.{ .prefill = fill.Callbacks(Backend).whole, .prefill_step = fill.Callbacks(Backend).one, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .first_masked = grammar.firstMasked, .held = grammar.held, .reports_fill = true } };
     }
 
     pub const facts = batch_costs.facts;
@@ -292,7 +292,7 @@ pub const Backend = struct {
             defer old.restore(b.e);
             outputs(b, s, 0);
             var watch = try think.Watch.init(.{}); // no thinking budget: lone_host_lone.fits keeps those in the lane core
-            const res = try b.e.decode(prompt, s.first, s.last, stream.max_new, stream.eos, null, &watch, .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled }, &ho);
+            const res = try b.e.decode(prompt, s.first, s.last, stream.max_new, stream.eos, null, &watch, .{ .ctx = &c, .prefilled = Ctx.prefilled, .tokens = Ctx.tokens, .cancelled = Ctx.cancelled, .sampling = sample.active(stream.sampling) }, &ho);
             if (c.failed) |err| return err;
             stream.rounds += res.rounds;
             stream.drafted += res.drafted;
