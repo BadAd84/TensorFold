@@ -4,8 +4,8 @@ const cuda = @import("cuda");
 pub const prompt_trace = @import("cuda_prompt_trace.zig");
 pub const route = @import("cuda_prof_route.zig");
 
-pub const Section = enum { gate, embed, kda, mla, mla_chunks, mla_merge, gather_a, dense, router, routed, shared, gather_b, head, draw, mtp, commit };
-const names = [_][]const u8{ "gate", "embed", "kda", "mla", "mla_chunks", "mla_merge", "gather_a", "dense", "router", "routed", "shared", "gather_b", "head", "draw", "mtp", "commit" };
+pub const Section = enum { gate, embed, kda, mla, mla_chunks, mla_merge, gather_a, glue, dense, router, routed, shared, gather_b, head, draw, mtp, commit };
+const names = [_][]const u8{ "gate", "embed", "kda", "mla", "mla_chunks", "mla_merge", "gather_a", "glue", "dense", "router", "routed", "shared", "gather_b", "head", "draw", "mtp", "commit" };
 const max_marks = 1024; // a window of 8 segments: 4 a layer plus the mla split's 3 or 6 per segment and MLA layer
 
 pub const Prof = struct {

@@ -469,6 +469,7 @@ pub const Forward = struct {
                     try f.post(r, r.b.x, R, 0);
                     try f.pre(r, l.ffn_hc, l.post_norm, R);
                 }
+                if (f.prof) |p| p.mark(f.stream, .glue); // the FFN-side HC glue and norm, apart from the router after it
                 try f.ffn(r, l, R, slot(r, R));
             }
             alt = alt != fuse;
