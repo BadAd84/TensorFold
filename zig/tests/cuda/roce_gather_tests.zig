@@ -108,24 +108,27 @@ fn timing(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize, world:
     defer t0.deinit();
     var t1 = try cuda.Event.init(gpu.d, true);
     defer t1.deinit();
-    var mine = try cuda.DeviceBuffer.alloc(gpu.d, 65536);
+    const prompt_shard = 4096 * 2048 * 4 / 3; // a 4,096-row prompt chunk's fp32 partials, one rank's share at TP=3
+    var mine = try cuda.DeviceBuffer.alloc(gpu.d, prompt_shard);
     defer mine.free();
-    var all = try cuda.DeviceBuffer.alloc(gpu.d, world * 65536);
+    var all = try cuda.DeviceBuffer.alloc(gpu.d, world * prompt_shard);
     defer all.free();
-    for ([_]usize{ 4096, 8192, 32768, 65536 }) |n| {
+    for ([_]usize{ 4096, 8192, 32768, 65536, 1 << 20, 1 << 22, prompt_shard }) |n| {
+        const r: usize = if (n >= 1 << 20) reps / 50 else reps; // prompt-sized shards: fewer calls, the same median
         var us: [2]f64 = undefined;
         for (0..2) |which| {
             for (0..2) |round| { // the first round warms
                 try t0.record(s);
-                for (0..reps) |_| {
+                for (0..r) |_| {
                     if (which == 0) try g.allGather(s, mine.ptr, all.ptr, n) else try g.lib.check(g.lib.api.ncclAllGather(mine.ptr, all.ptr, n, .u8, g.comm, s.handle), "ncclAllGather");
                 }
                 try t1.record(s);
                 try t1.synchronize();
-                if (round == 1) us[which] = @as(f64, try cuda.Event.elapsedMs(t0, t1)) * 1000.0 / reps;
+                if (round == 1) us[which] = @as(f64, try cuda.Event.elapsedMs(t0, t1)) * 1000.0 / @as(f64, @floatFromInt(r));
             }
         }
         try g.check();
-        check.pass("roce-gather rank {d}: {d} bytes a rank, {d} calls: RoCE {d:.1} us a call, NCCL {d:.1} us", .{ rank, n, reps, us[0], us[1] });
+        const gbs = @as(f64, @floatFromInt(n * (world - 1))) / (us[0] * 1e3); // bytes received a rank over the call
+        check.pass("roce-gather rank {d}: {d} bytes a rank, {d} calls: RoCE {d:.1} us a call ({d:.2} GB/s in), NCCL {d:.1} us", .{ rank, n, r, us[0], gbs, us[1] });
     }
 }
