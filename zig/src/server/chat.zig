@@ -156,6 +156,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
     };
+    const salt = @import("cache_salt.zig").read(f.get("cache_salt"));
+    if (salt == .bad) return cx.refuse(salt.bad);
+    // cache_salt: a key-only prefix, so kept states are resumed under their own salt and the prompt is untouched
+    const cache_key = if (salt == .some) try @import("cache_salt.zig").salted(a, salt.some, rendered.cache_key, rendered.ids) else rendered.cache_key;
     const sampling = try srv.resolveSampling(cx, f, input.temperature, rendered.ids);
     const draft_field = f.get("draft");
     const drafts = srv.config.use_drafts and !(draft_field != null and draft_field.? == .bool and !draft_field.?.bool);
@@ -178,7 +182,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
         .images = rendered.images,
-        .cache_key = rendered.cache_key,
+        .cache_key = cache_key,
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
     errdefer srv.release(false, request);
