@@ -130,5 +130,25 @@ fn timing(gpu: Gpu, g: *cuda.tp_group.Group, s: cuda.Stream, rank: usize, world:
         try g.check();
         const gbs = @as(f64, @floatFromInt(n * (world - 1))) / (us[0] * 1e3); // bytes received a rank over the call
         check.pass("roce-gather rank {d}: {d} bytes a rank, {d} calls: RoCE {d:.1} us a call ({d:.2} GB/s in), NCCL {d:.1} us", .{ rank, n, r, us[0], gbs, us[1] });
+        if (n == prompt_shard) { // the same share as pieces of at most 4 MB, each its own gather: what chunking the exchange would cost
+            const piece: usize = 4 << 20;
+            const pieces = (n + piece - 1) / piece;
+            var pus: f64 = 0;
+            for (0..2) |round| {
+                try t0.record(s);
+                for (0..r) |_| {
+                    var off: usize = 0;
+                    while (off < n) : (off += piece) {
+                        const len = @min(piece, n - off);
+                        try g.lib.check(g.lib.api.ncclAllGather(mine.ptr + off, all.ptr + off * world, len, .u8, g.comm, s.handle), "ncclAllGather");
+                    }
+                }
+                try t1.record(s);
+                try t1.synchronize();
+                if (round == 1) pus = @as(f64, try cuda.Event.elapsedMs(t0, t1)) * 1000.0 / @as(f64, @floatFromInt(r));
+            }
+            const pgbs = @as(f64, @floatFromInt(n * (world - 1))) / (pus * 1e3);
+            check.pass("roce-gather rank {d}: the {d}-byte share as {d} NCCL gathers of at most {d} bytes (pieces interleaved by rank): {d:.1} us a call ({d:.2} GB/s in)", .{ rank, n, pieces, piece, pus, pgbs });
+        }
     }
 }
