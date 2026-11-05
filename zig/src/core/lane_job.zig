@@ -29,9 +29,11 @@ pub const Job = struct {
     began: i96 = 0,
     /// The engine thread says the prompt pass is going: status readers may count this job's fill atomics.
     fill_on: std.atomic.Value(bool) = .init(false),
+    load: @import("lane_host_load.zig").Pass = .{}, // this attempt's prompt pass in the load ledger
     prefilled: ?i96 = null,
     entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
     marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
+    frame: u32 = 0, // exact family frame, before its compact cache-word hash
     key: []u32 = &.{}, // the request's cache key with its image frame in the first word (gpa-owned); empty: its own
     kept0: u64 = 0, // the store's kept count when the job looked it up
     seq: u64 = 0, // its admission's number
@@ -39,6 +41,7 @@ pub const Job = struct {
     reached: u32 = 0, // the furthest mark its prompt pass has stood at, kept or not
     prefix: @import("lane_host_prefix.zig").Waiting = .{}, // its wait for another fill's cut, while queued
     fetch: @import("lane_host_fetch.zig").Ticket = .{}, // its disk state read ahead, while queued
+    lease: @import("kv_ledger.zig").Lease = .{}, // its caches' bytes in the host's ledger, from admission to its end
 
     /// Record first admission once, including a family planner and a background pass that later yields.
     pub fn noteAdmission(job: *Job) void {
@@ -58,7 +61,7 @@ pub const Job = struct {
         if (job.host.cache) |store| {
             store.spares_only = job.spares();
             defer store.spares_only = false;
-            _ = store.keepBorn(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+            _ = store.keepBornFrame(job.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request), job.request.images, job.frame);
         }
     }
 

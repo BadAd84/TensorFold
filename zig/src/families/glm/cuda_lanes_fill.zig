@@ -27,7 +27,7 @@ pub fn onward(self: *Lanes, s: *lanes.Stream, l: *Lane) !bool {
         s.slice_pending = false;
     }
     try self.x.bind(l.slot);
-    const step = try self.x.slicePart(self.othersDecode(s));
+    const step = try self.x.slicePart(@import("cuda_prompt_solo.zig").othersDecode(&self.lanes, s));
     s.slice_pending = step.sliced;
     if (step.sliced) return false;
     l.slicing = false;
@@ -107,11 +107,12 @@ pub fn multiFill(self: *Lanes, ss: []const *lanes.Stream) !bool {
     var at: [max]usize = undefined; // where each prompt stands
     var from: [max]?engine.Resume = undefined; // its kept state, until its first piece restores it
     var marks: [max]?engine.Marks = undefined;
+    var keeps: [max]@import("cuda_prefix.zig").Keeps = undefined; // each stream's, while its marks are read
     for (ss, 0..) |s, i| {
         from[i] = try self.opening(s);
         opened += 1;
         at[i] = if (from[i]) |r| r.at else 0;
-        marks[i] = Lanes.marksOf(s);
+        marks[i] = self.marksOf(s, &keeps[i]);
     }
     while (true) {
         var lens: [max]usize = undefined;

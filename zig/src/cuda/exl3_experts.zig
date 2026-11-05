@@ -38,7 +38,8 @@ pub const Layer = struct {
     shared_input: bool = false, // the loader verified identical gate/up input scales across every expert
     gu_stride: usize = 0, // gate/up trellis row stride in tiles (0: contiguous per projection)
     limit: f32 = 0, // the SwiGLU clamp (0: none)
-    act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32
+    act_mode: i32 = 0, // 0: GLM's bf16 roundings (the route RED-SNOW runs), 1: fp32, 2: SwiGLU-OAI (Grouped only)
+    alpha: f32 = 0, // SwiGLU-OAI's sigmoid scale (act_mode 2)
     gate_base: u64 = 0, // every expert's gate trellis back to back, expert e at e * expertWords (0: not known)
     up_base: u64 = 0,
     down_base: u64 = 0,
@@ -303,6 +304,7 @@ pub const Experts = struct {
         std.debug.assert(rows >= 1 and rows <= sc.rows);
         std.debug.assert(slots >= 1 and slots <= 32);
         std.debug.assert(l.experts >= 1 and l.experts <= 4096);
+        if (l.act_mode != 0 and l.act_mode != 1) return error.BadExperts; // SwiGLU-OAI runs through Grouped only
         const g_sk = try plan(d, w, true);
         const d_sk = try plan(w, d, false);
         const p = rows * slots;

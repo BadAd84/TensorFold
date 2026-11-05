@@ -61,17 +61,13 @@ fn layerLinears(gpa: std.mem.Allocator, l: *Layer, list: *std.ArrayList(Lin)) !v
     }
 }
 
-/// Every linear b16.matmul reads, as the fields holding them; the head last, when it is bf16.
-/// TF_GLM_KDA_PAD: move an uneven fused KDA input stack into its own eight-aligned buffer (its true rows, then
-/// zeros), so `tiledInput()` passes and the stack is packed instead of staying bf16 row-major. The pad columns are
-/// computed from zero weights and ignored; the field offsets inside a row (f_a, g_a, b) do not move.
+/// Move an uneven fused KDA stack into an eight-aligned buffer so tiledInput() passes; pad columns are ignored.
 pub fn padKdaInputs(w: *Weights, d: *const cuda.Driver, s: cuda.Stream) !void {
     for (w.layers) |*l| switch (l.mixer) {
         .kda => |*x| try padOneKdaInput(w, d, s, x),
         else => {},
     };
-    // The MTP head's layer is registered by `linears()` too, so leaving it unpadded here gives it a padded
-    // descriptor over an unpadded buffer - the exact over-read this pad exists to avoid.
+    // The MTP head's layer is registered too, so it is padded here as well; skipping it over-reads as described.
     if (w.mtp) |*m| switch (m.layer.mixer) {
         .kda => |*x| try padOneKdaInput(w, d, s, x),
         else => {},
@@ -103,6 +99,7 @@ fn padOneKdaInput(w: *Weights, d: *const cuda.Driver, s: cuda.Stream, x: *@impor
     if (bufferAt(w, src)) |at| replace(w, at, buf) else try w.buffers.append(w.gpa, buf); // the loader's rows go
 }
 
+/// Every linear b16.matmul reads, as the fields holding them; the head last, when it is bf16.
 fn linears(w: *Weights, list: *std.ArrayList(Lin)) !void {
     for (w.layers) |*l| try layerLinears(w.gpa, l, list);
     if (w.mtp) |*m| {

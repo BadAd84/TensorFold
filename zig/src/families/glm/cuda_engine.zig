@@ -35,8 +35,7 @@ const pair_bytes = 16;
 /// A prompt pass's chunk rows (decode.prefill's).
 pub const prompt_rows = fw.prefill_rows;
 
-/// Where a prompt chunk from `start` ends: the next multiple of `prompt_rows`, the prompt's end, or the first mark past
-/// `start`. A start off that grid (a resume or a mark) ends on it, so the chunks after it start aligned and can pair.
+/// Where a chunk from `start` ends: the next prompt_rows multiple, the prompt's end or the first mark past `start`.
 pub fn chunkEnd(start: usize, len: usize, marks: []const u32) usize {
     var end = @min(len, (start / prompt_rows + 1) * prompt_rows);
     for (marks) |m| {
@@ -54,6 +53,7 @@ test "a prompt chunk ends on the chunk grid, at the prompt's end or at the first
     try std.testing.expectEqual(C + 903, chunkEnd(C, 9 * C, &.{ 9, C + 905, C + 903, C }));
     try std.testing.expectEqual(C + 900, chunkEnd(C + 3, 9 * C, &.{ C + 3, C + 900 })); // its own start does not cut
 }
+pub const solo_rows = fw.solo_rows;
 pub const max_together = @import("cuda_state.zig").prompt_heads;
 pub const Prompt = struct { slot: u32, ids: []const u32 };
 
@@ -64,6 +64,7 @@ pub const max_shared = 16;
 
 const types = @import("cuda_engine_types.zig");
 const snapshots = @import("cuda_snapshots.zig");
+const prompt_solo = @import("cuda_prompt_solo.zig");
 pub const Part = types.Part;
 pub const Kept = types.Kept;
 const Seq = types.Seq;
@@ -133,6 +134,7 @@ pub const Engine = struct {
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     shared_made: bool = false, // e.bs, DRAW1 and SEG_DSA made (cuda_engine_shared.ensure, at the first verify)
+    share_pages: bool = false, // TF_GLM_KV_SHARE: a kept state leaves its prefix's pages to the prompt cache that holds them
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -185,7 +187,8 @@ pub const Engine = struct {
         const spans = try gpa.alloc(shard.Span, world);
         errdefer gpa.free(spans);
         for (spans, 0..) |*sp, q| sp.* = (try shard.Share.of(&c, q, world)).vocab;
-        var m = try fw.Modules.load(d, ctx);
+        const block32 = !exl3.isExl3(gpa, text) and try @import("cuda_experts.zig").wantsBlock32(gpa, text);
+        var m = try fw.Modules.load(d, ctx, block32);
         errdefer m.deinit();
         const pair = prompt_pair.wanted(o.settings.pair, world);
         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
@@ -237,10 +240,12 @@ pub const Engine = struct {
             e.free(0);
             e.seqs.deinit(gpa);
         }
-        e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
+        e.bp = try fw.Buffers.init(d, &e.w, prompt_solo.bufferRows(o.settings.solo), true, o.capacity);
         errdefer e.bp.deinit();
         if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
         errdefer if (e.pair) |*p| p.deinit();
+        if (o.settings.solo and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ fw.solo_rows, fw.prefill_rows });
+        if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
         e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -388,8 +393,7 @@ pub const Engine = struct {
         if (e.drafter) |dr| try dr.restart(e.slot, 0);
     }
 
-    /// decode.prefill: `ids` in prompt_rows steps from its start, then the first token from the last row; `from`
-    /// restores a kept state. The steps are fixed and keep no state: a pass with marks runs Leader.chunk's steps.
+    /// decode.prefill: `ids` in prompt_rows steps, the first token from the last row; `from` restores a kept state.
     pub fn prefill(e: *Engine, ids: []const u32, from: ?Resume, cancel: ?Cancel) !u32 {
         var start = try e.prefillStart(ids.len, from);
         while (true) {
@@ -409,9 +413,7 @@ pub const Engine = struct {
         return r.at;
     }
 
-    /// One step of a `len`-id prompt pass: `rows` from `start` (one chunk, or a pair past a chunk's rows), `part` those
-    /// ids plus the next one; the first token at the end, else null. Rank 0 chooses `rows` (Leader.chunk), the others
-    /// take it from the step, so a chunk may start and end at any row: the prompt kernels give each row the same bits.
+    /// One step of a `len`-id pass: `rows` from `start` (a chunk or a pair), `part` those ids plus one; rank 0's rows.
     pub fn prefillChunk(e: *Engine, part: []const u32, start: usize, rows: usize, len: usize, from: ?Resume, cancel: ?Cancel, marks: ?Marks) !?u32 {
         const split = e.index_split; // this step's alone
         e.index_split = false;
@@ -546,7 +548,7 @@ pub const Engine = struct {
         var s0: usize = 0;
         while (s0 < next.len) : (s0 += fw.window_rows) {
             const part = next[s0..@min(next.len, s0 + fw.window_rows)];
-            try f.mtp(part, &.{hidden + s0 * D * 2});
+            try f.mtpMode(part, &.{hidden + s0 * D * 2}, depth > 0);
             try e.cur.st.setMtpLen(e.stream, e.cur.st.mtp_len + part.len);
         }
         for (0..depth) |j| {
@@ -583,9 +585,10 @@ pub const Engine = struct {
     const greedy = @import("cuda_engine_pick.zig").greedy;
     const greedyChance = @import("cuda_engine_pick.zig").greedyChance;
 
-    /// A failed RoCE gather's error, after a synchronize whose result read gathered rows (they hold nothing then).
+    /// A failed RoCE gather (its rows hold nothing) or TF_GLM_KV_HOST gather past its slots, after a synchronize.
     pub fn checkGathers(e: *const Engine) !void {
         if (e.group) |g| try g.check();
+        try @import("cuda_kv_host.zig").checkActive(); // a TF_GLM_KV_HOST gather past its slots
     }
 
     pub fn copy(e: *const Engine, dst: u64, src: u64, bytes: usize) !void {

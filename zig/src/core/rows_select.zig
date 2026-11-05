@@ -19,6 +19,7 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
     for (r.states.items, 0..) |*state, i| {
         if (s.family.vtable.bytes(s.family.ptr, state.at) > room) continue;
         if (moot(r, out, state.at, from)) continue; // TF_GLM_OVN_KEPT_WALK: no compare where a match changes nothing
+        if (r.blankBytes(state.at) > room) continue;
         if (!r.matches(state, prompt, starts, spans)) continue;
         if (out.disk == null or state.at > r.states.items[out.disk.?].at) out.disk = i;
         if (state.at <= from) continue;

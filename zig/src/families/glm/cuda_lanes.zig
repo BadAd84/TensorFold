@@ -7,6 +7,8 @@ const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
 const dflash = @import("dflash.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
+const prefix_mod = @import("cuda_prefix.zig");
+const prompt_solo = @import("cuda_prompt_solo.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
@@ -19,15 +21,7 @@ pub const max_rows = fw.window_rows;
 const mtp_rows = 1 + engine.max_drafts;
 const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
 
-/// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
-const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
-const gb10_shared_costs = costTable(engine.max_shared_rows, 76.0, 4.1); // to 64 rows; facts takes the load's
-
-fn costTable(comptime n: usize, comptime one: f64, comptime row: f64) [n]lanes.config.Cost {
-    var c: [n]lanes.config.Cost = undefined;
-    for (&c, 0..) |*x, i| x.* = .{ .width = i + 1, .ms = one + row * @as(f64, @floatFromInt(i)) };
-    return c;
-}
+const copy_policy = @import("cuda_copy_policy.zig"); // the GB10 cost tables, to 64 shared rows; facts takes the load's
 
 /// A stream's place in the backend: its sequence's slot, the rows its last verify left uncommitted, its held drafts.
 pub const Lane = struct {
@@ -40,6 +34,7 @@ pub const Lane = struct {
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
     slicing: bool = false, // TF_GLM_OVN_FILL_SLICE_MS: its chunk from `fill` waits part-way through its layers
     settled: bool = false, // and its prompt pass ended inside another call (fill_mod.settle): `first` holds its token
+    marks: []const u32 = &.{}, // TF_GLM_KV_SHARE: where the prompt cache keeps this stream's pass (owned)
 };
 
 pub const Lanes = struct {
@@ -48,6 +43,7 @@ pub const Lanes = struct {
     together: bool = true, // stepped: short prompts admitted in one pass (TF_GLM_PROMPT_MANY=0: one a round)
     alone: bool = false, // each window in its own forward (TF_GLM_SHARED=0)
     mtp_confidence: ?f64 = null, // --mtp-confidence: the MTP head's chains stop where their chance falls under it
+    copy_confidence: bool = false, // copy mode keeps head confidence in probabilities so target copies stay priced
     shared: u64 = 0, // forwards that held several streams' windows (checks read it)
     lanes: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
     drawn: [ring]u32 = undefined,
@@ -56,10 +52,15 @@ pub const Lanes = struct {
     bits_dev: u64 = 0,
     timed: ?@import("cuda_cost_time.zig").Timed = null, // TF_GLM_OVN_COST_TIME: the window costs timed at load
     multi: bool = false, // TF_GLM_OVN_MULTI_FILL: batched passes take marked and resumed prompts, a piece a pass
+    prefix: ?*prefix_mod.Prefix = null, // TF_GLM_KV_SHARE: the prompt cache over the pool's pages (rank 0's)
 
     pub fn deinit(self: *Lanes) void {
         if (self.bits) |*b| b.free();
+        var it = self.lanes.valueIterator();
+        while (it.next()) |l| self.x.e.gpa.free(l.marks);
         self.lanes.deinit(self.x.e.gpa);
+        if (self.prefix) |x| x.deinit(); // its pages back to the pool before the pool goes
+        self.prefix = null;
     }
 
     /// A window's grammar rows (rows of the vocabulary's words) at row `row` of the bits, device-read; 0 for none.
@@ -91,6 +92,7 @@ pub const Lanes = struct {
         .keep = keepFn,
         .draft = draftFn,
         .probabilities = chancesFn,
+        .tree = copy_policy.held,
         .release = releaseFn,
         .first_masked = firstMaskedFn,
         .held = heldFn,
@@ -122,6 +124,7 @@ pub const Lanes = struct {
         const block = self.x.e.drafter != null;
         const sharing = drafting and !self.alone;
         return .{
+            .allocate_shared_drafts = drafting,
             .exact_width = if (drafting) max_rows else 1,
             .first_copy_rows = mtp_rows, // a first copy as wide as a head round; it grows as its tokens land
             .gpu_tokens = false,
@@ -136,8 +139,8 @@ pub const Lanes = struct {
             .draft_confidence = if (cuda.ovn.on("DRAFT_FIXED") and block and self.x.e.drafter.?.knobs.fixed)
                 std.math.floatMin(f64)
             else if (block) null else self.mtp_confidence,
-            .window_costs = if (block) (if (self.timed) |*t| &t.window else &gb10_window_costs) else &.{},
-            .shared_costs = if (block) (if (self.timed) |*t| t.shared[0..self.x.e.settings.shared_rows] else gb10_shared_costs[0..self.x.e.settings.shared_rows]) else &.{},
+            .window_costs = if (block) (if (self.timed) |*t| &t.window else &copy_policy.window_costs) else &.{},
+            .shared_costs = if (block) (if (self.timed) |*t| t.shared[0..self.x.e.settings.shared_rows] else copy_policy.shared_costs[0..self.x.e.settings.shared_rows]) else &.{},
             // TF_GLM_OVN_WIN_FREE: no shared cost table, so each round's windows fill likeliest-first to its cap
             // TF_GLM_OVN_PLAIN_MARGIN: hundredths; a draft must beat plain rounds by this (0: the core's 105)
             .plain_margin = @as(f64, @floatFromInt(cuda.ovn.int("PLAIN_MARGIN", 0) catch 0)) / 100.0,
@@ -148,6 +151,12 @@ pub const Lanes = struct {
             .shared_depth_full = cuda.ovn.on("DEPTH_FULL"), // TF_GLM_OVN_DEPTH_FULL: no grant + 2 ratchet when shared
             .shared_copy_width = cuda.ovn.on("SHARED_COPY"), // TF_GLM_OVN_SHARED_COPY: shared copies grow as lone ones
         };
+    }
+
+    /// Root/context copies use the same verify/keep path and shared cost allocator as every target window.
+    pub fn factsWithCopies(self: *Lanes, enabled: bool) lanes.Model {
+        self.copy_confidence = enabled and self.x.e.mtp;
+        return copy_policy.apply(self.facts(), enabled, self.x.e.settings.shared_rows);
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -201,13 +210,6 @@ pub const Lanes = struct {
         return l;
     }
 
-    /// Whether a stream besides `s` is past its prompt pass: a paired prompt step would hold up its rounds.
-    pub fn othersDecode(self: *const Lanes, s: *const lanes.Stream) bool {
-        var it = self.lanes.iterator();
-        while (it.next()) |kv| if (kv.key_ptr.* != s and kv.value_ptr.fill == null) return true;
-        return false;
-    }
-
     fn cancelled(ptr: ?*anyopaque) bool {
         return @as(*lanes.Stream, @ptrCast(@alignCast(ptr.?))).isCancelled();
     }
@@ -225,8 +227,9 @@ pub const Lanes = struct {
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
         var at: usize = if (from) |r| r.at else 0;
+        var keeps: prefix_mod.Keeps = undefined;
         while (true) {
-            const step = try self.x.chunkOf(s.prompt(), at, false, from, reply.gate(s, cancelled), marksOf(s), false, reply.rowsOf(s)); // a reply's background pass: capped chunks, yields at each gate
+            const step = try self.x.chunkOf(s.prompt(), at, false, from, reply.gate(s, cancelled), self.marksOf(s, &keeps), false, reply.rowsOf(s)); // a reply's background pass: capped chunks, yields at each gate
             if (step.first) |first| {
                 self.lanes.getPtr(s).?.first = self.take(first);
                 return;
@@ -239,6 +242,7 @@ pub const Lanes = struct {
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
         try fill_mod.settle(self);
+        if (self.prefix != null) return false; // TF_GLM_KV_SHARE: the cache keeps a pass alone
         if (self.multi) return fill_mod.multiFill(self, ss);
         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
         for (ss) |s| if (!canBatch(s)) return false;
@@ -269,7 +273,7 @@ pub const Lanes = struct {
     }
 
     /// One chunk of the stream's prompt pass (other rounds run between); true once the first token is drawn.
-    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream, _: u32) anyerror!bool {
         const self = of(ptr);
         if (self.lanes.getPtr(s)) |l| if (l.slicing or l.settled) return fill_mod.onward(self, s, l);
         try fill_mod.settle(self); // another stream's chunk part-way through its layers finishes first
@@ -284,8 +288,9 @@ pub const Lanes = struct {
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        const busy = self.othersDecode(s); // a pair would hold up their rounds; TF_GLM_OVN_FILL_SLICE_MS slices instead
-        const step = try self.x.chunkOf(s.prompt(), at, !busy, from, .{ .ptr = s, .check = cancelled }, marksOf(s), busy and @import("cuda_prompt_slices.zig").of(self.x.e) != null, 0);
+        var keeps: prefix_mod.Keeps = undefined;
+        const busy = prompt_solo.othersDecode(&self.lanes, s); // a pair would hold up their rounds; TF_GLM_OVN_FILL_SLICE_MS slices instead
+        const step = try self.x.chunkOf(s.prompt(), at, !busy, from, .{ .ptr = s, .check = cancelled }, self.marksOf(s, &keeps), busy and @import("cuda_prompt_slices.zig").of(self.x.e) != null, 0);
         if (step.first) |first| {
             l.first = self.take(first);
             l.fill = null;
@@ -307,7 +312,8 @@ pub const Lanes = struct {
         const at = l.fill orelse return;
         if (at <= s.cached or s.reuse.hook == null) return;
         try self.x.bind(l.slot);
-        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, marksOf(s)) catch |err| {
+        var keeps: prefix_mod.Keeps = undefined;
+        _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, self.marksOf(s, &keeps)) catch |err| {
             if (err == error.Cancelled) return;
             return err;
         };
@@ -325,15 +331,33 @@ pub const Lanes = struct {
         if (@import("cuda_lineage.zig").on) if (self.x.e.pages) |p| { // its pages: those that hold the kept rows
             p.want = if (s.prompt_logprobs != null) 0 else self.keptId(s, ids.len);
         };
-        const pages = try self.seat(s, ids.len, s.max_new);
+        const gpa = self.x.e.gpa;
+        const share = self.cached(s);
+        var owner: prefix_mod.Owner = .{};
+        var adopt: std.ArrayList(u32) = .empty;
+        defer adopt.deinit(gpa);
+        // TF_GLM_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
+        const marks: []const u32 = if (share) (try self.prefix.?.beginStream(s, &owner, &adopt)).marks else &.{};
+        var held = true;
+        errdefer if (held) gpa.free(marks);
+        const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
         errdefer {
             self.x.e.release(self.lanes.get(s).?.slot);
             _ = self.lanes.remove(s);
         }
         if (self.x.e.images) |v| v.clear(); // no earlier request's rows splice into this one
-        try self.x.beginOn(s.sampling, pages);
+        try self.x.beginOn(s.sampling, pages, adopt.items.len);
         s.cached = 0;
         s.prompt_rows.clearRetainingCapacity();
+        const l = self.lanes.getPtr(s).?;
+        gpa.free(l.marks);
+        l.marks = marks;
+        held = false;
+        if (share) {
+            const k = owner.pending orelse return null;
+            s.cached = k.at;
+            return .{ .id = k.id, .at = k.at };
+        }
         return if (s.prompt_logprobs != null) null else self.resumeFrom(s, ids.len); // prompt rows need every row
     }
 
@@ -344,9 +368,17 @@ pub const Lanes = struct {
         return if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !self.x.e.holds(k.id)) 0 else k.id;
     }
 
-    /// The stream's slot, its pages, then its sequence: a slot past the paged ones waits before binding makes a window.
-    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize) ![]const u32 {
-        const l = try self.claim(s);
+    /// Whether the pool's prompt cache keeps this content-keyed pass, with no prompt logprob rows asked.
+    fn cached(self: *const Lanes, s: *const lanes.Stream) bool {
+        return self.prefix != null and prefix_mod.cacheable(s);
+    }
+
+    /// The stream's slot, its pages (the cache's `adopted` first, given back on a refusal), then its sequence.
+    pub fn seat(self: *Lanes, s: *const lanes.Stream, prompt: usize, max_new: usize, adopted: []const u32) ![]const u32 {
+        const l = self.claim(s) catch |err| {
+            if (self.x.e.pages) |p| p.give(adopted);
+            return err;
+        };
         l.pending_rows = null;
         l.held_n = 0;
         l.fill = null;
@@ -357,17 +389,20 @@ pub const Lanes = struct {
             if (self.x.e.pages) |p| p.close(l.slot);
             _ = self.lanes.remove(s);
         }
-        const pages = try self.pagesFor(l.slot, prompt, max_new);
+        const pages = try self.pagesFor(l.slot, prompt, max_new, adopted);
         try self.x.bind(l.slot);
         return pages;
     }
 
     /// A slot's pages for a prompt and its reply (none without a pool); LaneMemory: the pool lacks them now.
-    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize) ![]const u32 {
+    fn pagesFor(self: *Lanes, slot: u32, prompt: usize, max_new: usize, adopted: []const u32) ![]const u32 {
         const p = self.x.e.pages orelse return &.{};
-        if (!p.paged(slot)) return error.LaneMemory; // every paged sequence is taken
+        if (!p.paged(slot)) { // every paged sequence is taken
+            p.give(adopted);
+            return error.LaneMemory;
+        }
         p.close(slot); // a stream that opens again gives its earlier pages back first
-        return p.open(slot, prompt, max_new);
+        return p.openWith(slot, prompt, max_new, adopted);
     }
 
     /// The lane host's admission: with a pool, a paged sequence and the request's pages are free.
@@ -385,7 +420,11 @@ pub const Lanes = struct {
     }
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
-    pub fn marksOf(s: *lanes.Stream) ?engine.Marks {
+    pub fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *prefix_mod.Keeps) ?engine.Marks {
+        if (self.cached(s)) {
+            const l = self.lanes.getPtr(s) orelse return null;
+            return self.prefix.?.marks(l.slot, s, l.marks, keeps);
+        }
         return if (s.reuse.hook == null) null else .{
             .at = s.reuse.marks,
             .ctx = s,
@@ -543,13 +582,13 @@ pub const Lanes = struct {
                 n = rows.len;
                 break :a r.follow[rows.len - 1];
             } else self.value(r.first orelse return error.NoFirstToken);
-            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .out = &l.held, .probs = &l.chances };
+            reqs[i] = .{ .slot = l.slot, .pos = 0, .n = n, .anchor = anchor, .propose = r.depth > 0, .out = &l.held, .probs = &l.chances };
             held[i] = l;
         }
         shared_mod.commitEnd(self, prof);
         try self.x.block(reqs[0..requests.len]);
         const cuts = self.x.e.drafter.?.knobs.cuts; // TF_GLM_OVN_DRAFT_CUTS: the cut by streams in this pass
-        const cut = (if (cuts) |c| c.at(requests.len) else null) orelse confidence();
+        const cut = (if (cuts) |c| c.at(requests.len) else null) orelse dflash.confidence();
         for (requests, held[0..requests.len]) |r, l| {
             l.held_n = @min(r.depth, max_held);
             var chain: f64 = 1; // glm_cuda's rule: past the first, a chain stops where its product falls under the cut
@@ -559,12 +598,6 @@ pub const Lanes = struct {
                 if (c.* == 0) chain = 0;
             }
         }
-    }
-
-    /// TF_GLM_DRAFT_CONFIDENCE: where a DFlash2 chain's chance product stops it (glm_cuda's 0.7).
-    fn confidence() f64 {
-        const v = std.c.getenv("TF_GLM_DRAFT_CONFIDENCE") orelse return 0.7;
-        return std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.7;
     }
 
     /// Each held draft's chance, DFlash2's or the MTP head's under --mtp-confidence (else the per-depth rates stand).
@@ -579,6 +612,7 @@ pub const Lanes = struct {
             chain *= p;
             c.* = chain;
         }
+        if (self.mtp_confidence != null and self.copy_confidence and self.x.e.drafter == null) copy_policy.confidence(self.mtp_confidence, out[0..n]);
         for (out[n..]) |*c| c.* = 0;
         return true;
     }
@@ -587,6 +621,7 @@ pub const Lanes = struct {
     pub fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.lanes.fetchRemove(s) orelse return;
+        self.x.e.gpa.free(kv.value.marks);
         self.x.release(kv.value.slot) catch |err| std.log.err("releasing slot {d}: {s}", .{ kv.value.slot, @errorName(err) });
         if (self.lanes.count() == 0) self.x.idle() catch |err| std.log.err("the other ranks' idle step: {s}", .{@errorName(err)});
     }

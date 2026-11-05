@@ -227,7 +227,7 @@ pub fn attach(a: Allocator, io: std.Io, ctx: *const cuda.Context, o: api.Open, r
     if (keep_local) try facts.append(a, 0x6c6f63616c); // TF_GLM_OVN_DISK_LOCAL: its own store, rank 0's image alone
     const p = try probe(a, io, loaded.backend, e); // every rank's prefix still: it checks the ranks' shared bytes agree
     if (keep_local) store_pre = prefixes[0..1];
-    const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash);
+    const id = try cuda_disk.identityOf(a, io, ctx, o.dir, kernels, facts.items, p.hash, .{ .family = "glm", .backend = "cuda" });
     // TF_GLM_OVN_DISK_CARRY: this start's carry key and proof; an older directory proving them is read instead
     const carried = if (cuda.ovn.on("DISK_CARRY")) try carry.start(a, io, ctx, o, root, loaded.backend, e, facts.items, p.hash, id, store, keep_local) else null;
     const adopted: ?u64 = if (carried) |c| (if (c.choice.adopted) c.choice.id else null) else null;

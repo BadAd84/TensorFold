@@ -305,7 +305,7 @@ pub const Copy = struct {
                 else => return error.SnapshotShape,
             };
             if (at % pages.page + n > pages.page or at + n > c.lease.ids.items.len * pages.page) return error.SnapshotSize;
-            return arena.ptr + @as(u64, c.lease.ids.items[@intCast(at / pages.page)]) * pages.page + at % pages.page;
+            return arena.ptr() + @as(u64, c.lease.ids.items[@intCast(at / pages.page)]) * pages.page + at % pages.page;
         }
         return error.SnapshotShape;
     }
@@ -318,7 +318,7 @@ pub const Copy = struct {
         while (done < host.len) {
             const x = at + done;
             const n = @min(host.len - done, pages.page - x % pages.page);
-            const dev = arena.ptr + @as(u64, c.lease.ids.items[@intCast(x / pages.page)]) * pages.page + x % pages.page;
+            const dev = arena.ptr() + @as(u64, c.lease.ids.items[@intCast(x / pages.page)]) * pages.page + x % pages.page;
             const p = host[done..][0..n];
             if (out) {
                 try c.d.check(c.d.api.cuMemcpyDtoH_v2(p.ptr, dev, n), "cuMemcpyDtoH");

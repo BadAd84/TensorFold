@@ -98,7 +98,7 @@ test "GLM disk image: the lease bytes the image counts are the snapshot plan's, 
             const sh = try image.Shape.of(&st, &m.w.config, capacity, head);
             for (rows_kept) |at| {
                 for ([_]u64{ at - 1, at, sh.headRows(at) }) |mtp| {
-                    const plan = try Plan.init(&st, &m.w.config, at, if (head) mtp else null);
+                    const plan = try Plan.init(&st, &m.w.config, at, if (head) mtp else null, 0);
                     try expectEqual(@as(u64, plan.len), image.leaseBytes(sh, at, if (head) mtp else 0));
                 }
             }
@@ -152,7 +152,7 @@ test "GLM disk image: a kept state's image read out of its lease restores every 
     var st = try State.initFormat(a, &d, &m.w, capacity, false);
     defer st.deinit();
     for (H.bytes(st.arena.buf.ptr, st.arena.buf.len), 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
-    var pool = try pages.Pool.init(a, &d, 256 << 20);
+    var pool = try pages.Pool.init(a, &d, 256 << 20, false);
     defer pool.deinit();
     const stream: cuda.Stream = .{ .d = &d, .handle = null };
     const sh = try image.Shape.of(&st, c, capacity, true);
@@ -162,7 +162,7 @@ test "GLM disk image: a kept state's image read out of its lease restores every 
     defer segs.deinit(a);
     for (rows_kept) |at| {
         const mtp: u64 = at - 1; // a head one row behind: its last image row is not in the lease
-        const plan = try Plan.init(&st, c, at, mtp);
+        const plan = try Plan.init(&st, c, at, mtp, 0);
         var kept = try pool.take(plan.len);
         defer pool.give(&kept);
         try pool.move(stream, &kept, &plan, true);
@@ -187,7 +187,7 @@ test "GLM disk image: a kept state's image read out of its lease restores every 
         try expectEqual(@as(u64, 0b10), w.cur);
         try expectError(error.DiskWords, image.Words.decode(back, at + 1)); // a state one row on is another state
         @memset(H.bytes(fresh.arena.buf.ptr, fresh.arena.buf.len), 0); // no earlier row's restore stands in
-        const into = try Plan.init(&fresh, c, at, w.mtp_len);
+        const into = try Plan.init(&fresh, c, at, w.mtp_len, 0);
         try expectEqual(plan.len, into.len);
         try pool.move(stream, &blank, &into, false);
         for (plan.parts[0..plan.count], into.parts[0..into.count]) |x, y| {
@@ -259,7 +259,7 @@ test "GLM disk image: a disk read's blank state is refused until sealed, and its
     const a = std.testing.allocator;
     var e: Fake = .{ .gpa = a, .d = &d, .stream = .{ .d = &d, .handle = null }, .c = m.w.config, .cur = .{ .st = try State.initFormat(a, &d, &m.w, capacity, false) } };
     defer e.cur.st.deinit();
-    e.snap_pages = try pages.Pool.init(a, &d, 256 << 20);
+    e.snap_pages = try pages.Pool.init(a, &d, 256 << 20, false);
     defer e.snap_pages.?.deinit();
     try e.snaps.ensureTotalCapacity(a, 8);
     defer e.snaps.deinit(a);
@@ -309,7 +309,7 @@ test "GLM disk image: a disk read's blank state seals at rows off the pool grid 
     const a = std.testing.allocator;
     var e: Fake = .{ .gpa = a, .d = &d, .stream = .{ .d = &d, .handle = null }, .c = m.w.config, .cur = .{ .st = try State.initFormat(a, &d, &m.w, capacity, false) } };
     defer e.cur.st.deinit();
-    e.snap_pages = try pages.Pool.init(a, &d, 256 << 20);
+    e.snap_pages = try pages.Pool.init(a, &d, 256 << 20, false);
     defer e.snap_pages.?.deinit();
     try e.snaps.ensureTotalCapacity(a, 2);
     defer e.snaps.deinit(a);

@@ -63,7 +63,9 @@ fn seed(a: Allocator, dir: []const u8, keeps: []const Keep) !void {
         _ = f.pass(&s, plan);
         while (rows.write.step(r)) {}
     }
-    try std.testing.expectEqual(keeps.len, r.states.items.len);
+    var pictures: usize = 0; // a prompt with a picture's row never reaches the disk (cache_images.diskSafe)
+    for (keeps) |k| pictures += @intFromBool(k.picture);
+    try std.testing.expectEqual(keeps.len - pictures, r.states.items.len);
     try carry.record.write(r.dir, want(old_identity));
 }
 
@@ -224,7 +226,7 @@ test "rows_carry replay accepts states this build computes alike, asked by their
     defer e.deinit();
     try std.testing.expectEqual(replay.Verdict{ .same = 2 }, e.run(dir, replay.default_tokens));
     try std.testing.expectEqual(@as(usize, 0), e.f.live); // every fresh state dropped: the engine as a fresh boot leaves it
-    // the two prompt-row states, each by its own file's ids; the picture's state is never asked (ids cannot prefill it)
+    // the two prompt-row states, each by its own file's ids; the picture's prompt was never written (diskSafe)
     try std.testing.expectEqual(@as(usize, 2), e.asked.items.len);
     for (e.ids.items, e.asked.items) |ids, at| {
         const salt: u32 = if (at == 1400) 0 else 3;

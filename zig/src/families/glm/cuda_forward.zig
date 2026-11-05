@@ -35,6 +35,7 @@ const slices = @import("cuda_forward_slices.zig");
 const rotlayer = @import("cuda_rotlayer.zig");
 
 pub const prefill_rows = state.prefill_rows;
+pub const solo_rows = state.solo_rows;
 pub const window_rows = state.window_rows;
 pub const State = state.State;
 pub const Buffers = state.Buffers;
@@ -69,7 +70,8 @@ pub const Modules = struct {
     mla: glue.Mla, // TF_GLM_OVN_MLA_FUSEMERGE, TF_GLM_OVN_ABSORB_VEC: the MLA launch choices, read at load
     l2pace: ?l2pace.Paced, // TF_GLM_OVN_L2PF_PACED: #1580's paced prefetch, opened by the engine after the weights tile
 
-    pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context) !Modules {
+    /// `block32`: a csf0_v1 checkpoint's block 32 experts' image too (experts.wantsBlock32).
+    pub fn load(d: *const cuda.Driver, ctx: *const cuda.Context, block32: bool) !Modules {
         const k = cuda.kernels;
         var m: Modules = undefined;
         var n: usize = 0;
@@ -83,7 +85,7 @@ pub const Modules = struct {
         m.prompt = try cuda.nvfp4.Prompt.load(d);
         errdefer m.prompt.unload();
         m.kda = try kda.Kernels.load(m.mods[0]);
-        m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)));
+        m.experts = try experts.Kernels.load(d, m.mods[2], @intCast(try ctx.attribute(.multiprocessor_count)), block32);
         errdefer m.experts.unload();
         m.copy_rows = try m.mods[1].function("tf_glm_copy_rows");
         m.put_slot = try m.mods[1].function("tf_glm_put_slot");
@@ -521,11 +523,15 @@ pub const Forward = struct {
 
     /// mtp.mtp_forward: caches from mtp_len, drafts in b.logits; a prompt chunk past its caches runs its last row.
     pub fn mtp(f: *const Forward, ids: []const i32, hidden: []const u64) !void {
+        return f.mtpMode(ids, hidden, true);
+    }
+
+    pub fn mtpMode(f: *const Forward, ids: []const i32, hidden: []const u64, propose: bool) !void {
         const n = ids.len;
         const c = &f.ranks[0].w.config;
         const D: usize = c.hidden;
         // every rank shares this buffer and this row count, so every rank takes the same path and the gathers match
-        const last_row = f.ranks[0].b.prefill and n > 1;
+        const last_row = propose and f.ranks[0].b.prefill and n > 1;
         const tail = if (last_row) (n - 1) * D * 2 else 0; // b.mx's last row, or its front
         const rows: usize = if (last_row) 1 else n; // the pass past the caches works on that row alone
         for (f.ranks, hidden) |r, h| {
@@ -546,12 +552,15 @@ pub const Forward = struct {
             try glue.rmsnormBy(f.set(), f.stream, b.mx, D, m.layer.in_norm, b.normed, D, b.xs, c.eps, n, D);
             const nch = @min(latent.chunksFor(r.st.mtp_len + n), b.nch);
             const k: dsa_block.Kernels = .{ .set = f.set(), .ops = f.m.ops(), .shard = dsa_block.index_shard.of(f.m.shard_from, b.prefill, f.exchange, r.w.share.rank, r.w.share.world) };
-            if (last_row) { // all n rows' caches, one row's attention, its partial in the slot's row 0
+            if (!propose) {
+                try dsa_block.commit(k, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len);
+            } else if (last_row) { // all n rows' caches, one row's attention, its partial in the slot's row 0
                 try dsa_block.blockLastRow(k, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, slot(r, 1));
             } else {
                 try dsa_block.block(k, f.stream, m.layer.mixer.mla, r.st.mtp_caches, b.dsa, b.normed, D, n, r.st.mtp_pos_dev, r.st.mtp_len, nch, b.part_rows, slot(r, n));
             }
         }
+        if (!propose) return;
         try f.gather(rows);
         for (f.ranks) |r| {
             const m = r.w.mtp.?;

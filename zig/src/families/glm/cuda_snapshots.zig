@@ -16,7 +16,7 @@ pub fn prepare(e: anytype, budget: u64) !void {
     const count = std.math.cast(u32, budget / pages.page) orelse return error.SnapshotBudget;
     try e.snaps.ensureTotalCapacity(e.gpa, count);
     try e.dropped.ensureTotalCapacity(e.gpa, @as(usize, count) + 1);
-    e.snap_pages = try pages.Pool.init(e.gpa, e.d, budget);
+    e.snap_pages = try pages.Pool.init(e.gpa, e.d, budget, pages.onHost());
     if (cuda.ovn.on("SNAP_GATHER") and e.snap_pages.?.arena != null)
         e.snap_pages.?.gather = try gather.Gather.init(e.gpa, e.d, e.m.glue.snap_copy);
 }
@@ -40,7 +40,7 @@ pub fn planBytes(e: anytype, at: usize) u64 {
     const head: ?usize = if (!e.mtp) null else if (!e.head) 0 else @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64));
     if (lin.on) return lin_copy.size(&e.cur.st, &e.c, e.capacity, at, head); // the padded lease
     // a paged sequence holds its request's rows: its prefix is counted to the capacity, in a window's bytes
-    const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head) catch return std.math.maxInt(u64);
+    const n = layout.Plan.size(&e.cur.st, &e.c, e.capacity, at, head, heldPages(e, at)) catch return std.math.maxInt(u64);
     return pages.rounded(n) catch std.math.maxInt(u64);
 }
 
@@ -76,9 +76,9 @@ pub fn moveFlat(pool: *const pages.Pool, stream: cuda.Stream, lease: *const page
     var done: usize = 0;
     while (done < len) {
         const at = off + done;
-        const held = arena.ptr + @as(u64, lease.ids.items[at / pages.page]) * pages.page + at % pages.page;
+        const held = arena.ptr() + @as(u64, lease.ids.items[at / pages.page]) * pages.page + at % pages.page;
         const n = @min(len - done, pages.page - at % pages.page);
-        try arena.d.check(arena.d.api.cuMemcpyDtoDAsync_v2(if (into) held else live + done, if (into) live + done else held, n, stream.handle), "cuMemcpyDtoDAsync");
+        try arena.driver().check(arena.driver().api.cuMemcpyDtoDAsync_v2(if (into) held else live + done, if (into) live + done else held, n, stream.handle), "cuMemcpyDtoDAsync");
         done += n;
     }
 }
@@ -112,7 +112,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
     if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
         return error.NotAtMark;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null);
+    const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null, heldPages(e, e.cur.st.pos));
     const win = window(e);
     const state_len = if (win != null) try pages.rounded(plan.len) else plan.len; // the ring starts on a page
     var lease = try pool.take(state_len + @as(usize, if (win != null) ring_bytes else 0));
@@ -125,7 +125,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
     try pool.move(e.stream, &lease, &plan, true);
     if (win) |w| try moveFlat(pool, e.stream, &lease, state_len, w.ring, ring_bytes, true);
     try e.stream.synchronize();
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .win_from = if (win) |w| w.from else null });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = e.cur.st.pos, .mtp_len = e.cur.st.mtp_len, .cur = cur, .bases = .{ e.cur.st.base, e.cur.st.mtp_base }, .win_from = if (win) |w| w.from else null, .shared = plan.shared });
 }
 
 /// A disk read's state: `at`'s pages leased under rank 0's id on each rank, refused by `restore` until `seal`.
@@ -154,7 +154,7 @@ pub fn seal(e: anytype, id: u64, mtp_len: usize, bases: [2]usize, cur: u64) !voi
     if (mtp_len > head) return error.DiskWords;
     const rows = e.cur.st.ring_rows;
     if (!ringHolds(bases[0], s.pos, rows) or !ringHolds(bases[1], mtp_len, rows)) return error.DiskWords;
-    const n = try layout.Plan.size(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null);
+    const n = try layout.Plan.size(&e.cur.st, &e.c, e.capacity, s.pos, if (e.mtp) mtp_len else null, 0);
     if (n == 0 or n > s.lease.ids.items.len * pages.page) return error.SnapshotSize;
     for (s.cur, 0..) |*b, i| b.* = @intCast(cur >> @intCast(i) & 1);
     s.len = n;
@@ -167,13 +167,19 @@ pub fn restore(e: anytype, id: u64) !void {
     const s = e.snaps.getPtr(id) orelse return error.NoKeptState;
     if (s.len == 0) return error.UnsealedState;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    const plan = try layout.Plan.init(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null);
+    const plan = try layout.Plan.init(&e.cur.st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared);
     if (plan.len != s.len) return error.SnapshotSize;
     errdefer cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot restore did not drain");
     try pool.move(e.stream, &s.lease, &plan, false);
     try e.cur.st.restoreHost(e.stream, s.pos, s.mtp_len, s.cur, s.bases);
     e.cur.in_head = 0;
     try e.stream.synchronize();
+}
+
+/// TF_GLM_KV_SHARE: the pages below `at` a page-sharing store holds, whose rows a kept state leaves on them.
+pub fn heldPages(e: anytype, at: usize) usize {
+    const sharing = if (@hasField(@TypeOf(e.*), "share_pages")) e.share_pages else false; // a test's fake engine: none
+    return if (sharing) at / @import("cuda_state.zig").page_rows else 0;
 }
 
 pub fn holds(e: anytype, id: u64) bool {

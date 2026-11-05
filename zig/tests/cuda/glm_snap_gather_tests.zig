@@ -30,7 +30,7 @@ fn leaseBytes(gpu: check.Gpu, comptime S: type, pool: *const S.pages.Pool, lease
     const arena = pool.arena.?;
     for (lease.ids.items, 0..) |id, i| {
         const n = @min(S.pages.page, out.len - i * S.pages.page);
-        try (cuda.DeviceBuffer{ .d = gpu.d, .ptr = arena.ptr + @as(u64, id) * S.pages.page, .len = n, .borrowed = true }).download(0, out[i * S.pages.page ..][0..n]);
+        try (cuda.DeviceBuffer{ .d = gpu.d, .ptr = arena.ptr() + @as(u64, id) * S.pages.page, .len = n, .borrowed = true }).download(0, out[i * S.pages.page ..][0..n]);
     }
 }
 
@@ -58,7 +58,7 @@ pub fn run(gpu: check.Gpu) !void {
     @memset(host, 0);
     try back_memcpy.upload(0, host);
     try back_gather.upload(0, host);
-    var pool = try S.pages.Pool.init(gpa, gpu.d, 8 * S.pages.page);
+    var pool = try S.pages.Pool.init(gpa, gpu.d, 8 * S.pages.page, false);
     const g = try S.gather.Gather.init(gpa, gpu.d, ks.snap_copy);
     pool.gather = g;
     defer pool.deinit();

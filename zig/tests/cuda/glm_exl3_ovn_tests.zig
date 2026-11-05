@@ -193,7 +193,7 @@ pub fn run_(gpu: Gpu) !void {
     defer pm.unload();
     var k = try glm.exl3.Kernels.load(gpu.d);
     defer k.unload();
-    var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
+    var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)), false);
     defer ek.unload();
     var t: Tally = .{};
     for ([_]usize{ 256, 640 }) |n| for ([_]bool{ true, false }) |one| { // 640: a TP=3 rank's 5 blocks, 10 down steps

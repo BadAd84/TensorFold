@@ -10,4 +10,16 @@ pub fn tests(b: *std.Build, api: *std.Build.Module, lanes: *std.Build.Module, al
     step.dependOn(&files.step);
     all.dependOn(&run.step);
     all.dependOn(&files.step);
+    const scale = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/rows_startup_scale_test.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    var imports = api.import_table.iterator();
+    while (imports.next()) |entry| scale.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    const measure = b.addRunArtifact(b.addTest(.{ .root_module = scale, .filters = &.{"restore scale: startup 1000"} }));
+    measure.has_side_effects = true;
+    b.step("test-rows-startup-scale", "Measure startup with 1K, 10K and 100K valid stored states without a GPU")
+        .dependOn(&measure.step);
 }

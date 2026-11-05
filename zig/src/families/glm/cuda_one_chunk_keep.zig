@@ -143,7 +143,7 @@ pub fn keepAt(e: anytype, id: u64, k: usize) !void {
     if (e.snaps.contains(id)) return error.StateKept;
     if (st.pending != 0 or k >= c.marks or c.end != st.pos) return error.NotAtMark;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    const plan = try layout.Plan.init(st, &e.c, at, if (e.mtp) st.mtp_len else null);
+    const plan = try layout.Plan.init(st, &e.c, at, if (e.mtp) st.mtp_len else null, @import("cuda_snapshots.zig").heldPages(e, at));
     var lease = try pool.take(plan.len);
     errdefer {
         cuda.completion.drain(e.d, e.stream, "a failed GLM snapshot copy did not drain");
@@ -154,7 +154,7 @@ pub fn keepAt(e: anytype, id: u64, k: usize) !void {
     try pool.move(e.stream, &lease, &plan, true);
     const arena = st.arena.buf.ptr;
     if (plan.parts[0].live != arena or st.pos_dev - arena + 4 > pages.page) return error.SnapshotShape;
-    const held = (pool.arena orelse return error.NoSnapshotRoom).ptr + @as(u64, lease.ids.items[0]) * pages.page;
+    const held = (pool.arena orelse return error.NoSnapshotRoom).ptr() + @as(u64, lease.ids.items[0]) * pages.page;
     try e.d.check(e.d.api.cuMemsetD32Async(held + (st.pos_dev - arena), @bitCast(@as(i32, @intCast(at))), 1, e.stream.handle), "cuMemsetD32Async");
     try snapshots.moveFlat(pool, e.stream, &lease, st.conv - arena, c.conv + k * c.nk * c.conv_layer, c.nk * c.conv_layer, true);
     try snapshots.moveFlat(pool, e.stream, &lease, st.rec - arena, c.rec + k * 2 * c.nk * c.rec_layer, 2 * c.nk * c.rec_layer, true);
@@ -173,5 +173,5 @@ pub fn keepAt(e: anytype, id: u64, k: usize) !void {
     const tail = try offsetOf(&plan, st.mtp_pos_dev);
     try snapshots.moveFlat(pool, e.stream, &lease, tail + (st.prompt_hidden - st.mtp_pos_dev), c.hidden, c.hidden_bytes, true);
     try e.stream.synchronize();
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = at, .mtp_len = st.mtp_len, .cur = cur, .bases = .{ c.base, st.mtp_base } });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = at, .mtp_len = st.mtp_len, .cur = cur, .shared = plan.shared, .bases = .{ c.base, st.mtp_base } });
 }

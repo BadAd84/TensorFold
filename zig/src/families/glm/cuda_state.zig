@@ -21,9 +21,10 @@ pub const window_rows = 8;
 pub const prompt_heads = 16;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
 pub const dense_reach = 2560;
-/// Index-key and gate rows a DSA cache holds (a ring): pool_keys reads only from the current pool's first row on.
-/// A paired step's two chunks fit from its rebase (prompt_pair.ringsAgree).
+/// Index-key and gate rows a DSA cache holds (a ring); a paired step's two chunks fit from its rebase (ringsAgree).
 pub const index_ring = 2 * prefill_rows;
+/// A solo prompt pass's rows (TF_GLM_CHUNK_SOLO): a whole ring, which a rebase at a grid point leaves it.
+pub const solo_rows = index_ring;
 
 const Arena = @import("cuda_arena.zig").Arena;
 const arena = @import("cuda_arena.zig").arena;
@@ -32,7 +33,7 @@ const arena = @import("cuda_arena.zig").arena;
 pub const page_rows = latent.chunk;
 
 /// Where a paged sequence's caches are: the pool's pages at `kv`, `page_bytes` apart, through a table of `pages`.
-pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64 };
+pub const Paged = struct { kv: u64, pages: usize, page_bytes: u64, pk: u64 = 0, pk_page: u64 = 0 }; // pk: TF_GLM_KV_HOST
 
 /// The DSA (MLA) layers among the loaded ones; the MTP layer's caches come after theirs.
 pub fn mlaLayers(w: *const weights.Weights) usize {
@@ -50,6 +51,15 @@ fn latentPageBytes(c: anytype, kv8: bool) usize {
     return if (kv8) page_rows * (c.kv_lora + 4) else page_rows * c.kv_lora * 2;
 }
 
+/// TF_GLM_KV_HOST: one cache's pooled keys on a device page of their own, and that page's bytes.
+fn pkCacheBytes(c: anytype) usize {
+    return page_rows / sparse.pool * c.i_dim * 2;
+}
+
+pub fn pkPageBytes(w: *const weights.Weights) u64 {
+    return (mlaLayers(w) + mtpCaches()) * pkCacheBytes(&w.config);
+}
+
 /// A page's bytes: every cache's part (13,056 a row, 6,960 with FP8 KV), in whole 1,024-byte bf16 latent rows (PK8).
 pub fn pageBytes(w: *const weights.Weights, kv8: bool) u64 {
     return std.mem.alignForward(u64, (mlaLayers(w) + mtpCaches()) * pageCacheBytes(&w.config, kv8), 1024);
@@ -63,11 +73,12 @@ pub fn mtpCaches() usize {
     return @intFromBool(!drop_mtp);
 }
 
-/// Cache `j`'s rows on pages: its part of page 0 at `p.kv`, the others through the table; FP8 scales follow the codes.
+/// Cache `j`'s rows on pages: page 0's part at `p.kv`, the rest through the table; KV_HOST's pooled keys sit apart.
 fn onPages(x: *dsa_block.Caches, c: anytype, p: Paged, table: u64, j: usize, kv8: bool) void {
     x.lc = p.kv + j * pageCacheBytes(c, kv8);
     x.ls = if (kv8) x.lc + page_rows * c.kv_lora else 0;
-    x.pk = x.lc + latentPageBytes(c, kv8);
+    x.pk = if (p.pk != 0) p.pk + j * pkCacheBytes(c) else x.lc + latentPageBytes(c, kv8);
+    x.pks = p.pk_page;
     x.pt = table;
     x.ps = p.page_bytes;
 }

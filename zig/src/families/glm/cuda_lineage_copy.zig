@@ -69,7 +69,7 @@ const Mover = struct {
 
     fn of(pool: *const pages.Pool, stream: cuda.Stream) !Mover {
         const arena = pool.arena orelse return error.NoSnapshotRoom;
-        return .{ .d = arena.d, .stream = stream, .g = if (pool.gather) |*g| g else null };
+        return .{ .d = arena.driver(), .stream = stream, .g = if (pool.gather) |*g| g else null };
     }
 
     fn one(m: *Mover, src: u64, dst: u64, len: usize) !void {
@@ -88,7 +88,7 @@ const Mover = struct {
 
 /// Bytes [lo, hi) of plan part `part`, at `at` in the lease: into the lease (`into`) or back out of it.
 fn range(m: *Mover, pool: *const pages.Pool, lease: *const pages.Lease, plan: *const layout.Plan, part: layout.Part, at: usize, lo: usize, hi: usize, into: bool) !void {
-    const arena = (pool.arena orelse return error.NoSnapshotRoom).ptr;
+    const arena = (pool.arena orelse return error.NoSnapshotRoom).ptr();
     if (hi > part.len or at + hi > lease.ids.items.len * pages.page) return error.SnapshotSize;
     var done = lo;
     while (done < hi) {
@@ -153,7 +153,7 @@ pub fn restore(e: anytype, id: u64) !void {
     if (s.len == 0) return error.UnsealedState;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     const st = &e.cur.st;
-    const plan = try layout.Plan.init(st, &e.c, s.pos, if (e.mtp) s.mtp_len else null);
+    const plan = try layout.Plan.init(st, &e.c, s.pos, if (e.mtp) s.mtp_len else null, s.shared);
     if (plan.len != s.len) return error.SnapshotSize;
     const k = try keptOf(e, s);
     st.lin.settle(st.pos);
@@ -226,7 +226,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
     const st = &e.cur.st;
     if (st.pending != 0 or st.mtp_len > st.pos + window_rows) return error.NotAtMark;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
-    const plan = try layout.Plan.init(st, &e.c, st.pos, if (e.mtp) st.mtp_len else null);
+    const plan = try layout.Plan.init(st, &e.c, st.pos, if (e.mtp) st.mtp_len else null, snapshots.heldPages(e, st.pos));
     const l = lay(&plan, st, true);
     const win = snapshots.window(e);
     const state_len = if (win != null) try pages.rounded(l.end) else l.end; // the ring starts on a page
@@ -263,7 +263,7 @@ pub fn keepAs(e: anytype, id: u64) !void {
     try m.flush();
     if (win) |w| try snapshots.moveFlat(pool, e.stream, &lease, state_len, w.ring, ring_bytes, true);
     try e.stream.synchronize();
-    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = st.pos, .mtp_len = st.mtp_len, .cur = cur, .bases = .{ st.base, st.mtp_base }, .win_from = if (win) |w| w.from else null, .lin = k });
+    e.snaps.putAssumeCapacityNoClobber(id, .{ .lease = lease, .len = plan.len, .pos = st.pos, .mtp_len = st.mtp_len, .cur = cur, .bases = .{ st.base, st.mtp_base }, .shared = plan.shared, .win_from = if (win) |w| w.from else null, .lin = k });
     stats.copied += m.bytes;
     stats.shared += shared;
 }

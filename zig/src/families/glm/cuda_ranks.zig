@@ -16,7 +16,8 @@ pub const Settings = struct {
     split_min: u32 = 0, // TF_GLM_SPLIT_MIN: a prompt piece of fewer rows glues whole (0: every piece of world rows splits)
     kda_wide: bool = true, // TF_GLM_KDA_DECODE_WIDE: 1 (decode windows on KDA's three-kernel chain) or 0
     kda_pad: bool = false, // TF_GLM_KDA_PAD: 1 (the fused KDA input padded to eight columns at load, for glm_mm) or 0
-    pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole).
+    pieces: u32 = 3, // TF_GLM_OVERLAP_PIECES: a prompt chunk's exchanges in this many row pieces (1: whole); unset, 8 under solo on the wire.
+    solo: bool = false, // TF_GLM_CHUNK_SOLO: 4096 (prompt buffers for two chunks a pass, while no stream decodes) or 2048
     pair: bool = true, // TF_GLM_PROMPT_PAIR: 1 (while no stream decodes, a prompt step takes two chunks, each one's exchanges under the other's sites) or 0
     index_split: u32 = 2048, // TF_GLM_INDEX_SPLIT: from this position on, rank 0 splits a prompt chunk's indexer rows (0: never)
     heat: ?heat.Bands = null, // TF_HEAT_HIGH and TF_HEAT_LOW (upstream's names): a prompt chunk waits on every rank's hottest zone
@@ -26,6 +27,9 @@ pub const Settings = struct {
     ovn_comms: u32 = 0, // the comms lane's TF_GLM_OVN_* knobs as one word (ovnComms): every rank exchanges alike
     shared_rows: u32 = least_shared_rows, // TF_GLM_OVN_SHARED_ROWS: a shared verify's rows at most (0: auto, unresolved)
     shared_bs_rows: u32 = 0, // TF_GLM_OVN_SHARED_BS_ROWS: the shared buffers' rows, 32 to 64 (0: the setting's)
+    roce_multi: bool = false, // TF_GLM_ROCE_MULTI: 1 (three ranks or more: small all-gathers on fabric/tp's multirank RoCE beside NCCL) or 0
+    kv_host: u8 = 0, // TF_GLM_KV_HOST=1: KV pages in host memory (1); with TF_GLM_KV_HOST_SHARED=1, one copy a host (2)
+    kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: the host pages' GiB (0: one full window)
 
     /// The settings `get` (an environment lookup) gives; `problem` names a value that is not one of the choices.
     pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
@@ -69,12 +73,26 @@ pub const Settings = struct {
                 return error.BadSetting;
             }
         }
+        if (get("TF_GLM_ROCE_MULTI")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.roce_multi = true else if (std.mem.eql(u8, v, "0")) s.roce_multi = false else {
+                problem.* = "TF_GLM_ROCE_MULTI: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_CHUNK_SOLO")) |v| {
+            if (std.mem.eql(u8, v, "4096")) s.solo = true else if (std.mem.eql(u8, v, "2048")) s.solo = false else {
+                problem.* = "TF_GLM_CHUNK_SOLO: 2048 or 4096";
+                return error.BadSetting;
+            }
+        }
         if (get("TF_GLM_OVERLAP_PIECES")) |v| {
             s.pieces = std.fmt.parseInt(u32, v, 10) catch 0;
             if (s.pieces < 1 or s.pieces > 8) {
                 problem.* = "TF_GLM_OVERLAP_PIECES: 1 to 8";
                 return error.BadSetting;
             }
+        } else if (s.solo and s.roce_multi and wireOpens(get)) {
+            s.pieces = 8; // TF_GLM_CHUNK_SOLO=4096 with TF_GLM_ROCE_MULTI=1: solo's doubled passes on the wire
         }
         if (get("TF_GLM_SPLIT_MIN")) |v| {
             s.split_min = std.fmt.parseInt(u32, v, 10) catch 1 << 31;
@@ -133,6 +151,30 @@ pub const Settings = struct {
             problem.* = "TF_GLM_PROMPT_K=shape requires TF_GLM_MM=1";
             return error.BadSetting;
         }
+        if (get("TF_GLM_KV_HOST")) |v| {
+            if (std.mem.eql(u8, v, "1")) s.kv_host = 1 else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = "TF_GLM_KV_HOST: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KV_HOST_SHARED")) |v| {
+            if (std.mem.eql(u8, v, "1") and s.kv_host == 1) s.kv_host = 2 else if (!std.mem.eql(u8, v, "0")) {
+                problem.* = if (std.mem.eql(u8, v, "1")) "TF_GLM_KV_HOST_SHARED=1 requires TF_GLM_KV_HOST=1" else "TF_GLM_KV_HOST_SHARED: 0 or 1";
+                return error.BadSetting;
+            }
+        }
+        if (get("TF_GLM_KV_HOST_GIB")) |v| {
+            s.kv_host_gib = std.fmt.parseFloat(f64, v) catch 0;
+            if (!(s.kv_host_gib > 0) or s.kv_host == 0) {
+                problem.* = "TF_GLM_KV_HOST_GIB: the host pages' GiB, more than 0, with TF_GLM_KV_HOST=1";
+                return error.BadSetting;
+            }
+        }
+        // refused here, before the weights load: the wire's bootstrap meets at rank 0, its kernel comes from the image
+        if (s.roce_multi and (get("TF_TP_MASTER") == null or get("TF_TP_KERNEL_IMAGE") == null)) {
+            problem.* = "TF_GLM_ROCE_MULTI=1 requires TF_TP_MASTER and TF_TP_KERNEL_IMAGE";
+            return error.BadSetting;
+        }
         if (s.kda_pad and !s.tiled) {
             problem.* = "TF_GLM_KDA_PAD=1 requires TF_GLM_MM=1 (glm_mm is what reads the padded rows)";
             return error.BadSetting;
@@ -181,14 +223,20 @@ pub fn ovnComms() !u32 {
     return @as(u32, @intFromBool(rails)) | @as(u32, @intFromBool(cuda.ovn.on("LINK1"))) << 1 | @as(u32, @intFromBool(cuda.ovn.on("LINK_ROCE"))) << 2 | @as(u32, @intFromBool(cuda.ovn.on("PRX"))) << 3 | @as(u32, @intFromBool(cuda.ovn.on("PRX_ALONE"))) << 4 | kb << 8;
 }
 
-/// The process environment's value of `name` (null when unset).
+/// A setting by name (null when unset): a registered switch through the profile registry, the rest as before.
 pub fn environment(name: [:0]const u8) ?[]const u8 {
-    return std.mem.span(std.c.getenv(name) orelse return null);
+    return @import("profile").lookup(name);
+}
+
+/// Whether TF_GLM_ROCE_MULTI's wire opens at TF_GLM_WORLD: three ranks or more (cuda_roce_multi); TP=2 stays on NCCL.
+fn wireOpens(get: *const fn ([:0]const u8) ?[]const u8) bool {
+    const v = get("TF_GLM_WORLD") orelse return false;
+    return (std.fmt.parseInt(usize, v, 10) catch 0) >= 3;
 }
 
 /// What every rank must agree on, as bytes the communicator carries.
 pub const Fingerprint = extern struct {
-    layout: u32 = 17, // this struct's version
+    layout: u32 = 18, // this struct's version (16 plus pair, ovn_comms, shared_rows, shared_bs_rows)
     world: u32,
     rank: u32,
     kv8: u32 = 0,
@@ -207,6 +255,9 @@ pub const Fingerprint = extern struct {
     max_images: u32 = 0,
     max_videos: u32 = 0,
     max_frames: u32 = 0,
+    roce_multi: u32 = 0, // TF_GLM_ROCE_MULTI: every rank opens the borrowed wire or none does (a lone rank would wait on it)
+    kv_host: u32 = 0, // TF_GLM_KV_HOST(_SHARED): every rank sizes the pool alike and maps the shared file, or none does
+    solo: u32 = 0, // TF_GLM_CHUNK_SOLO: rank 0's solo passes need the wider prompt buffers on every rank
     bits: u32 = 16 << 8 | 16, // TF_GLM_DENSE_BITS << 8 | TF_GLM_HEAD_BITS: every rank's matmuls read the same codes
     ovn_comms: u32 = 0, // Settings.ovn_comms: the RoCE gather's blob and stripes and the step link's transport
     moe_owners: u32 = 0, // TF_GLM_OVN_EXPERT_ROTATE's owners (cuda_rotlayer digest): every rank sums a layer alike
@@ -214,6 +265,7 @@ pub const Fingerprint = extern struct {
     capacity: u64, // tokens a sequence holds
     heat_high: f64, // the heat bands in degrees (0 and 0: off): every rank must wait alike
     heat_low: f64,
+    kv_host_gib: f64 = 0, // TF_GLM_KV_HOST_GIB: each rank's row marks span the host pages rank 0 counts
     config: [32]u8, // sha256 of config.json
     program: [32]u8, // sha256 of this executable
     checkpoint: [64]u8, // hex digest of the checkpoint's metadata and every shard byte, through the digest cache
@@ -238,6 +290,9 @@ pub const Fingerprint = extern struct {
         max_images,
         max_videos,
         max_frames,
+        roce_multi,
+        kv_host,
+        solo,
         bits,
         ovn_comms,
         moe_owners,
@@ -245,6 +300,7 @@ pub const Fingerprint = extern struct {
         capacity,
         heat_high,
         heat_low,
+        kv_host_gib,
         config,
         program,
         checkpoint,
@@ -274,6 +330,10 @@ pub const Fingerprint = extern struct {
             .pair = @intFromBool(s.pair),
             .layers = s.layers,
             .mtp = @intFromBool(mtp),
+            .roce_multi = @intFromBool(s.roce_multi),
+            .kv_host = s.kv_host,
+            .kv_host_gib = s.kv_host_gib,
+            .solo = @intFromBool(s.solo),
             .bits = @as(u32, s.dense_bits) << 8 | s.head_bits,
             .ovn_comms = s.ovn_comms,
             .shared_rows = s.shared_rows | (bufferRows(s) catch 0) << 8, // the cap, then the buffers' rows
@@ -313,6 +373,9 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "max_images",
             "max_videos",
             "max_frames",
+            "roce_multi",
+            "kv_host",
+            "solo",
             "bits",
             "ovn_comms",
             "moe_owners",
@@ -320,6 +383,7 @@ pub fn mismatch(all: []const Fingerprint) ?Mismatch {
             "capacity",
             "heat_high",
             "heat_low",
+            "kv_host_gib",
             "config",
             "program",
             "checkpoint",
@@ -400,7 +464,14 @@ fn probeSplit(d: *const cuda.Driver, lib: *const cuda.nccl.Library, comm: cuda.n
     };
 }
 
+/// The latest pair split refused, which a test build keeps for its test instead of printing the refusal.
+pub var refused_pair: ?[2]usize = null;
+
 fn unreachablePeer(rank: usize, peer: usize) error{SplitUnreachable} {
+    if (@import("builtin").is_test) {
+        refused_pair = .{ rank, peer };
+        return error.SplitUnreachable;
+    }
     std.debug.print("REFUSE TF_GLM_PREFILL_REDUCE=split: rank {d} cannot exchange with rank {d}; split sends every rank's rows to every other, and a fabric where some ranks reach only their neighbours (a ring of four without a switch) needs TF_GLM_PREFILL_REDUCE=ring or gather\n", .{ rank, peer });
     return error.SplitUnreachable;
 }
@@ -426,6 +497,10 @@ fn explain(f: Fingerprint.Field) []const u8 {
         .max_images => "the image count limit",
         .max_videos => "the video count limit",
         .max_frames => "the frame limit",
+        .roce_multi => "TF_GLM_ROCE_MULTI",
+        .kv_host => "TF_GLM_KV_HOST or TF_GLM_KV_HOST_SHARED",
+        .kv_host_gib => "TF_GLM_KV_HOST_GIB",
+        .solo => "TF_GLM_CHUNK_SOLO",
         .bits => "TF_GLM_DENSE_BITS or TF_GLM_HEAD_BITS",
         .ovn_comms => "TF_GLM_OVN_ROCE_RAILS, TF_GLM_OVN_ROCE_RAILS_KB, TF_GLM_OVN_LINK1, TF_GLM_OVN_LINK_ROCE, TF_GLM_OVN_PRX or TF_GLM_OVN_PRX_ALONE",
         .moe_owners => "TF_GLM_OVN_EXPERT_ROTATE (each MoE layer's expert share owners)",

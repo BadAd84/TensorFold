@@ -52,7 +52,7 @@ fn kept(e: anytype, a: std.mem.Allocator, id: u64) ![]u8 {
     var off: usize = 0;
     while (off < s.len) {
         const n = @min(s.len - off, page - off % page);
-        const at = arena.ptr + @as(u64, s.lease.ids.items[off / page]) * page + off % page;
+        const at = arena.ptr() + @as(u64, s.lease.ids.items[off / page]) * page + off % page;
         try e.d.check(e.d.api.cuMemcpyDtoH_v2(out[off..].ptr, at, n), "cuMemcpyDtoH");
         off += n;
     }

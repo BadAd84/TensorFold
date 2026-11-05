@@ -244,5 +244,6 @@ pub fn shareTaps(f: *const Forward, t: taps.Taps, cut: []const [2]usize) !void {
         if (!f.splits(n)) continue;
         const plan: relay.Relay = .{ .world = r.w.share.world, .rank = r.w.share.rank, .n = n };
         if (try fprx.of(x, f.prx, f.ring, f.stream)) |ch| try ch.exchange(f.stream, &fprx.glued(plan, t.out, piece[0], dims)) else if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
+        if (f.ring) try relay.glued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims) else try relay.splitGlued(x.lib, x.comm, f.stream, plan, t.out, piece[0], dims);
     }
 }

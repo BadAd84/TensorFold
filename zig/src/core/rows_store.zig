@@ -30,6 +30,8 @@ pub const Image = struct {
     gather: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, out: []u8) anyerror!void,
     /// A new kept state of `at` tokens, its image filled by `scatter` and then restored as any other.
     blank: *const fn (ptr: *anyopaque, at: u32) anyerror!pc.Saved,
+    /// New storage `blank` takes at `at` (null: the family's ordinary save estimate).
+    blank_bytes: ?*const fn (ptr: *anyopaque, at: u32) u64 = null,
     /// Copy `in`, back to back, into `ranges` of `saved`'s image.
     scatter: *const fn (ptr: *anyopaque, saved: pc.Saved, ranges: []const image.Range, in: []const u8) anyerror!void,
     /// Whether `saved`'s image can still be read whole (null: always).
@@ -136,7 +138,7 @@ pub const Rows = struct {
         errdefer r.deinit();
         try makePath(gpa, r.dir);
         try @import("rows_scan.zig").scan(r);
-        @import("rows_scan.zig").settle(r);
+        try @import("rows_scan.zig").settle(r);
         r.stamp();
         r.sync_writes = o.sync_writes or (if (platform.c.getenv("TENSORFOLD_ROWS_SYNC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false);
         r.staging_bytes = stagingBytes(o.staging_bytes, if (platform.c.getenv("TENSORFOLD_ROWS_STAGING_GIB")) |v| std.mem.span(v) else null);
@@ -180,6 +182,11 @@ pub const Rows = struct {
         gpa.free(s.tokens);
         gpa.free(s.spans);
         gpa.free(s.starts);
+    }
+
+    /// A disk restore can need more storage than saving a resident state whose rows stay in the live pool.
+    pub fn blankBytes(r: *const Rows, at: u32) u64 {
+        return if (r.img.blank_bytes) |f| f(r.family.ptr, at) else r.family.vtable.bytes(r.family.ptr, at);
     }
 
     /// A staging buffer of at least `bytes` (kept between steps).
@@ -559,4 +566,5 @@ test "TENSORFOLD_ROWS_STAGING_GIB raises the staging permit; unset or unreadable
     try std.testing.expectEqual(@as(u64, 8 << 30), stagingBytes(1 << 30, "8"));
     try std.testing.expectEqual(@as(u64, 3 << 29), stagingBytes(1 << 30, "1.5"));
     for ([_][]const u8{ "0", "-2", "x", "2000" }) |bad| try std.testing.expectEqual(@as(u64, 1 << 30), stagingBytes(1 << 30, bad));
+    _ = @import("rows_all_test.zig");
 }

@@ -15,6 +15,7 @@ const dflash = @import("dflash.zig");
 const dflash_load = @import("dflash_load.zig");
 const copy = @import("copy.zig");
 const pages_mod = @import("cuda_pages.zig");
+const prefix_mod = @import("cuda_prefix.zig");
 const kv = @import("core").kv_pool;
 
 pub const model_type = "glm5_next";
@@ -27,9 +28,7 @@ pub fn copyProposers() ?copy.Factory {
 pub const default_context: i64 = 8192;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fw.prefill_rows;
-/// No snap_grid: a prompt row's bits do not depend on its chunk's rows or start (cuda_engine.chunkEnd cuts at marks), so
-/// states keep and resume at any row. The smallest state cache admission plans for (cuda_kv_pool.capacity's floor and
-/// minimum), apart from the chunk size: tied to the chunk, 2,049- to 4,096-row windows would lose their cache facts.
+/// States keep at any row (chunkEnd cuts at marks): the smallest state admission plans for, apart from the chunk size.
 pub const snap_min_rows: u32 = 2048;
 /// TF_GLM_OVN_KDA_CHUNKED: prompt rows depend on 32-row sub-chunk alignment, so states keep and resume on that grid.
 pub fn snapGridNow() ?u32 {
@@ -84,20 +83,51 @@ pub const Loaded = struct {
     vision: ?*images_mod.Images = null, // rank 0's tower for the server's image offer
     layout: ?kv.Layout = null, // every stream's memory as one pool of KV pages (null: a window each, by TF_KV_PAGES)
     engine_paged: bool = false, // with a layout, the engine's own sequence takes pages too: the plan sets a window aside
+    host_snaps: bool = false, // TF_GLM_HOST_CACHE: kept states in pinned host memory, --prompt-cache-gib of it
+    own_prompt_cache: bool = false, // TF_GLM_KV_SHARE: the family keeps prompts over the pool's pages, no host store
 };
+
+pub fn benchmark(p: *anyopaque) struct { ranks: ?u32, group: ?[]const u8 } {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    return .{ .ranks = @intCast(own.group.world), .group = own.benchmark_group };
+}
 
 /// The pool behind every stream: the engine's own sequence and `streams` more on `pages` KV pages, on every rank.
 pub fn attach(p: *anyopaque, streams: u32, pages: usize) !void {
     const own: *Owned = @ptrCast(@alignCast(p));
     const l = own.layout orelse return error.NoPages;
-    try own.lanes.x.pool(streams + 1, pages, l.pageBytes());
-    own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, pages, true);
+    const kept = @import("cuda_kv_host.zig").pagesFor(@import("cuda_state.zig").pageBytes(&own.e.w, own.e.settings.kv8), own.e.capacity, pages);
+    try own.lanes.x.pool(streams + 1, kept, l.pageBytes());
+    own.e.pages = try pages_mod.Pages.init(own.gpa, own.e, l, streams + 1, kept, true);
+    if (own.share > 0) try share(own, streams + 1);
+}
+
+/// TF_GLM_KV_SHARE: the pool's prompt cache, its `own.share` snapshots sized at the window's last mark (rings whole).
+fn share(own: *Owned, parallel: u32) !void {
+    const e = own.e;
+    const snap_grid: u32 = prompt_rows; // the cache keeps its states at the window's marks, on the chunk grid
+    e.share_pages = true;
+    // cc-defer: the snapshots take the room set aside for --prompt-cache-gib; from the plan once it plans them
+    try readySnapshots(own, own.share * e.stateBytes(e.capacity - e.capacity % snap_grid));
+    own.lanes.prefix = try prefix_mod.Prefix.init(e.gpa, e, e.pages.?, snap_grid, own.share);
+    if (prefix_mod.fewStates(own.share, parallel)) std.log.warn(
+        "TF_GLM_KV_SHARE={d} keeps under 4 states a stream at --parallel {d}: live streams evict each other's before a resume; set it to {d} or more",
+        .{ own.share, parallel, 4 * parallel },
+    );
 }
 
 /// Whether a request's caches fit now (the lane host's admission, on its engine thread).
 pub fn fits(p: *anyopaque, prompt: u32, max_tokens: u32) bool {
     const own: *Owned = @ptrCast(@alignCast(p));
     return own.lanes.fits(prompt, max_tokens);
+}
+
+/// The page pool the load ledger watches: rank 0's, the one that takes and gives pages for every rank.
+pub fn kvPool(p: *anyopaque) ?kv.Source {
+    const own: *Owned = @ptrCast(@alignCast(p));
+    const pages = own.e.pages orelse return null; // a window a stream
+    if (!pages.leader) return null;
+    return .{ .pool = &pages.pool, .page_tokens = @import("cuda_state.zig").page_rows };
 }
 
 /// This rank's place: TF_GLM_RANK of TF_GLM_WORLD (both, or neither for a refusal that names them).
@@ -141,35 +171,17 @@ const snapshots = @import("cuda_snapshots.zig");
 
 const Owned = struct {
     gpa: std.mem.Allocator,
+    benchmark_group: ?[]const u8,
     group: cuda.tp_group.Group, // the ranks' communicator; two ranks add RoCE writes for the main stream's small gathers
     e: *engine.Engine,
     link: follow.Link,
     lanes: glm_lanes.Lanes,
     layout: ?kv.Layout,
+    share: usize, // TF_GLM_KV_SHARE: states the prompt cache over the pool's pages keeps (0: the host store)
 };
 
 const env = @import("sys").env;
 const cost_time = @import("cuda_cost_time.zig");
-
-/// Every peer's send/recv connected now, before the weights fill memory (connected on first use, ibv_reg_mr can fail).
-fn warmPeers(d: *const cuda.Driver, g: *const cuda.tp_group.Group) !void {
-    const bytes = 4 << 20; // a prompt piece's exchange: every channel a large send/recv takes
-    var buf = try cuda.DeviceBuffer.alloc(d, 2 * bytes * g.world);
-    defer buf.free();
-    var s = try cuda.Stream.init(d, false);
-    defer s.deinit();
-    try g.lib.check(g.lib.api.ncclGroupStart(), "ncclGroupStart");
-    const posted: anyerror!void = post: {
-        for (0..g.world) |peer| if (peer != g.rank) {
-            g.send(s, buf.ptr + peer * bytes, bytes, peer) catch |err| break :post err;
-            g.recv(s, buf.ptr + (g.world + peer) * bytes, bytes, peer) catch |err| break :post err;
-        };
-        break :post {};
-    };
-    try g.lib.check(g.lib.api.ncclGroupEnd(), "ncclGroupEnd"); // the group closes on every path
-    try posted;
-    try s.synchronize();
-}
 
 /// TF_ROCE_MAX_KB in KiB, bounded by the RDMA scatter/gather length before any allocation.
 pub fn roceBytes(text: ?[]const u8) !usize {
@@ -186,6 +198,10 @@ const paging = startup.paging;
 pub fn settingsOf(get: *const fn ([:0]const u8) ?[]const u8, o: Options, problem: *[]const u8) !ranks.Settings {
     var set = try ranks.Settings.read(get, problem);
     set.kv8 = o.kv8;
+    if (set.kv8 and set.kv_host != 0) { // the host gather moves bf16 latent rows (cuda_kv_host.Gather): no FP8 pages
+        problem.* = "TF_GLM_KV_HOST=1 does not take --kv-cache fp8";
+        return error.BadSetting;
+    }
     set.shared_rows = ranks.autoRows(set.shared_rows, o.parallel); // auto: production's rule by the streams served
     return set;
 }
@@ -201,7 +217,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         std.log.err("{s}", .{problem});
         return err;
     };
-    return startup.open(io, p, if (std.c.getenv("TF_KV_PAGES")) |v| std.mem.span(v) else null, set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes }, openRank);
+    const share_snaps = try prefix_mod.sharing();
+    return startup.open(io, p, @import("core").profile.get(.TF_KV_PAGES), set, cuda.tp_watch, StartArgs{ .gpa = gpa, .io = io, .ctx = ctx, .dir = dir, .o = o, .p = p, .roce_bytes = roce_bytes, .share = share_snaps }, openRank, startup.log);
 }
 
 const StartArgs = struct {
@@ -212,6 +229,7 @@ const StartArgs = struct {
     o: Options,
     p: Place,
     roce_bytes: usize,
+    share: usize,
 };
 
 /// After liveness and page settings: NCCL, the engine and the link, then a follower's loop or rank zero's lanes.
@@ -223,10 +241,19 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     const o = a.o;
     const p = a.p;
     const roce_bytes = a.roce_bytes;
+    const copies = try cuda.priority_copies.read("TF_GLM_COPIES", o.drafts);
+    var load_cache = @import("core").checkpoint.cache.Load.begin(io, p.world > 1);
+    defer load_cache.deinit();
+    // TF_GLM_KV_SHARE keeps prompts as the pool's pages: refused before the weights load, every rank told (startup)
+    if (a.share > 0 and !set.pages) return error.GlmShareNeedsPages;
+    try @import("cuda_prompt_solo.zig").refuse(set.solo, o.drafter);
+    if (@import("cuda_kv_host.zig").onHost() and !set.pages) return error.GlmKvHostNeedsPages;
     cuda.memory_receipt.emit(@intCast(p.rank), .load_begin, true); // the four phases tools/memory_receipts.py reads
     const own = try gpa.create(Owned);
     errdefer gpa.destroy(own);
     own.gpa = gpa;
+    own.benchmark_group = null;
+    own.share = a.share;
     // every connection registered at init, while memory is free (lazily, a full GB10's ibv_reg_mr can refuse it)
     if (std.c.getenv("NCCL_RUNTIME_CONNECT") == null) _ = env.setenv("NCCL_RUNTIME_CONNECT", "0", 0);
     // NCCL's cuMem host buffers wore out GB10's driver pool under load (NV_ERR_NO_MEMORY; next ranks failed to start)
@@ -247,7 +274,7 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
     try lib.check(lib.api.ncclCommInitRank(&comm, @intCast(p.world), id, @intCast(p.rank)), "ncclCommInitRank");
     own.group = .{ .lib = lib, .comm = comm, .rank = p.rank, .world = p.world };
     errdefer _ = own.group.lib.api.ncclCommDestroy(own.group.comm);
-    if (p.world > 1) try warmPeers(ctx.d, &own.group);
+    if (p.world > 1) try @import("cuda_warm_peers.zig").warm(ctx.d, &own.group, set.ring);
     cuda.p2p_report.afterInit(&diag, .{ .lib = &own.group.lib, .comm = comm, .d = ctx.d, .later = true });
     const cap = capacity(o.context);
     own.e = try engine.Engine.init(gpa, io, ctx.d, ctx, dir, &own.group.lib, own.group.comm, p.rank, p.world, .{ .capacity = cap, .mtp = o.drafts, .settings = set, .vision = o.vision, .drafter = o.drafter != null });
@@ -268,10 +295,14 @@ fn openRank(a: StartArgs, set: ranks.Settings) !Loaded {
         .p = p,
         .cap = cap,
         .roce_bytes = roce_bytes,
+        .load_cache = &load_cache,
+        .copies = copies,
     }, finishRank);
 }
 
 const OpenArgs = struct {
+    copies: bool,
+    load_cache: *@import("core").checkpoint.cache.Load,
     own: *Owned,
     io: std.Io,
     ctx: *const cuda.Context,
@@ -300,12 +331,16 @@ fn finishRank(a: OpenArgs) !Loaded {
     // TF_GLM_OVN_PRX (cuda_ranks agreed it): its pinned region before the rooms are measured, so they count it
     if (cuda.ovn.on("PRX")) try own.group.openPrx(gpa, io, ctx.d, own.e.stream);
     errdefer if (own.group.prx) |c| c.deinit();
+    try @import("cuda_roce_multi.zig").open(gpa, io, ctx.d, &own.group, set.roce_multi); // three ranks or more, likewise
+    errdefer if (own.group.multi) |m| m.deinit(m.ctx);
     own.e.group = &own.group;
     own.link = try follow.Link.init(gpa, ctx.d, &own.group.lib, own.group.comm, own.e.stream, try linkCapacity(cap, o.vision));
     errdefer own.link.deinit();
     try own.link.oneBlock(&own.group); // TF_GLM_OVN_LINK1 / LINK_ROCE (agreed in cuda_ranks): the block and its rows
     if (p.rank == 0 and p.world > 1) own.e.link = &own.link; // its disk steps (cuda_disk_ranks) cross on the link
     own.e.snap_setup = .{ .ptr = own, .run = readySnapshots };
+    try @import("cuda_kv_host.zig").prepare(ctx.d, @import("cuda_state.zig").pageBytes(&own.e.w, own.e.settings.kv8), own.e.capacity, own.e.w.config.kv_lora * 2);
+    if (p.world > 1) try a.load_cache.finishAfter(.{ io, own.e.checkpoint_digest }, cuda.tp_watch.ready) else a.load_cache.finish();
     // Rank 0 admits by the smallest room of the ranks; its sizes are the largest (the first ranks take the remainder).
     const rooms = try gpa.alloc(u64, p.world);
     defer gpa.free(rooms);
@@ -316,11 +351,11 @@ fn finishRank(a: OpenArgs) !Loaded {
     for (rooms[1..], 1..) |r, q| if (peer == null or r < peer.?.bytes) {
         peer = .{ .bytes = r, .rank = q };
     };
+    own.benchmark_group = try @import("core").benchmark_group.cuda(gpa, io, ctx, &own.group, own.e.stream);
+    errdefer if (own.benchmark_group) |b| gpa.free(b);
     // every rank loaded and agreed (cuda_ranks) before the first step; the digest names what they agreed on
-    if (p.world > 1) try cuda.tp_watch.ready(io, own.e.checkpoint_digest);
     cuda.memory_receipt.emit(@intCast(p.rank), .load_end, false);
-    // TF_GLM_OVN_SHARED_ROWS moves nothing before the pool: this count is the same at 32 and 64 rows, and what the rows
-    // size is made at the first verify (cuda_engine_shared.ensure), never during the load
+    // TF_GLM_OVN_SHARED_ROWS moves nothing before the pool: what the rows size is made at the first verify, not here
     if (own.e.shared_made or own.e.bs != null or own.e.draw1 != null) return error.SharedMadeBeforePool;
     std.log.info("glm: rank {d} holds {d} bytes at the load's end; the pool, then the shared windows ({d} bytes set aside)", .{ p.rank, cuda.usage(false).device, later });
     if (p.rank != 0) { // a follower never serves: it runs rank 0's steps, frees what it owns, then leaves the process
@@ -336,8 +371,7 @@ fn finishRank(a: OpenArgs) !Loaded {
         cuda.memory_receipt.emit(@intCast(p.rank), .cleanup_end, false);
         std.process.exit(0);
     }
-    // Rank 0 alone reads these: TF_GLM_PROMPT_STEPS=0 passes prompts whole, TF_GLM_PROMPT_MANY=0 admits short prompts
-    // one a round, TF_GLM_SHARED=0 runs windows alone.
+    // Rank 0 alone reads these: PROMPT_STEPS=0 passes prompts whole, PROMPT_MANY=0 admits one a round, SHARED=0 alone
     const off = struct {
         fn get(name: [*:0]const u8) bool {
             return if (std.c.getenv(name)) |v| std.mem.eql(u8, std.mem.span(v), "0") else false;
@@ -355,7 +389,7 @@ fn finishRank(a: OpenArgs) !Loaded {
     return .{
         .draft_kind = if (own.e.drafter != null) "DFlash2" else null,
         .backend = own.lanes.backend(),
-        .facts = own.lanes.facts(),
+        .facts = own.lanes.factsWithCopies(a.copies),
         .rows = glm_lanes.max_rows,
         .stream_bytes = own.e.seqBytes() + extra, // each stream past the first makes its own sequence on every rank
         .free_streams = 1, // the first is the sequence the engine made
@@ -367,6 +401,8 @@ fn finishRank(a: OpenArgs) !Loaded {
         .vision = own.e.images,
         .layout = own.layout,
         .engine_paged = set.pages,
+        .host_snaps = snapshots.pages.onHost(),
+        .own_prompt_cache = own.share > 0,
     };
 }
 
@@ -454,6 +490,7 @@ fn release(own: *Owned) void {
     if (own.e.images) |v| v.deinit();
     own.e.deinit();
     own.group.close();
+    if (own.benchmark_group) |b| own.gpa.free(b);
     own.gpa.destroy(own);
 }
 
@@ -464,6 +501,12 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoRank => "GLM-5.3-Flash runs at TP over hosts: set TF_GLM_RANK and TF_GLM_WORLD on every host (WORLD 1: one GPU, with TF_GLM_LAYERS for a thin model)",
         error.NoCommId => "GLM-5.3-Flash's ranks meet over NCCL: with TF_GLM_WORLD 2 or more, set NCCL_COMM_ID to rank 0's address:port on every host",
         error.RankMismatch => "the ranks' settings differ (each rank's log names the one): start them alike",
+        error.Fp8OnPages => "--kv-cache fp8 keeps a window per stream: unset TF_KV_PAGES, or set it to auto or off",
+        error.BadGlmKvShare => "TF_GLM_KV_SHARE: give how many states the prompt cache over the KV pages keeps, or 0 or unset for off",
+        error.GlmShareNeedsPages => "TF_GLM_KV_SHARE keeps prompts as KV pool pages: set TF_KV_PAGES=on as well",
+        error.BadCopyPolicy => "TF_GLM_COPIES: expected 0 or 1 for verified root/context copies",
+        error.GlmSoloWithDrafter => "TF_GLM_CHUNK_SOLO=4096 holds buffers no pass uses beside --drafter: unset it, or leave out --drafter",
+        error.GlmKvHostNeedsPages => "TF_GLM_KV_HOST keeps the KV pool's pages in host memory: set TF_KV_PAGES=on (and --kv-cache bf16) as well",
         error.TooManyRanks => std.fmt.comptimePrint(
             "GLM-5.3-Flash on CUDA runs on at most {d} ranks: set TF_GLM_WORLD to {d} or fewer",
             .{ ranks.max_world, ranks.max_world },
@@ -487,19 +530,36 @@ test "a checkpoint refused for its format, at the entry or by the loader, is exp
 }
 
 test "TF_KV_PAGES: auto pages from two ranks, off and 0 give windows, all and other values page like on" {
-    try std.testing.expect(!paging(null, 1));
-    try std.testing.expect(!paging("auto", 1));
+    try std.testing.expect(!try paging(null, 1, false));
+    try std.testing.expect(!try paging("auto", 1, false));
     for ([_]usize{ 2, 3, 16 }) |w| {
-        try std.testing.expect(paging(null, w));
-        try std.testing.expect(paging("auto", w));
+        try std.testing.expect(try paging(null, w, false));
+        try std.testing.expect(try paging("auto", w, false));
     }
     for ([_]usize{ 1, 2, 3 }) |w| {
-        try std.testing.expect(paging("on", w));
-        try std.testing.expect(paging("1", w));
-        try std.testing.expect(!paging("off", w));
-        try std.testing.expect(!paging("0", w));
-        try std.testing.expect(paging("all", w));
+        try std.testing.expect(try paging("on", w, false));
+        try std.testing.expect(try paging("1", w, false));
+        try std.testing.expect(!try paging("off", w, false));
+        try std.testing.expect(!try paging("0", w, false));
+        try std.testing.expect(try paging("all", w, false));
     }
+}
+
+test "TF_KV_PAGES with --kv-cache fp8: the same choices as bf16 (FP8 rows lay out on pages, cuda_state.onPages)" {
+    for ([_]usize{ 1, 2, 3, 16 }) |w| {
+        try std.testing.expectEqual(w >= 2, try paging(null, w, true));
+        try std.testing.expectEqual(w >= 2, try paging("auto", w, true));
+        try std.testing.expect(!try paging("off", w, true));
+        for ([_][]const u8{ "on", "1", "all" }) |v| try std.testing.expect(try paging(v, w, true));
+    }
+}
+
+test "TF_GLM_CHUNK_SOLO=4096 beside --drafter is refused by name" {
+    const solo = @import("cuda_prompt_solo.zig");
+    try std.testing.expectError(error.GlmSoloWithDrafter, solo.refuse(true, "dflash2"));
+    try solo.refuse(true, null);
+    try solo.refuse(false, "dflash2");
+    try std.testing.expect(explain(null, error.GlmSoloWithDrafter) != null);
 }
 
 test "capacity keeps a verify window past the context and a multiple of 64" {

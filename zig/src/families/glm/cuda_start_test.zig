@@ -2,6 +2,13 @@
 const std = @import("std");
 const startup = @import("cuda_start.zig");
 
+fn recordReport(args: Args, selection: startup.Report) void {
+    const w = args.world;
+    const line = std.fmt.bufPrint(&w.report, "glm kv selection: {f}", .{selection}) catch @panic("unbounded startup report");
+    w.report_len = line.len;
+    w.reports += 1;
+}
+
 const Settings = struct { kv8: bool, pages: bool = false, marker: u32 = 37 };
 const Place = struct { rank: usize, world: usize = 2 };
 const World = struct {
@@ -14,6 +21,10 @@ const World = struct {
     notifications: usize = 0,
     fail_start: bool = false,
     fail_engine: bool = false,
+    expected_world: usize = 2,
+    reports: usize = 0,
+    report: [256]u8 = undefined,
+    report_len: usize = 0,
 };
 const Watch = struct {
     world: *World,
@@ -21,7 +32,7 @@ const Watch = struct {
 
     pub fn start(w: Watch, _: std.Io, rank: usize, world: usize) !void {
         try std.testing.expectEqual(w.rank, rank);
-        try std.testing.expectEqual(@as(usize, 2), world);
+        try std.testing.expectEqual(w.world.expected_world, world);
         w.world.starts += 1;
         if (w.world.fail_start) return error.InjectedConnectFailure;
         w.world.connected[rank] = true;
@@ -39,6 +50,7 @@ const Watch = struct {
 const Args = struct { world: *World, rank: usize };
 
 fn construct(a: Args, settings: Settings) anyerror!void {
+    try std.testing.expect(a.world.reports > 0);
     a.world.constructed[a.rank] = true;
     a.world.settings[a.rank] = settings;
     if (a.world.fail_engine) return error.InjectedEngineFailure;
@@ -46,7 +58,7 @@ fn construct(a: Args, settings: Settings) anyerror!void {
 }
 
 fn run(w: *World, rank: usize, world: usize, text: ?[]const u8, kv8: bool) !void {
-    return startup.open(std.testing.io, Place{ .rank = rank, .world = world }, text, Settings{ .kv8 = kv8 }, Watch{ .world = w, .rank = rank }, Args{ .world = w, .rank = rank }, construct);
+    return startup.open(std.testing.io, Place{ .rank = rank, .world = world }, text, Settings{ .kv8 = kv8 }, Watch{ .world = w, .rank = rank }, Args{ .world = w, .rank = rank }, construct, recordReport);
 }
 
 test "GLM startup: valid modes reach construction with every other setting intact" {
@@ -55,7 +67,7 @@ test "GLM startup: valid modes reach construction with every other setting intac
         try run(&w, 0, 2, mode, kv8);
         try std.testing.expect(w.connected[0]);
         try std.testing.expect(w.constructed[0]);
-        try std.testing.expectEqual(startup.paging(mode, 2), w.settings[0].?.pages);
+        try std.testing.expectEqual(try startup.paging(mode, 2, kv8), w.settings[0].?.pages);
         try std.testing.expectEqual(kv8, w.settings[0].?.kv8);
         try std.testing.expectEqual(@as(u32, 37), w.settings[0].?.marker);
         try std.testing.expectEqual(@as(usize, 0), w.notifications);
@@ -84,4 +96,49 @@ test "GLM startup: failed liveness connection never resolves settings or constru
     try std.testing.expectError(error.InjectedConnectFailure, run(&w, 0, 2, "on", true));
     try std.testing.expect(!w.constructed[0]);
     try std.testing.expectEqual(@as(usize, 0), w.notifications);
+    try std.testing.expectEqual(@as(usize, 0), w.reports);
+}
+
+test "GLM startup: legacy paging matrix preserves settings and reports each rank before construction" {
+    const Case = struct { raw: ?[]const u8, single: bool, multi: bool, mode: []const u8 };
+    const cases = [_]Case{
+        .{ .raw = null, .single = false, .multi = true, .mode = "auto" },
+        .{ .raw = "auto", .single = false, .multi = true, .mode = "auto" },
+        .{ .raw = "off", .single = false, .multi = false, .mode = "off" },
+        .{ .raw = "0", .single = false, .multi = false, .mode = "off" },
+        .{ .raw = "on", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "1", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "all", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "false", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "AUTO", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "00", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = " 0 ", .single = true, .multi = true, .mode = "on" },
+        .{ .raw = "off\n\x1b[31m", .single = true, .multi = true, .mode = "on" },
+    };
+    for (cases) |c| for (1..17) |world| for ([_]bool{ false, true }) |kv8| {
+        const last_rank = @min(world, 2);
+        for (0..last_rank) |rank| {
+            var w: World = .{ .expected_world = world };
+            const pages = if (world == 1) c.single else c.multi; // FP8 rows lay out on pages too
+            try run(&w, rank, world, c.raw, kv8);
+            try std.testing.expectEqualDeep(Settings{ .kv8 = kv8, .pages = pages }, w.settings[rank].?);
+            try std.testing.expectEqual(@as(usize, 1), w.reports);
+            var buffer: [256]u8 = undefined;
+            const expected = try std.fmt.bufPrint(&buffer, "glm kv selection: {s}; TF_KV_PAGES={s} ({s}); rank {d} of {d}; cache {s}", .{
+                if (pages) "pool pages" else "window per stream", c.mode,
+                if (c.raw == null) "default" else "env",          rank,
+                world,                                            if (kv8) "fp8" else "bf16",
+            });
+            try std.testing.expectEqualStrings(expected, w.report[0..w.report_len]);
+        }
+    };
+}
+
+test "GLM startup: reports use the passed selection and never echo arbitrary environment bytes" {
+    const raw: [4096]u8 = @splat('\n');
+    var buffer: [256]u8 = undefined;
+    const report: startup.Report = .{ .text = &raw, .rank = 15, .world = 16, .kv8 = false, .pages = false };
+    const line = try std.fmt.bufPrint(&buffer, "{f}", .{report});
+    try std.testing.expectEqualStrings("window per stream; TF_KV_PAGES=on (env); rank 15 of 16; cache bf16", line);
 }

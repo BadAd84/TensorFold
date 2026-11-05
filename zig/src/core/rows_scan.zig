@@ -29,7 +29,8 @@ pub fn scan(r: *Rows) !void {
             const bytes = dirs.fileBytes(p) catch continue;
             try r.blocks.put(r.gpa, n, .{ .bytes = bytes });
         } else if (std.mem.endsWith(u8, name, ".st")) {
-            readState(r, p) catch {
+            readState(r, p) catch |err| { // an allocation failure keeps the file for the next open
+                if (err == error.OutOfMemory) return err;
                 _ = platform.c.unlink(p);
             };
         }
@@ -68,8 +69,8 @@ pub fn stateOf(r: *const Rows, p: [:0]const u8) !State {
     return s;
 }
 
-/// Each state's blocks counted; a state missing one, or that its family cannot lay out, goes; then idle blocks.
-pub fn settle(r: *Rows) void {
+/// Each state's blocks counted; a missing block or a layout refusal removes it, an allocation failure propagates.
+pub fn settle(r: *Rows) !void {
     var i: usize = 0;
     while (i < r.states.items.len) {
         const s = &r.states.items[i];
@@ -77,7 +78,7 @@ pub fn settle(r: *Rows) void {
         defer wants.deinit(r.gpa);
         const whole = if (r.wantsOf(r.gpa, s, &wants)) |_| for (wants.items) |w| {
             if (!r.blocks.contains(chain.stem(w.name))) break false;
-        } else true else |_| false;
+        } else true else |err| if (err == error.OutOfMemory) return err else false;
         if (!whole) {
             var gone = r.states.orderedRemove(i);
             rows_store.unlinkName(r.dir, gone.name, ".st");

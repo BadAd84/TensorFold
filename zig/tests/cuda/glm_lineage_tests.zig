@@ -47,7 +47,7 @@ const Run = struct {
         if (r.paged and slot < 2) {
             e.pages.?.want = if (from) |f| f.id else 0; // TF_GLM_OVN_LINEAGE: the pages that hold its rows
             const held = try e.pages.?.open(slot, ids.len, 64);
-            try r.x.beginOn(null, held);
+            try r.x.beginOn(null, held, 0);
         } else try r.x.begin(null);
         var keep: Keep = .{ .e = e };
         var buf: [max_keeps]u32 = undefined; // a mark at the resume row: the restored state, kept before any pass

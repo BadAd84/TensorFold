@@ -41,7 +41,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
 
 /// The template's text for `messages` (call arguments through `args`); with `against`, cut a little past leaving it.
 fn rendered(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, args: ?*messages_mod.Args, against: ?[]const u8) errors.Refused!model_text.Rendered {
-    const normalized = try messages_mod.toolArgumentsWith(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)), args);
+    const normalized = if (srv.text.vtable.format == .kimi) messages else try messages_mod.toolArgumentsWith(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)), args);
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
@@ -69,7 +69,10 @@ fn failed(cx: *Cx, e: model_text.Error, problem: []const u8) errors.Refused {
 
 /// The ``</think>`` id appended when thinking is off and a generation prompt's last token opens a thought.
 fn closer(srv: *Server, cx: *Cx, ids: []const u32, thinking: bool, generation: bool) errors.Refused!?u32 {
-    if (thinking or !generation or ids.len == 0) return null;
+    if (thinking or !generation) return null;
+    // MiniMax-M3 thinks adaptively: with thinking off, its reply begins after the `</mm:think>` the prompt ends with
+    if (std.mem.eql(u8, srv.markers.close, @import("reply_text.zig").mm_markers.close)) return srv.text.tokenId(srv.markers.close);
+    if (ids.len == 0) return null;
     const last = try srv.text.decode(cx.a, ids[ids.len - 1 ..]);
     if (!std.mem.eql(u8, @import("reply_text.zig").pyStrip(last), "<think>")) return null;
     const close = srv.text.encode(cx.a, "</think>", false) catch |e| switch (e) {
@@ -180,7 +183,7 @@ fn generationPrompt(srv: *Server, cx: *Cx, thinking: bool) errors.Refused![]cons
 /// Earlier replies' decoded rows: from each turn's generation prompt end through its closing stop token.
 pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]const [2]u32 {
     if (srv.eos.len == 0) return &.{};
-    var probe: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking }; // a template that refuses the probe leaves the request without spans, not failed
+    var probe: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking, .template_fields = cx.template_fields }; // a template that refuses the probe leaves the request without spans, not failed
     const openers = [2][]const u32{ generationPrompt(srv, &probe, false) catch &.{}, generationPrompt(srv, &probe, true) catch &.{} };
     var spans: std.ArrayList([2]u32) = .empty;
     var i: usize = 0;
@@ -299,7 +302,7 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
     user.put(cx.a, "role", .{ .string = "user" }) catch return 0;
     user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
     probe[first_user] = .{ .object = user };
-    var scratch: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking };
+    var scratch: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking, .template_fields = cx.template_fields };
     const other = renderIds(srv, &scratch, .{ .array = probe }, tools, thinking, effort, true) catch return 0;
     var shared: usize = 0;
     while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;

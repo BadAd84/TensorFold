@@ -14,10 +14,13 @@ pub const RenderOptions = struct {
     clear_thinking: ?bool = null,
     /// Stop rendering `slack` bytes past where the text first differs from `against`; the text is then cut.
     stop: ?struct { against: []const u8, slack: usize } = null,
+    tool_choice: ?json.Value = null,
+    response_format: ?json.Value = null,
 };
 
 pub const Error = error{ Template, OutOfMemory };
 pub const Span = [2]usize;
+pub const Segment = struct { end: usize, allow_special: bool };
 
 /// A rendered prompt's ids with what `Text.pieces` reuses of them; null `state`: nothing to reuse.
 pub const Kept = struct { ids: []const u32, state: ?*const anyopaque = null };
@@ -33,6 +36,8 @@ pub const Rendered = struct {
     history: ?usize = null,
     /// The render stopped early (`RenderOptions.stop`): text and spans are a prefix of the full render's.
     cut: bool = false,
+    /// Release encoders may reset BPE at each segment, including adjacent ordinary template fragments.
+    segments: []const Segment = &.{},
 
     pub fn isTemplate(r: Rendered, start: usize, end: usize) bool {
         if (start == end) return true;
@@ -61,10 +66,42 @@ pub const Rendered = struct {
             if (p[0] >= end) break;
             if (p[1] > start) try spans.append(a, .{ @max(start, p[0]) - start, @min(end, p[1]) - start });
         }
-        return .{ .text = r.text[start..end], .spans = spans.items };
+        var segments: std.ArrayList(Segment) = .empty;
+        var from: usize = 0;
+        for (r.segments) |s| {
+            if (s.end > start and from < end)
+                try segments.append(a, .{ .end = @min(s.end, end) - start, .allow_special = s.allow_special });
+            from = s.end;
+        }
+        return .{ .text = r.text[start..end], .spans = spans.items, .segments = segments.items };
     }
 
     pub fn encode(r: Rendered, t: Text, a: Allocator, problem: *[]const u8) Error![]u32 {
+        if (r.segments.len > 0) {
+            var out: std.ArrayList(u32) = .empty;
+            errdefer out.deinit(a);
+            var start: usize = 0;
+            for (r.segments) |s| {
+                if (s.end <= start or s.end > r.text.len or (s.allow_special and !r.isTemplate(start, s.end))) {
+                    problem.* = "invalid or untrusted Kimi prompt segment";
+                    return error.Template;
+                }
+                const piece = r.text[start..s.end];
+                const ids = try t.encodeMasked(a, piece, if (s.allow_special) &.{} else &.{.{ 0, piece.len }}, problem);
+                defer a.free(ids);
+                try out.appendSlice(a, ids);
+                start = s.end;
+            }
+            if (start != r.text.len) {
+                problem.* = "incomplete Kimi prompt segment boundaries";
+                return error.Template;
+            }
+            return out.toOwnedSlice(a);
+        }
+        if (t.vtable.format == .kimi and r.text.len > 0) {
+            problem.* = "Kimi chat requires its release segment boundaries";
+            return error.Template;
+        }
         return t.encodeMasked(a, r.text, r.spans, problem);
     }
 
@@ -95,7 +132,14 @@ pub const Rendered = struct {
         errdefer a.free(spans);
         @memcpy(spans[0..r.spans.len], r.spans);
         spans[r.spans.len] = .{ r.text.len, r.text.len + label.len };
-        return .{ .text = try std.mem.concat(a, u8, &.{ r.text, label }), .spans = spans };
+        var segments: []const Segment = &.{};
+        if (r.segments.len > 0) {
+            const out = try a.alloc(Segment, r.segments.len + 1);
+            @memcpy(out[0..r.segments.len], r.segments);
+            out[r.segments.len] = .{ .end = r.text.len + label.len, .allow_special = false };
+            segments = out;
+        }
+        return .{ .text = try std.mem.concat(a, u8, &.{ r.text, label }), .spans = spans, .segments = segments };
     }
 
     /// Media replacement is limited to template-written occurrences, with every other range retained.
@@ -133,6 +177,7 @@ pub const Text = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        format: enum { template, kimi } = .template,
         /// Ids of ``text``, special-token text included as its token; ``add_special`` adds what the tokenizer prepends.
         encode: *const fn (ctx: *anyopaque, a: Allocator, text: []const u8, add_special: bool) Error![]u32,
         /// UTF-8 of ``ids`` with special tokens; bytes that end mid-character decode as U+FFFD, as Python's replace does.
