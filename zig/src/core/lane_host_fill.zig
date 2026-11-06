@@ -44,12 +44,15 @@ fn pick(h: *const LaneHost, among: enum { all, short, long }) ?usize {
 fn remaining(h: *const LaneHost, j: *const LaneHost.Job) u64 {
     const completed = if (j.fill_began and h.core.backend.vtable.reports_fill)
         @max(j.stream.cached, j.stream.fill_at.load(.monotonic))
-    else if (!j.fill_began and !j.stream.reuse_failed)
-        // an unstarted job's cache hit is known at admission; a rejected restore leaves the whole prompt
-        @max(j.stream.cached, j.stream.reuse.at)
     else
-        j.stream.cached;
+        keptRows(j);
     return j.stream.prompt_len -| completed;
+}
+
+/// The rows a job's pass starts past: its cache hit, known at admission before the restore sets `cached`.
+fn keptRows(j: anytype) u64 {
+    // an unstarted job's cache hit is known at admission; a rejected restore leaves the whole prompt
+    return if (!j.fill_began and !j.stream.reuse_failed) @max(j.stream.cached, j.stream.reuse.at) else j.stream.cached;
 }
 
 /// Takes `job` off the filling list, wherever it is.
@@ -305,9 +308,10 @@ fn srptStep(h: *LaneHost, at: usize, decoding: bool) u64 {
     return rows;
 }
 
-/// A prompt whose whole pass is at most `short_rows` rows (a long prompt's last rows are not).
-fn short(j: *const LaneHost.Job) bool {
-    return j.stream.prompt_len -| j.stream.cached <= Share.short_rows;
+/// A prompt whose whole pass is at most `short_rows` rows (a long prompt's last rows are not): a resumed turn's pass
+/// is the rows past its kept state, so a short turn on a long conversation is short before its restore too.
+fn short(j: anytype) bool {
+    return j.stream.prompt_len -| keptRows(j) <= Share.short_rows;
 }
 
 /// Fill chunks' cap: only the flag, a chunk-invariant family and live decoders together; else 0 (the engine's own cut).
@@ -327,6 +331,17 @@ pub fn runnable(h: *const LaneHost) usize {
     var n: usize = 0;
     for (h.core.live.items) |s| n += @intFromBool(!s.finished and !s.paused);
     return n;
+}
+
+test "a resumed short turn on a long conversation is short before its restore; a rejected restore and a long prompt are not" {
+    const S = struct { prompt_len: usize, cached: usize, reuse_failed: bool, reuse: struct { at: usize } };
+    const J = struct { fill_began: bool, stream: S };
+    // the forks shape: 202,414 tokens, 202,394 kept, 20 rows to run, before its first chunk restores the state
+    try std.testing.expect(short(J{ .fill_began = false, .stream = .{ .prompt_len = 202414, .cached = 0, .reuse_failed = false, .reuse = .{ .at = 202394 } } }));
+    try std.testing.expect(short(J{ .fill_began = true, .stream = .{ .prompt_len = 202414, .cached = 202394, .reuse_failed = false, .reuse = .{ .at = 202394 } } }));
+    try std.testing.expect(!short(J{ .fill_began = false, .stream = .{ .prompt_len = 202414, .cached = 0, .reuse_failed = true, .reuse = .{ .at = 202394 } } }));
+    try std.testing.expect(!short(J{ .fill_began = false, .stream = .{ .prompt_len = 8192, .cached = 0, .reuse_failed = false, .reuse = .{ .at = 0 } } }));
+    try std.testing.expect(short(J{ .fill_began = false, .stream = .{ .prompt_len = 512, .cached = 0, .reuse_failed = false, .reuse = .{ .at = 0 } } }));
 }
 
 test "a share of 0.5 owes the decoders a step's time; 1 owes nothing; rounds pay it down" {
