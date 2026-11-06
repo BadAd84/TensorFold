@@ -50,6 +50,9 @@ fn rendered(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinki
         .reasoning_effort = if (thinking) effort else null,
         .clear_thinking = cx.clear_thinking,
         .stop = if (against) |t| .{ .against = t, .slack = stop_slack } else null,
+        .tool_choice = cx.template_fields.get("tool_choice"),
+        .response_format = cx.template_fields.get("response_format"),
+        .images = srv.info.vision != null,
     };
     var r = srv.text.render(cx.a, normalized, options, &problem) catch |e| return failed(cx, e, problem);
     // with image input, a marker the text spells is ordinary text (images.zig)
@@ -211,6 +214,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
+    cx.template_fields = input.fields;
     var once: Once = .{ .srv = srv, .tools = input.tools, .thinking = thinking, .effort = effort };
     const prompt = try once.prompt(cx, input.messages);
     const history = try once.history(cx, input.messages);

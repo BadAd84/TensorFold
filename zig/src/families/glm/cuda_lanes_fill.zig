@@ -107,7 +107,7 @@ pub fn multiFill(self: *Lanes, ss: []const *lanes.Stream) !bool {
     var at: [max]usize = undefined; // where each prompt stands
     var from: [max]?engine.Resume = undefined; // its kept state, until its first piece restores it
     var marks: [max]?engine.Marks = undefined;
-    var keeps: [max]@import("cuda_prefix.zig").Keeps = undefined; // each stream's, while its marks are read
+    var keeps: [max]@import("cuda_share.zig").Keeps = undefined; // each stream's, while its marks are read
     for (ss, 0..) |s, i| {
         from[i] = try self.opening(s);
         opened += 1;

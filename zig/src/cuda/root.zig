@@ -36,6 +36,7 @@ pub const prx_plan = @import("prx_plan.zig");
 pub const triton = @import("triton.zig");
 pub const aot = @import("aot.zig");
 pub const kernels = @import("kernels.zig");
+pub const qmmf_shared = @import("qmmf_shared.zig");
 pub const qmmf = @import("qmmf.zig");
 pub const fp8 = @import("fp8.zig");
 pub const mxfp8 = @import("mxfp8.zig");
@@ -93,6 +94,7 @@ test {
     _ = train_q4;
     _ = train_attn;
     _ = @import("memory.zig");
+    _ = @import("download_stage_test.zig");
     _ = memory_receipt;
     _ = @import("grouped.zig");
     _ = @import("qlinear.zig");
@@ -127,6 +129,7 @@ test {
     _ = aot;
     _ = segments;
     _ = @import("qmmf.zig");
+    _ = @import("qmmf_shared.zig");
     _ = @import("fp8.zig");
     _ = @import("mxfp8.zig");
     _ = carveout;
@@ -170,6 +173,7 @@ test {
     _ = @import("graph_registry.zig");
     _ = @import("graph_cache_regression_test.zig");
     _ = @import("graph_cache_ranks_test.zig");
+    _ = @import("graph_cache_shapes_test.zig");
     _ = exl3.block.dense;
     _ = exl3.block.experts;
     _ = exl3.block.lin2;

@@ -441,7 +441,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
     }
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
-    if (comptime @hasDecl(F, "share_attach")) if (share and cache > 0) {
+    if (comptime @hasDecl(F, "share_attach")) if (@import("cuda_streams.zig").opensStore(F, share, cache)) {
         h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), try @import("core").kv_prompts.sharing());
     };
     errdefer if (h.prompts) |x| x.close();
@@ -560,8 +560,8 @@ test "a family's warm wait and warm_spares reach the lane host only with warm tu
     try @import("cuda_warm_serve_test.zig").check(Host, Host.serve);
 }
 
-test "Flash Next refuses tensor-rank draft caching before files or CUDA" {
-    try @import("cuda_flashnext_refusal_test.zig").cache(openWith);
+test "Flash Next takes kept prompt states and drafts together on any rank count" {
+    try @import("cuda_flashnext_refusal_test.zig").cache();
 }
 
 test "Flash Next takes --vision at family admission" {

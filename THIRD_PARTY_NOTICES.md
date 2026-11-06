@@ -230,6 +230,20 @@ The Zig tensor-parallel fabric's RoCE path (`zig/src/fabric/tp/mailbox.cu`, `roc
 the same one-shot all-gather protocol of b12x's RoCEnante (`b12x/comm/roce/`, PRs #295 and #315) for any family that
 runs tensor parallelism over it, under the same copyright and Apache License 2.0 terms.
 
+## Cloudflare Clef
+
+`zig/src/server/clef_encode.zig` and `clef_answer.zig`, the host head in `zig/src/core/joint_schema/`
+(`reference.zig`, `reference_attn.zig`) and the device head in `zig/src/hip/joint_schema/` with its kernels in
+`zig/kernels/hip/joint_schema/joint_schema.hip` port Cloudflare's Clef release code, `joint_schema_model.py` in
+[Cloudflare/clef](https://huggingface.co/Cloudflare/clef) and
+[Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash): the record rendering and encoding
+(`render`, `question_options`, `encode_record`), the verbatim system prompt, the joint schema head
+(`JointSchemaHead`, `EvidenceRoutingLayer`) and the SystemOne answer shape (`systemone_answer`). The encoder's first
+port is gilby's. Copyright Cloudflare, Inc., Apache License 2.0; see [the license text](LICENSES/Apache-2.0.txt).
+`tools/clef_head_golden.py`, `tools/clef_tokens.py` and `tools/clef_head_gate.py` run that file:
+`zig/src/core/joint_schema/fixtures/clef_tiny.json` holds a generated head's outputs (no Cloudflare weights), and
+`zig/src/server/fixtures/clef_tokens.json` the Clef-Flash tokenizer's ids for synthetic records.
+
 ## Vendored code and weights
 
 In the Python engine, frozen at 0.6.6, `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified
@@ -293,10 +307,20 @@ These follow a model's release code or a library's model code for their math, ro
 - `tools/lfm3/ref64.py` and `zig/kernels/xpu/lfm3.cl`: `modeling_lfm3.py` in [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B). Copyright Liquid AI, LFM Open License v1.0; see [the license text](LICENSES/LFM-Open-1.0.txt).
 - `zig/kernels/metal/minimax_m3/glue.metal`: the rounding points of `modeling_minimax_m3_vl.py` in [transformers](https://github.com/huggingface/transformers).
 - `zig/src/vision/qwen_cuda.zig`: `Qwen3_5VisionModel` in transformers.
-- `zig/src/core/picture/patches.zig`: `smart_resize`, `Lfm3VlImageProcessor` and `Qwen2VLImageProcessor` in transformers; `patches_test.zig` checks it against them.
+- `zig/src/core/picture/patches_test.zig`: recorded image-processor output data from `Lfm3VlImageProcessor` and `Qwen2VLImageProcessor` in transformers; the processing implementation is described below.
 - `zig/src/families/flashnext/rotary_config.zig`: `_compute_yarn_parameters` in transformers, for the 64 rotary dims.
 
 transformers is Copyright The HuggingFace Team, Apache License 2.0; see [the license text](LICENSES/Apache-2.0.txt).
+
+## Image patch preparation
+
+`zig/src/core/picture/patches.zig` implements the image budgets and geometry described by the
+[Qwen2-VL model card](https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct),
+[Qwen2.5-VL model card](https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct) and
+[LFM2-VL model card](https://huggingface.co/LiquidAI/LFM2-VL-450M).
+Its discrete sizing, patch ordering, normalization and cache identities are pinned by TensorFold's own tests and
+black-box processing outputs. The implementation was rewritten from those behavior sources; the recorded comparison
+data in `patches_test.zig` retains its provenance above.
 
 ## MIT License text
 

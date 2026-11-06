@@ -59,6 +59,7 @@ test {
     _ = @import("tool_grammar_lfm2.zig");
     _ = @import("tool_grammar_lfm2_test.zig");
     _ = @import("tool_required_test.zig");
+    _ = @import("structure_field_test.zig");
     _ = @import("grammar.zig");
     _ = @import("pyrepr.zig");
     _ = @import("metrics.zig");
@@ -86,6 +87,10 @@ test {
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_register_test.zig"); // over a Unix socket pair
     _ = @import("drama_prompt.zig");
     _ = @import("health_test.zig");
+    _ = @import("clef_encode_test.zig");
+    _ = @import("clef_tokens_test.zig");
+    _ = @import("clef_answer_test.zig");
+    _ = @import("clef_systemone_test.zig");
     _ = @import("memory_routes.zig");
     _ = @import("process_memory.zig");
     _ = @import("process_resident.zig");
@@ -102,6 +107,7 @@ test {
     _ = @import("media_fetch.zig");
     _ = @import("videos.zig");
     _ = @import("stream_preflight_test.zig");
+    _ = @import("engine_refusal_test.zig");
     _ = @import("stream_dsml_test.zig");
     _ = @import("tool_cut_test.zig");
     _ = @import("tool_glm_stream_test.zig");
@@ -112,6 +118,7 @@ test {
     _ = @import("tool_single_stream_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("think_split_test.zig");
+    _ = @import("think_tool_tail_test.zig");
     _ = @import("deepseek_reply_test.zig");
     _ = @import("thinking_reserve_test.zig");
     _ = @import("loop_stop_test.zig");
@@ -240,4 +247,5 @@ test {
 
 test {
     _ = @import("models_idle_audit_test.zig");
+    _ = @import("penalty_request_test.zig");
 }

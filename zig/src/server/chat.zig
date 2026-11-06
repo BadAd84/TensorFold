@@ -12,10 +12,12 @@ const cached_tokens = @import("cached_tokens.zig");
 const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const wait = @import("wait_reason.zig");
-const Server = @import("server.zig").Server;
+const server_mod = @import("server.zig");
+const Server = server_mod.Server;
 const chunk_plan = @import("chunk_plan.zig");
 const Mailbox = @import("mailbox.zig").Mailbox;
 const StopHook = @import("stop_hook.zig").StopHook;
+const engine_refusal = @import("engine_refusal.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -35,6 +37,8 @@ pub const Input = struct {
     logprobs: ?u8 = null,
     /// ``/v1/completions``' ``prompt_logprobs``: rows for the prompt with this many alternatives; null: not asked.
     prompt_logprobs: ?u8 = null,
+    /// The client's own name for the grammar field (text.format, output_config.format); null on chat and completions.
+    format: ?[]const u8 = null,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -188,6 +192,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .cache_key = cache_key,
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, reasoning, rendered.ids, input.tools, &request);
+    server_mod.nameStructure(input.format, &request);
     errdefer srv.release(false, request);
     if (reasoning) {
         const budget_field = f.get("thinking_budget");
@@ -206,6 +211,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     }
     if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, reasoning, request.think_budget, count);
     request.prompt_logprobs = input.prompt_logprobs;
+    if (try engine_refusal.of(srv.engine, cx, &request)) |message| return cx.refuse(message);
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .reasoning = reasoning, .effort = effort, .sampled = sampling != null, .drafts = drafts, .token_ids = flag(f, "return_token_ids") orelse false, .stops = stops_opt, .preparing = preparing };
 }
 
