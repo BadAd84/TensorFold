@@ -354,6 +354,80 @@ fn timeDecode(gpu: Gpu, k: Kernels, s: cuda.Stream, r: std.Random, reps: usize) 
     }
 }
 
+/// GLM's NVFP4 routed decode (Affine4Experts.run, the single-grid kernel): us a call at 1-8 rows, up and down, so the
+/// per-row cost of the routed stage (PARITY 2g/2j) is measured offline. No warp/CTA form: the kernel is one launch.
+fn timeDecode4(gpu: Gpu, k: Kernels, s: cuda.Stream, r: std.Random, reps: usize) !void {
+    const sh: Shape = .{ .experts = 64, .ni = wide.ni, .dims = wide.dims, .slots = wide.slots };
+    const e = sh.experts;
+    var cs: [3][2]Codes = undefined;
+    for (&cs, [_][2]usize{ .{ sh.ni, sh.dims }, .{ sh.ni, sh.dims }, .{ sh.dims, sh.ni } }) |*c, nk| c.* = .{ try Codes.init(gpu.gpa, r, e, nk[0], nk[1], 3), try Codes.init(gpu.gpa, r, 1, nk[0], nk[1], 4) };
+    defer for (cs) |c| for (c) |x| x.deinit(gpu.gpa);
+    var pair = try tables(gpu, k, s, &.{ cs[0], cs[1] });
+    defer pair.deinit();
+    var down = try tables(gpu, k, s, &.{cs[2]});
+    defer down.deinit();
+    const l4: cuda.experts.Layer = .{ .format = .affine4, .up = pair.all4.ptr, .down = down.all4.ptr, .width = sh.ni, .dims = sh.dims, .experts = e + 1, .swiglu = true };
+    const g: cuda.experts.Grouped = .{ .affine4 = &k.a4 };
+    const dx = try gpu.gpa.alloc(u16, 8 * sh.dims);
+    defer gpu.gpa.free(dx);
+    for (dx) |*v| v.* = randBf16(r, 1.0);
+    var gx = try upload(gpu, std.mem.sliceAsBytes(dx));
+    defer gx.free();
+    var act = try cuda.DeviceBuffer.alloc(gpu.d, 8 * sh.slots * sh.ni * 2);
+    defer act.free();
+    var y = try cuda.DeviceBuffer.alloc(gpu.d, 8 * sh.slots * sh.dims * 4);
+    defer y.free();
+    var t0 = try cuda.Event.init(gpu.d, true);
+    defer t0.deinit();
+    var t1 = try cuda.Event.init(gpu.d, true);
+    defer t1.deinit();
+    for ([_]usize{ 1, 2, 4, 6, 8 }) |rows| {
+        var plans: [8]PlanBufs = undefined;
+        var made: usize = 0;
+        defer for (plans[0..made]) |*p| p.deinit();
+        for (&plans) |*p| {
+            var picks: [8 * 9]i32 = undefined;
+            for (0..rows) |row| {
+                var taken: [64]bool = @splat(false);
+                for (0..sh.slots - 1) |i| {
+                    var pick = r.uintLessThan(usize, e);
+                    while (taken[pick]) pick = r.uintLessThan(usize, e);
+                    taken[pick] = true;
+                    picks[row * sh.slots + i] = @intCast(pick);
+                }
+                picks[row * sh.slots + sh.slots - 1] = @intCast(e);
+            }
+            p.* = try PlanBufs.init(gpu, k, s, picks[0 .. rows * sh.slots], e + 1, 16);
+            made += 1;
+        }
+        try s.synchronize();
+        const rows_in: cuda.experts.Rows = .{ .x = gx.ptr, .stride = sh.dims, .slots = sh.slots };
+        const act_in: cuda.experts.Rows = .{ .x = act.ptr, .stride = sh.ni };
+        var us: [2]f64 = undefined;
+        for (0..2) |form| {
+            try cuda.graph.beginCapture(s, .thread_local);
+            for (0..reps) |i| {
+                const p = plans[i % plans.len];
+                if (form == 0) {
+                    try g.decode(s, .up, rows_in, l4, p.plan(), act.ptr, p.items_n, -1);
+                } else try g.decode(s, .down_f32, act_in, l4, p.plan(), y.ptr, p.items_n, -1);
+            }
+            var graph = try cuda.graph.endCapture(s);
+            defer graph.deinit();
+            var exec = try graph.instantiate();
+            defer exec.deinit();
+            for (0..2) |round| {
+                try t0.record(s);
+                try exec.launchOn(s);
+                try t1.record(s);
+                try t1.synchronize();
+                if (round == 1) us[form] = @as(f64, try cuda.Event.elapsedMs(t0, t1)) * 1000 / @as(f64, @floatFromInt(reps));
+            }
+        }
+        std.debug.print("TIME nvfp4 decode ({d} by {d}, {d} picks a row) at {d} rows: up {d:.1} us, down {d:.1} us\n", .{ sh.ni, sh.dims, sh.slots, rows, us[0], us[1] });
+    }
+}
+
 pub fn run(gpu: Gpu, reps: usize) !void {
     var prng = std.Random.DefaultPrng.init(0x3b17);
     const r = prng.random();
@@ -378,4 +452,5 @@ pub fn run(gpu: Gpu, reps: usize) !void {
     }
     try projections(gpu, k, s, r);
     if (reps > 0) try timeDecode(gpu, k, s, r, reps);
+    if (reps > 0) try timeDecode4(gpu, k, s, r, reps);
 }
