@@ -126,6 +126,8 @@ fn tables(gpu: Gpu, k: Kernels, s: cuda.Stream, parts: []const [2]Codes) !Tables
 const Shape = struct { experts: usize = 6, ni: usize = 128, dims: usize = 256, rows: usize = 40, slots: usize = 3 };
 /// Qwen3.5-35B-A3B's expert widths at a verify window of 4 rows: 8 routed picks and the shared expert a row.
 const wide: Shape = .{ .experts = 16, .ni = 512, .dims = 2048, .rows = 4, .slots = 9 };
+/// GLM-5.3-Flash's real routed expert widths: up 4096 -> moe_intermediate 2048, 8 routed picks and the shared expert.
+const glm_routed: Shape = .{ .experts = 64, .ni = 2048, .dims = 4096, .rows = 8, .slots = 9 };
 /// 5 K groups: the split form's last round has fewer groups than warps.
 const short: Shape = .{ .dims = 320 };
 
@@ -357,7 +359,7 @@ fn timeDecode(gpu: Gpu, k: Kernels, s: cuda.Stream, r: std.Random, reps: usize) 
 /// GLM's NVFP4 routed decode (Affine4Experts.run, the single-grid kernel): us a call at 1-8 rows, up and down, so the
 /// per-row cost of the routed stage (PARITY 2g/2j) is measured offline. No warp/CTA form: the kernel is one launch.
 fn timeDecode4(gpu: Gpu, k: Kernels, s: cuda.Stream, r: std.Random, reps: usize) !void {
-    const sh: Shape = .{ .experts = 64, .ni = wide.ni, .dims = wide.dims, .slots = wide.slots };
+    const sh: Shape = .{ .experts = glm_routed.experts, .ni = glm_routed.ni, .dims = glm_routed.dims, .slots = glm_routed.slots };
     const e = sh.experts;
     var cs: [3][2]Codes = undefined;
     for (&cs, [_][2]usize{ .{ sh.ni, sh.dims }, .{ sh.ni, sh.dims }, .{ sh.dims, sh.ni } }) |*c, nk| c.* = .{ try Codes.init(gpu.gpa, r, e, nk[0], nk[1], 3), try Codes.init(gpu.gpa, r, 1, nk[0], nk[1], 4) };
