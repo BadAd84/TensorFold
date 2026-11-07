@@ -62,7 +62,7 @@ pub fn steps(b: *std.Build, host: std.Build.ResolvedTarget, cuda: *std.Build.Mod
     for ([_]struct { *std.Build.Module, []const u8 }{ .{ server_tests, "prompt once:" }, .{ mods.tokenizer, "kept pieces:" }, .{ template, "generation split:" } }) |t|
         once.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = t[0], .filters = &.{t[1]} })).step);
     const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
-    @import("server_seed_host.zig").steps(b, server_tests);
+    @import("request_starts_host.zig").steps(b, native_modules.engines, server_tests);
     const json_test = b.addRunArtifact(b.addTest(.{ .root_module = server_json }));
     const publication = b.addRunArtifact(b.addTest(.{ .root_module = server_tests, .filters = &.{"benchmark publication:"} }));
     b.step("test-benchmark-publication-host", "Benchmark command publication boundaries with inert effects").dependOn(&publication.step);
