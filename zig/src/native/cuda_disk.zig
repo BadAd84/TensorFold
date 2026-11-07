@@ -97,15 +97,22 @@ pub fn identity(a: Allocator, io: std.Io, g: *const cuda.Context, dir: []const u
 /// The identity's hash: the checkpoint, kernels, device, driver, a family's facts, then its probe's hash.
 pub fn identityOf(a: Allocator, io: std.Io, g: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, facts: []const u64, probed: u64, profile: disk_identity.Profile) !u64 {
     var h = std.hash.Wyhash.init(0x6375);
+    try @import("sys").file_identity.current(&h, a, io);
     try disk_identity.checkpoint(&h, a, io, dir);
     inline for (comptime std.meta.declarations(cuda.kernels)) |d| {
         const v = @field(cuda.kernels, d);
         if (comptime @TypeOf(v) == []const u8) h.update(v);
     }
-    if (kernels) |k| h.update(try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ k, "aot.json" }), a, .limited(1 << 26)));
+    if (kernels) |k| {
+        const captured = try cuda.aot.identity.hash(a, io, k);
+        h.update(std.mem.asBytes(&captured));
+    }
+    var name_buf: [256]u8 = undefined;
+    h.update(g.name(&name_buf) catch "GPU");
+    const device_id = [_]u64{ try g.capability(), @intCast(try g.d.version()) };
+    h.update(std.mem.sliceAsBytes(&device_id));
     // TF_GLM_OVN_DISK_CARRY_SALT, a test hook: kernels that moved but compute the same bits (identity moves, key stays)
     if (cuda.ovn.text("DISK_CARRY_SALT")) |s| h.update(s);
-    try device(&h, g);
     h.update(std.mem.sliceAsBytes(facts));
     h.update(std.mem.asBytes(&probed));
     disk_identity.profile(&h, profile);
@@ -310,13 +317,18 @@ test "disk identity: TF_GLM_OVN_DISK_CARRY_SALT moves the identity as a kernel c
     try std.testing.expect(one[1] == plain[1] and two[1] == plain[1]);
     // unset, the identity hashes what it always did: the checkpoint, the kernels, the device, the facts, the probe
     var h = std.hash.Wyhash.init(0x6375);
+    try @import("sys").file_identity.current(&h, a, io);
     try disk_identity.checkpoint(&h, a, io, dir);
     inline for (comptime std.meta.declarations(cuda.kernels)) |k| {
         const v = @field(cuda.kernels, k);
         if (comptime @TypeOf(v) == []const u8) h.update(v);
     }
-    try device(&h, &g);
+    var name_buf: [256]u8 = undefined;
+    h.update(g.name(&name_buf) catch "GPU");
+    const device_id = [_]u64{ try g.capability(), @intCast(try g.d.version()) };
+    h.update(std.mem.sliceAsBytes(&device_id));
     h.update(std.mem.sliceAsBytes(&salt_facts));
     h.update(std.mem.asBytes(&salt_probed));
+    disk_identity.profile(&h, .{ .family = "glm", .backend = "cuda" });
     try std.testing.expectEqual(h.final(), plain[0]);
 }

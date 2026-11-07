@@ -11,6 +11,15 @@ pub const Choice = struct {
 };
 
 pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry) Choice {
+    return chooseAt(s, prompt, starts, spans, have, null);
+}
+
+/// A refused disk restore gets only the next-longest compatible, affordable state strictly below it.
+pub fn shorter(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry, before: u32) Choice {
+    return chooseAt(s, prompt, starts, spans, have, before);
+}
+
+fn chooseAt(s: *const pc.Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*pc.Entry, before: ?u32) Choice {
     const r = s.disk orelse return .{};
     const room = capacity(s, have) orelse return .{};
     const from = if (have) |e| e.at else 0;
@@ -19,10 +28,15 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
     for (r.states.items, 0..) |*state, i| {
         if (s.family.vtable.bytes(s.family.ptr, state.at) > room) continue;
         if (moot(r, out, state.at, from)) continue; // TF_GLM_OVN_KEPT_WALK: no compare where a match changes nothing
+        if (before) |at| if (state.at >= at) continue;
         if (r.blankBytes(state.at) > room) continue;
         if (!r.matches(state, prompt, starts, spans)) continue;
         if (out.disk == null or state.at > r.states.items[out.disk.?].at) out.disk = i;
         if (state.at <= from) continue;
+        if (before != null) {
+            if (out.restore == null or state.at > r.states.items[out.restore.?].at) out.restore = i;
+            continue;
+        }
         if (savedSeconds(r, i, from)) |saved| {
             if (!(saved > 0)) continue;
             if (out.restore != null and (saved < best_saved or
@@ -32,7 +46,10 @@ pub fn choose(s: *const pc.Store, prompt: []const u32, starts: []const u32, span
         out.restore = i;
         out.read_seconds = readSeconds(r, i) orelse 0;
     }
-    if (out.restore) |i| out.disk = i;
+    if (out.restore) |i| {
+        out.disk = i;
+        out.read_seconds = readSeconds(r, i) orelse 0;
+    }
     return out;
 }
 

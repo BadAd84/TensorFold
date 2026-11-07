@@ -41,7 +41,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
 
 /// The template's text for `messages` (call arguments through `args`); with `against`, cut a little past leaving it.
 fn rendered(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, args: ?*messages_mod.Args, against: ?[]const u8) errors.Refused!model_text.Rendered {
-    const normalized = if (srv.text.vtable.format == .kimi) messages else try messages_mod.toolArgumentsWith(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)), args);
+    const normalized = if (srv.text.vtable.format == .kimi or srv.text.native_deepseek) messages else try messages_mod.toolArgumentsWith(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.media()), args);
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,

@@ -88,6 +88,8 @@ test {
     _ = @import("cuda_lanes_test.zig");
     _ = @import("dflash_load.zig");
     _ = prompt_solo;
+    _ = @import("cuda_l2pf.zig");
+    _ = prompt_pair;
     _ = experts;
     _ = exl3;
     _ = vision;

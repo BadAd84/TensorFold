@@ -55,6 +55,7 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
             const pieces = if (r.b.seg.pieces) |x| (if (b.prefill and x.segs == r.segs.len) x else null) else null; // TF_GLM_OVN_KDA_PIECES
             if (f.paced()) |p| try p.fork(f.stream, li + di, .o); // TF_GLM_OVN_L2PF_PACED: o into L2 while the chains run
             if (pieces) |x| try x.chains(&f.m.kda, f.stream, k, s, li, rows); // the pieces' chains in one launch; the loop keeps each conv window
+            if (f.prefetch()) |p| try p.fork(f.stream, l.index, .o); // TF_GLM_L2PF: o read into L2 while the chains run
             for (r.segs) |g| {
                 const st = g.st;
                 const cur = st.cur[li];
