@@ -104,7 +104,16 @@ pub const Config = struct {
     enter_match: i64 = 8, // matching tokens a copy needs (rejects coincidental indentation)
     copy_rate: f64 = 0.94, // a copied token's chance of landing in allocation
     lone_copies: bool = true, // Model.lone_copies
+    /// A lone stream's copy window after a round that kept fewer than all its rows: back to first_copy, or kept.
+    copy_miss: CopyMiss = .first,
+    /// ... and after a round that kept every copied row: twice the width plus one, or straight to max_copy.
+    copy_ramp: CopyRamp = .double,
+    /// Streams in shared rounds take that ramp too, for copies out of the prompt only; false: they keep first_copy.
+    copy_shared: bool = false,
     k: Constants = .{},
+
+    pub const CopyMiss = enum { first, keep };
+    pub const CopyRamp = enum { double, jump };
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
         if (max_rows < 1) return error.BadMaxRows;
@@ -206,4 +215,8 @@ test "setup derives widths like Python" {
     var steady = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .depth_rate = 0.08 }, 16, 15);
     defer steady.deinit(gpa);
     try std.testing.expectEqual(@as(f64, 0.08), steady.k.depth_rate);
+    // the copy policy's defaults are the widening rule as it stands: shared rounds copy first_copy rows
+    try std.testing.expectEqual(Config.CopyMiss.first, c.copy_miss);
+    try std.testing.expectEqual(Config.CopyRamp.double, c.copy_ramp);
+    try std.testing.expect(!c.copy_shared);
 }

@@ -246,6 +246,7 @@ pub const Stream = struct {
     grant_gain: ?f64 = null, // the drafts its last grant expected to keep (the chances it was priced by)
     draft_chances: std.ArrayList(f64) = .empty, // last full head prices, retained through zero-row rounds
     copy_width: ?u32 = null,
+    copy_prompt: bool = false, // the last copied window read out of the prompt (windows.rampCopy)
 
     pub fn init(gpa: Allocator, spec: Spec) !Stream {
         var s: Stream = .{
@@ -320,6 +321,7 @@ pub const Stream = struct {
         s.draft_chances.deinit(gpa);
         s.draft_chances = .empty;
         s.copy_width = null;
+        s.copy_prompt = false;
         s.proposal_depth = null;
     }
 

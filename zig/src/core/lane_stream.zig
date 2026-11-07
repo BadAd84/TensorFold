@@ -33,7 +33,12 @@ pub fn open(h: *LaneHost, job: *Job) bool {
     } else |_| {};
     if (h.proposers) |ps| {
         job.custom = ps.make(ps.ctx, h.gpa, r.prompt, r.eos) catch return !h.drop(job, "the drafter could not start");
-    } else job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return !h.drop(job, "the drafter could not start");
+    } else {
+        // with resyncs the threshold is the round loop's entry gate: a match the loop drops cannot hide a resync
+        const min_match = if (h.resync) @max(h.min_match, h.core.cfg.enter_match) else h.min_match;
+        const source_end = if (h.resync_prompt_only) r.prompt.len else std.math.maxInt(usize);
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = min_match, .resync = h.resync, .resync_source_end = source_end }) catch return !h.drop(job, "the drafter could not start");
+    }
     const recall = recalls.reader(h, job);
     job.stream = lanes.Stream.init(h.gpa, .{
         .id = "request",

@@ -202,7 +202,8 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
 /// A copy from the context backed by `enter_match` ids (Python `_copy_proposal`), else Recall's when it should pay.
 pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
     if (e.cfg.max_copy == 0 or s.force.items.len > 0 or (e.cfg.root_copies and s.root_copy_miss)) return .{};
-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
+    const ramped = e.alone or (e.cfg.copy_shared and s.copy_prompt);
+    const width: u32 = if (ramped) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
     const most = @min(@as(i64, width), s.draftRoom() - 1);
     if (s.proposer) |p| if (!e.alone or e.cfg.lone_copies) {
         // a priced proposer's drafts are as it gives them, its none too: no width, length or match gate, no Recall
@@ -420,6 +421,21 @@ pub fn observeCopied(e: *const Engine, s: *Stream, recalled: bool, kept: usize, 
     s.copied_broke[i] = copy_decay * s.copied_broke[i] + @as(f64, @floatFromInt(@intFromBool(kept < offered)));
 }
 
+/// A copied window's next width: the lone ramp, which shared rounds take under copy_shared for prompt copies only.
+pub fn rampCopy(e: *const Engine, s: *Stream, recalled: bool, kept: usize, offered: usize) void {
+    const at: ?usize = if (recalled) null else if (s.proposer) |pr| pr.lastEnd() else null;
+    s.copy_prompt = if (at) |x| x <= s.prompt_len else false;
+    if (!e.alone and !(e.cfg.copy_shared and s.copy_prompt)) return;
+    const width = s.copy_width orelse e.cfg.first_copy;
+    s.copy_width = if (kept == offered) switch (e.cfg.copy_ramp) {
+        .double => @min(e.cfg.max_copy, 2 * width + 1),
+        .jump => e.cfg.max_copy,
+    } else switch (e.cfg.copy_miss) {
+        .first => e.cfg.first_copy,
+        .keep => width,
+    };
+}
+
 /// A context copy's appended rows: each its parent's chance times the stream's copy rate; the drafts keep their own.
 fn planChances(e: *Engine, p: Plan, n: usize) ![]const f64 {
     if (!p.context_copy or p.branch_from == 0 or p.parents == null or n < p.branch_from) return nodeChances(e, p.stream, n);
@@ -488,6 +504,55 @@ test "a copy is trusted after a long match, or out of the prompt early in the re
     try std.testing.expect(trustedCopy(&s)); // out of the prompt, the reply not begun
     for (0..early_reply) |_| try s.context.append(a, 7);
     try std.testing.expect(!trustedCopy(&s)); // out of the prompt, past the reply's first tokens
+}
+
+test "shared rounds take the lone ramp only under copy_shared, and only for copies out of the prompt" {
+    const a = std.testing.allocator;
+    const Cfg = @import("config.zig").Config;
+    var cfg = try Cfg.init(a, .{ .exact_width = 32, .first_copy_rows = 16, .mtp = true, .speculate = true, .drafts = 15, .hidden_rows = true, .batch_rows = 64, .max_streams = 8 }, 32, 31);
+    defer cfg.deinit(a);
+    try std.testing.expectEqual(@as(u32, 15), cfg.first_copy);
+    try std.testing.expectEqual(@as(u32, 31), cfg.max_copy);
+    var target: @import("fake.zig").Fake = .{ .gpa = a };
+    defer target.deinit();
+    var clock: @import("fake.zig").FixedClock = .{};
+    var e = Engine.init(a, &cfg, target.backend(), clock.clock());
+    defer e.deinit();
+    e.alone = false;
+    var look = try @import("proposer.zig").SuffixLookup.init(a, .{ .min_match = 4 });
+    defer look.deinit();
+    var prompt: [100]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i);
+    var s = try Stream.init(a, .{ .id = "s", .prompt = &prompt, .max_new = 400, .proposer = look.proposer() });
+    defer s.deinit(a);
+    try s.context.appendSlice(a, prompt[0..20]);
+    s.copy_width = 31;
+    s.copy_prompt = true;
+    // a stream in a shared round copies first_copy rows, whatever its ramp reached
+    try std.testing.expectEqual(@as(usize, 15), (try copyProposal(&e, &s)).tokens.len);
+    cfg.copy_shared = true;
+    try std.testing.expectEqual(@as(usize, 31), (try copyProposal(&e, &s)).tokens.len);
+    s.copy_prompt = false;
+    try std.testing.expectEqual(@as(usize, 15), (try copyProposal(&e, &s)).tokens.len);
+    // the ramp itself: the copy's source is read back from the proposer, so a prompt copy ramps in a shared round
+    s.copy_width = 15;
+    rampCopy(&e, &s, false, 15, 15);
+    try std.testing.expect(s.copy_prompt);
+    try std.testing.expectEqual(@as(?u32, 31), s.copy_width);
+    rampCopy(&e, &s, false, 3, 31);
+    try std.testing.expectEqual(@as(?u32, 15), s.copy_width);
+    cfg.copy_miss = .keep;
+    cfg.copy_ramp = .jump;
+    rampCopy(&e, &s, false, 3, 15);
+    try std.testing.expectEqual(@as(?u32, 15), s.copy_width);
+    rampCopy(&e, &s, false, 15, 15);
+    try std.testing.expectEqual(@as(?u32, 31), s.copy_width);
+    // with copy_shared off a shared round's copy never moves the width, and a recalled copy is not a prompt copy
+    cfg.copy_shared = false;
+    rampCopy(&e, &s, false, 3, 31);
+    try std.testing.expectEqual(@as(?u32, 31), s.copy_width);
+    rampCopy(&e, &s, true, 3, 31);
+    try std.testing.expect(!s.copy_prompt);
 }
 
 /// The head's chance for each held draft, else chain chances from the stream's per-depth acceptance.

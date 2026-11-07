@@ -38,6 +38,8 @@ pub const LaneHost = struct {
     core: *lanes.Engine,
     info_: Info,
     min_match: i64 = 4,
+    resync: bool = false, // copy proposers resume the source right after an edit (lanes/proposer.zig Params.resync)
+    resync_prompt_only: bool = true, // ... and only copies out of the prompt arm one
     /// A family's own copy proposer for each request (null: lanes.SuffixLookup at `min_match`)
     proposers: ?Proposers = null,
     mutex: std.Io.Mutex = .init,

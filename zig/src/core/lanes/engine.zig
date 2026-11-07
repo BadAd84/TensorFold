@@ -353,10 +353,7 @@ pub const Engine = struct {
                 const own: usize = own_end - 1;
                 if (p.kind == .copy) {
                     win.observeCopied(e, s, p.recalled, own_kept, own);
-                    if (e.alone) {
-                        const width = s.copy_width orelse e.cfg.first_copy;
-                        s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
-                    }
+                    win.rampCopy(e, s, p.recalled, own_kept, own);
                 } else if (p.kind == .head) {
                     if (p.lanes) |l| if (s.odds != null) s.observeLanes(l, path);
                     const ds = try accept.depths(a, parents);

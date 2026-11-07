@@ -6,7 +6,33 @@ const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const kv_pages = @import("cuda_kv_pool.zig");
 const family_memory = @import("cuda_family_memory.zig");
+const getenv = @import("cuda_device.zig").getenv;
 pub const Hook = ?*const fn (*anyopaque, cuda.startup_watch.Phase) void;
+
+/// A 0 or 1 setting; any other value refuses the start rather than falling back to the default in silence.
+fn flag(name: [:0]const u8) !?bool {
+    const v = getenv(name) orelse return null;
+    if (std.mem.eql(u8, v, "0")) return false;
+    if (std.mem.eql(u8, v, "1")) return true;
+    std.log.err("{s}={s}: 0 or 1", .{ name, v });
+    return error.BadCopySetting;
+}
+
+/// The copy policy from TENSORFOLD_COPY_*; every setting unset leaves the engine's own widening rule.
+fn copyPolicy(h: anytype) !void {
+    if (getenv("TENSORFOLD_COPY_MISS")) |v| h.cfg.copy_miss = std.meta.stringToEnum(lanes.Config.CopyMiss, v) orelse {
+        std.log.err("TENSORFOLD_COPY_MISS={s}: first or keep", .{v});
+        return error.BadCopySetting;
+    };
+    if (getenv("TENSORFOLD_COPY_RAMP")) |v| h.cfg.copy_ramp = std.meta.stringToEnum(lanes.Config.CopyRamp, v) orelse {
+        std.log.err("TENSORFOLD_COPY_RAMP={s}: double or jump", .{v});
+        return error.BadCopySetting;
+    };
+    if (try flag("TENSORFOLD_COPY_SHARED")) |v| h.cfg.copy_shared = v;
+    if (try flag("TENSORFOLD_COPY_RESYNC")) |v| h.host.resync = v;
+    if (try flag("TENSORFOLD_COPY_RESYNC_PROMPT_ONLY")) |v| h.host.resync_prompt_only = v;
+    std.log.info("copy policy: miss {s}, ramp {s}, shared rounds {s}, resync {s}", .{ @tagName(h.cfg.copy_miss), @tagName(h.cfg.copy_ramp), if (h.cfg.copy_shared) "ramp prompt copies" else "first width", if (!h.host.resync) "off" else if (h.host.resync_prompt_only) "prompt copies" else "every copy" });
+}
 
 pub fn readiness(h: anytype, comptime F: type) void {
     if (@hasDecl(F, "startup_phase")) h.startup_phase = F.startup_phase;
@@ -29,6 +55,7 @@ pub fn serve(h: anytype, io: std.Io, facts: lanes.Model, rows: u32, info: api.In
     h.core = lanes.Engine.init(h.gpa, &h.cfg, callbacks.backend(h), h.clock.clock());
     errdefer h.core.deinit();
     h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+    try copyPolicy(h);
     h.host.on_thread = .{ .ctx = h, .run = callbacks.initThread };
     h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
     h.host.explain = explain;
