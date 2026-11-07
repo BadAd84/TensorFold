@@ -184,7 +184,7 @@ pub const Backend = struct {
         try b.sl.restore(i, snap.id);
     }
 
-    /// Slot `i`'s resident states past `at` made whole where the budget has room before it writes; a pair's rank 1 copies the same ids.
+    /// Before slot `i` writes: resident states past `at` made whole as budget allows; pair rank 1 copies the same ids.
     fn copyOut(b: *Backend, i: u32, at: u32) !void {
         b.words.clearRetainingCapacity();
         try b.words.append(b.gpa, i);
@@ -342,7 +342,7 @@ pub const Backend = struct {
         return b.sl.ringPut(Engine.u32s(b.sl.e.sc.picks, 1)[0]);
     }
 
-    /// The next one-token round queued ahead: its token the handle's (read on the GPU) or the host's, its pick a handle.
+    /// The next one-token round queued ahead: its token the handle's (read on GPU) or the host's, its pick a handle.
     fn queue(ptr: *anyopaque, s: *Stream, feed: be.Feed, position: u64) anyerror!u64 {
         const b = self(ptr);
         const i = try b.slotOf(s);
@@ -442,6 +442,10 @@ test "zero grant: GLM Metal MTP resumes after a long priced skip" {
     var e: Engine = undefined;
     e.w = &w;
     e.ep = null;
+    const objc = @import("metal").objc;
+    const no_arch = objc.msg(objc.Id, objc.class("NSObject"), "new", .{}); // facts() asks it for tensor units, no GPU
+    defer objc.release(no_arch);
+    e.device = .{ .id = no_arch };
     var slots: [16]slots_mod.Slot = undefined;
     var sl: slots_mod.Slots = undefined;
     sl.e = &e;
@@ -458,6 +462,10 @@ test "shared head costs: GLM Metal MTP retains costed copy grants" {
     var e: Engine = undefined;
     e.w = &w;
     e.ep = null;
+    const objc = @import("metal").objc;
+    const no_arch = objc.msg(objc.Id, objc.class("NSObject"), "new", .{}); // facts() asks it for tensor units, no GPU
+    defer objc.release(no_arch);
+    e.device = .{ .id = no_arch };
     var slots: [16]slots_mod.Slot = undefined;
     var sl: slots_mod.Slots = undefined;
     sl.e = &e;

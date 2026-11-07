@@ -1,381 +1,350 @@
-//! TF_GLM_L2PF: a decode window's L2 weight prefetch on a side stream (glm_cuda's port of the glm5_next
-//! family's l2pf, v1.8). While the main stream waits on an all-gather or runs latency-bound glue, a small
-//! kernel asks the memory system to bring the weights the next kernels read into L2. It only loads or
-//! prefetches, so no result changes. Three sites a layer: `a` before the mixer's all-gather (this layer's
-//! FFN: its hyper-connection weights, norm, the router and shared expert, or a dense MLP), `f` before the
-//! FFN's all-gather (the next layer's hyper-connection weights, norm and input projections; after the last
-//! layer the final norm and the head), `o` before the mixer (its output projection). Each site takes up to
-//! TF_GLM_L2PF_MB (default 8) MiB: the small tensors whole, then the leading bytes of the large ones (the
-//! glm5_next original also cut 4-bit chunk heads for its Triton kit; glm_mm's tiled readers have no such
-//! one-wave chunk shape, so this port spans only). The side stream forks from the main stream at a site (an
-//! event) and is joined before a window ends.
+//! TF_GLM_L2PF: a decode window's next weights read into L2 on a side stream (DeepSeek V4.1's l2pf and l2pace kernels).
+
 const std = @import("std");
 const cuda = @import("cuda");
-const kernels = @import("cuda").kernels;
-const wt = @import("cuda_weights.zig");
-const cfg = @import("config.zig");
-const glue = @import("cuda_glue.zig");
+const weights = @import("cuda_weights.zig");
 const projection = @import("cuda_proj.zig");
 
-const align_b = 16; // cp.async.bulk wants 16-byte addresses and sizes
-const piece: usize = 32 << 10; // the table's pieces are at most 32 KiB
+/// TF_GLM_L2PF and its knobs at DeepSeek V4.1's defaults (TF_DSV41_L2PF's): on unless 0, the knobs read unless 0.
+pub const Options = struct {
+    on: bool = true,
+    named: bool = false, // TF_GLM_L2PF=1: on whatever the GPU, where unset is a GB10's alone (`want`)
+    mb: u32 = 12, // TF_GLM_L2PF_MB: a site's budget in MiB
+    ctas: u32 = 2, // TF_GLM_L2PF_CTAS: the CTAs a site's prefetch spreads over
+    pace_gbps: u32 = 150, // TF_GLM_L2PF_PACE_GBPS: the sites beside a gather read at this rate (0: unpaced)
 
-pub const Settings = struct {
-    mode: i32 = -1, // -1: off; 0 bulk, 1 lines, 2 touch
-    mb: f64 = 8.0,
-    sites: [3]bool = .{ true, true, true }, // a, f, o
-    threads: usize = 128,
-
-    pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Settings {
-        var s: Settings = .{};
-        const v = get("TF_GLM_L2PF") orelse return s;
-        if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off")) return s;
-        s.mode = if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "bulk") or v.len == 0) 0 else if (std.mem.eql(u8, v, "lines")) 1 else if (std.mem.eql(u8, v, "touch")) 2 else {
-            problem.* = "TF_GLM_L2PF: 0, off, 1, bulk, lines or touch";
-            return error.BadSetting;
-        };
-        if (get("TF_GLM_L2PF_MB")) |x| {
-            s.mb = std.fmt.parseFloat(f64, x) catch {
-                problem.* = "TF_GLM_L2PF_MB: MiB, at most 64";
-                return error.BadSetting;
-            };
-            if (!(s.mb > 0 and s.mb <= 64)) {
-                problem.* = "TF_GLM_L2PF_MB: MiB, at most 64";
+    pub fn read(get: *const fn ([:0]const u8) ?[]const u8, problem: *[]const u8) !Options {
+        var o: Options = .{};
+        if (get("TF_GLM_L2PF")) |v| {
+            if (std.mem.eql(u8, v, "0")) return .{ .on = false };
+            if (!std.mem.eql(u8, v, "1")) {
+                problem.* = "TF_GLM_L2PF: 0 or 1";
                 return error.BadSetting;
             }
+            o.named = true;
         }
-        if (get("TF_GLM_L2PF_SITES")) |x| {
-            s.sites = .{ false, false, false };
-            for (x) |ch| switch (ch) {
-                'a' => s.sites[0] = true,
-                'f' => s.sites[1] = true,
-                'o' => s.sites[2] = true,
-                else => {
-                    problem.* = "TF_GLM_L2PF_SITES: a, f and o";
-                    return error.BadSetting;
+        const knobs = .{
+            .{ "TF_GLM_L2PF_MB", "mb", 1, "TF_GLM_L2PF_MB: a site's budget in MiB, 1 or more" },
+            .{ "TF_GLM_L2PF_CTAS", "ctas", 1, "TF_GLM_L2PF_CTAS: 1 or more" },
+            .{ "TF_GLM_L2PF_PACE_GBPS", "pace_gbps", 0, "TF_GLM_L2PF_PACE_GBPS: GB/s, or 0 for unpaced" },
+        };
+        inline for (knobs) |k| if (get(k[0])) |x| {
+            const n = std.fmt.parseInt(u32, x, 10) catch null;
+            if (n == null or n.? < k[2]) {
+                problem.* = k[3];
+                return error.BadSetting;
+            }
+            @field(o, k[1]) = n.?;
+        };
+        return o;
+    }
+
+    /// What the ranks agree on: zeros when off, so knobs nobody reads never differ.
+    pub fn words(o: Options) [4]u32 {
+        return if (o.on) .{ 1, o.mb, o.ctas, o.pace_gbps } else @splat(0);
+    }
+
+    /// Whether `cap` prefetches at `world` ranks: named on any GPU, unset on a GB10 (sm_121) at two ranks or more.
+    pub fn want(o: Options, cap: usize, world: usize) bool {
+        return o.on and (o.named or (cap == 121 and world >= 2));
+    }
+};
+
+/// A layer's sites: n before gather_b (the next mixer's input), f before gather_a (the ffn's head), o (KDA's chain).
+pub const Site = enum(u2) { n, f, o };
+
+/// One site's rows of the table and their bytes.
+pub const Span = struct { at: u32 = 0, rows: u32 = 0, bytes: u64 = 0 };
+
+const max_sources = 8;
+
+const Sources = struct {
+    ptrs: [max_sources]u64 = undefined,
+    len: usize = 0,
+
+    fn add(s: *Sources, p: u64) void {
+        if (p != 0) {
+            s.ptrs[s.len] = p;
+            s.len += 1;
+        }
+    }
+
+    fn lane(s: *Sources, q: cuda.qmmf.Weight) void {
+        s.add(q.scales);
+        s.add(q.codes);
+    }
+
+    fn proj(s: *Sources, w: projection.Proj) void {
+        switch (w) {
+            .bf16 => |p| s.add(p),
+            .fp8g, .mxfp8 => |q| s.lane(q),
+        }
+    }
+};
+
+/// The buffers site `site` of layer `l` reads first, in its matmuls' order: a lane weight's scales, then its codes.
+fn sources(l: weights.Layer, site: Site) Sources {
+    var s: Sources = .{};
+    switch (site) {
+        .n => switch (l.mixer) {
+            .kda => |k| switch (k.proj) {
+                .bf16 => |p| s.add(p),
+                .split => |sp| {
+                    s.lane(sp.qkv);
+                    s.add(sp.rest);
                 },
-            };
-        }
-        return s;
-    }
-
-    pub fn on(s: Settings) bool {
-        return s.mode >= 0;
-    }
-};
-
-const T = struct { ptr: u64, bytes: usize };
-
-/// One site's tensors, prefetched small first within `budget`.
-const Group = struct {
-    ts: [10]T = undefined,
-    n: usize = 0,
-
-    fn add(g: *Group, t: ?T) void {
-        const x = t orelse return;
-        if (x.ptr == 0 or x.bytes == 0) return;
-        for (g.ts[0..g.n]) |y| if (y.ptr == x.ptr) return; // each tensor once
-        if (g.n == g.ts.len) return; // a site's worth of tensors is all this needs
-        g.ts[g.n] = x;
-        g.n += 1;
-    }
-};
-
-pub const Site = struct { first: u32, count: u32, grid: u32 };
-
-pub const Prefetch = struct {
-    s: Settings,
-    table: cuda.DeviceBuffer,
-    sink: cuda.DeviceBuffer,
-    mod: cuda.Module,
-    f: cuda.Function,
-    sites: [cfg.max_layers][3]?Site = @splat(@splat(null)),
-    side: cuda.Stream,
-    fork: cuda.Event,
-    join_ev: cuda.Event,
-    forked: bool = false,
-    bytes: [3]usize = .{ 0, 0, 0 },
-    count: [3]usize = .{ 0, 0, 0 },
-
-    fn named(w: *const wt.Weights, ptr: u64) ?usize {
-        for (w.named.items) |n| if (n.ptr == ptr) return n.len;
-        return null;
-    }
-
-    fn whole(w: *const wt.Weights, g: *Group, ptr: u64) void {
-        g.add(.{ .ptr = ptr, .bytes = named(w, ptr) orelse 0 });
-    }
-
-    /// A hidden-size norm, bf16 or kept fp32.
-    fn norm(w: *const wt.Weights, g: *Group, n: glue.Norm) void {
-        switch (n) {
-            .bf16 => |x| whole(w, g, x),
-            .f32 => |x| whole(w, g, x),
-        }
-    }
-    /// A projection's codes and scale tables (bf16: the one buffer).
-    fn proj(w: *const wt.Weights, g: *Group, p: projection.Proj) void {
-        switch (p) {
-            .bf16 => |x| whole(w, g, x),
-            .fp8g, .mxfp8 => |q| {
-                whole(w, g, q.codes);
-                whole(w, g, q.scales);
             },
-        }
-    }
-
-    /// Site `a`: this layer's FFN - hyper-connection weights, norm, the router and shared expert, or a dense MLP.
-    fn ffnSite(w: *const wt.Weights, l: wt.Layer, gs: *std.ArrayList(Group), gpa: std.mem.Allocator) !void {
-        var hc: Group = .{};
-        whole(w, &hc, l.ffn_hc.fn_w);
-        whole(w, &hc, l.ffn_hc.base);
-        whole(w, &hc, l.ffn_hc.scale);
-        try gs.append(gpa, hc);
-        var n: Group = .{};
-        norm(w, &n, l.post_norm);
-        try gs.append(gpa, n);
-        switch (l.ffn) {
-            .moe => |m| {
-                var r: Group = .{};
-                whole(w, &r, m.router);
-                whole(w, &r, m.bias);
-                try gs.append(gpa, r);
-                var a: Group = .{};
-                proj(w, &a, m.shared_gu);
-                try gs.append(gpa, a);
-                var b: Group = .{};
-                proj(w, &b, m.shared_down);
-                try gs.append(gpa, b);
+            .mla => |a| {
+                s.proj(a.proj);
+                s.proj(a.q_b);
             },
+        },
+        .f => switch (l.ffn) {
+            .moe => |m| s.add(m.router),
             .dense => |m| switch (m.w) {
-                .bf16 => |b| {
-                    var a: Group = .{};
-                    whole(w, &a, b.gu);
-                    try gs.append(gpa, a);
-                    var d: Group = .{};
-                    whole(w, &d, b.down);
-                    try gs.append(gpa, d);
+                .nvfp4 => |x| {
+                    s.lane(x.gate);
+                    s.lane(x.up);
                 },
-                .nvfp4 => |b| {
-                    var a: Group = .{};
-                    whole(w, &a, b.gate.codes);
-                    whole(w, &a, b.gate.scales);
-                    whole(w, &a, b.up.codes);
-                    whole(w, &a, b.up.scales);
-                    try gs.append(gpa, a);
-                    var d: Group = .{};
-                    whole(w, &d, b.down.codes);
-                    whole(w, &d, b.down.scales);
-                    try gs.append(gpa, d);
-                },
-                .mxfp8 => |b| {
-                    var a: Group = .{};
-                    whole(w, &a, b.gu.codes);
-                    whole(w, &a, b.gu.scales);
-                    try gs.append(gpa, a);
-                    var d: Group = .{};
-                    whole(w, &d, b.down.codes);
-                    whole(w, &d, b.down.scales);
-                    try gs.append(gpa, d);
-                },
+                .bf16 => |x| s.add(x.gu),
+                .mxfp8 => |x| s.lane(x.gu),
             },
-        }
+        },
+        .o => switch (l.mixer) {
+            .kda => |k| s.proj(k.o),
+            .mla => {},
+        },
     }
+    return s;
+}
 
-    /// Site `f`: the next layer's hyper-connection weights, norm and input projections; after the last layer
-    /// the final norm and the head.
-    fn nextSite(w: *const wt.Weights, nxt: ?wt.Layer, gs: *std.ArrayList(Group), gpa: std.mem.Allocator) !void {
-        const n = nxt orelse {
-            var a: Group = .{};
-            norm(w, &a, w.norm);
-            try gs.append(gpa, a);
-            var h: Group = .{};
-            proj(w, &h, w.head);
-            try gs.append(gpa, h);
-            return;
+/// l2pf.take: the bytes of each of `sizes` in order within `budget`, 16-byte multiples, the last one's head, 0 past it.
+pub fn take(sizes: []const u64, budget: u64, out: []u64) void {
+    var left = budget;
+    for (sizes, out) |s, *n| {
+        n.* = if (left < 16) 0 else @min(left, s) / 16 * 16;
+        left -= n.*;
+    }
+}
+
+/// Every site's rows of (address, bytes) from `bufs`, the weights' allocations; false when a source starts none.
+pub fn table(gpa: std.mem.Allocator, bufs: []const cuda.DeviceBuffer, layers: []const weights.Layer, budget: u64, rows: *std.ArrayList([2]i64), spans: []Span) !bool {
+    std.debug.assert(spans.len == layers.len * 3);
+    for (layers, 0..) |_, j| for ([_]Site{ .n, .f, .o }) |site| {
+        const sp = &spans[j * 3 + @backingInt(site)];
+        sp.* = .{ .at = @intCast(rows.items.len) };
+        if (site == .n and j + 1 == layers.len) continue; // the last layer's next is the head
+        const src = sources(layers[if (site == .n) j + 1 else j], site);
+        var sizes: [max_sources]u64 = undefined;
+        for (src.ptrs[0..src.len], sizes[0..src.len]) |p, *n| n.* = for (bufs) |b| {
+            if (b.ptr == p) break b.len;
+        } else {
+            std.log.warn("TF_GLM_L2PF: layer {d}'s site {t} reads 0x{x}, which starts no weight buffer; prefetch off", .{ j, site, p });
+            return false;
         };
-        var hc: Group = .{};
-        whole(w, &hc, n.attn_hc.fn_w);
-        whole(w, &hc, n.attn_hc.base);
-        whole(w, &hc, n.attn_hc.scale);
-        try gs.append(gpa, hc);
-        var nm: Group = .{};
-        norm(w, &nm, n.in_norm);
-        try gs.append(gpa, nm);
-        switch (n.mixer) {
-            .kda => |k| {
-                var a: Group = .{};
-                switch (k.proj) {
-                    .bf16 => |x| whole(w, &a, x),
-                    .split => |sp| {
-                        whole(w, &a, sp.qkv.codes);
-                        whole(w, &a, sp.qkv.scales);
-                        whole(w, &a, sp.rest);
-                    },
-                }
-                try gs.append(gpa, a);
-                var s: Group = .{};
-                whole(w, &s, k.fb);
-                whole(w, &s, k.gb);
-                whole(w, &s, k.conv_w);
-                whole(w, &s, k.a_log);
-                whole(w, &s, k.dt_bias);
-                whole(w, &s, k.norm_w);
-                try gs.append(gpa, s);
-            },
-            .mla => |a| {
-                var p: Group = .{};
-                proj(w, &p, a.proj);
-                try gs.append(gpa, p);
-                var s: Group = .{};
-                whole(w, &s, a.q_norm);
-                whole(w, &s, a.kv_norm);
-                whole(w, &s, a.index.gate);
-                whole(w, &s, a.index.ln_w);
-                whole(w, &s, a.index.ln_b);
-                whole(w, &s, a.index.ape);
-                try gs.append(gpa, s);
-                var ix: Group = .{};
-                proj(w, &ix, a.index.kw);
-                proj(w, &ix, a.index.qb);
-                whole(w, &ix, a.wk);
-                try gs.append(gpa, ix);
-            },
+        var got: [max_sources]u64 = undefined;
+        take(sizes[0..src.len], budget, got[0..src.len]);
+        for (src.ptrs[0..src.len], got[0..src.len]) |p, b| if (b > 0) {
+            try rows.append(gpa, .{ @intCast(p), @intCast(b) });
+            sp.rows += 1;
+            sp.bytes += b;
+        };
+    };
+    return true;
+}
+
+/// DeepSeek V4.1's launch: 32 KiB pieces, segments over 128 threads a CTA, paced as one piece per `chunk / rate` ns.
+const chunk: u32 = 32 << 10;
+
+/// The prefetch's own stream, events, kernels and table; the main stream forks at each site and joins once a window.
+pub const L2pf = struct {
+    gpa: std.mem.Allocator,
+    o: Options,
+    side: cuda.Stream,
+    fork_ev: cuda.Event,
+    join_ev: cuda.Event,
+    mods: [2]cuda.Module,
+    segments: cuda.Function,
+    paced: cuda.Function,
+    rows: cuda.DeviceBuffer,
+    spans: []Span,
+
+    /// Built after the weights load and tile (tiling moves packed linears); null when a source is not a buffer.
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const weights.Weights, o: Options) !?L2pf {
+        const spans = try gpa.alloc(Span, w.layers.len * 3);
+        errdefer gpa.free(spans);
+        var host: std.ArrayList([2]i64) = .empty;
+        defer host.deinit(gpa);
+        if (!try table(gpa, w.buffers.items, w.layers, @as(u64, o.mb) << 20, &host, spans)) {
+            gpa.free(spans);
+            return null;
         }
+        if (host.items.len == 0) return error.NoPrefetchRows;
+        var total: u64 = 0;
+        for (spans) |sp| total += sp.bytes;
+        std.log.info("TF_GLM_L2PF: {d} rows, {d} MiB a decode window, {d} CTAs a site, the gathers' sites at {d} GB/s (0: unpaced)", .{ host.items.len, total >> 20, o.ctas, o.pace_gbps });
+        var rows = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(host.items));
+        errdefer rows.free();
+        var mods: [2]cuda.Module = .{ try cuda.Module.load(d, cuda.kernels.l2pf), undefined };
+        errdefer mods[0].unload();
+        mods[1] = try cuda.Module.load(d, cuda.kernels.l2pace);
+        errdefer mods[1].unload();
+        var side = try cuda.Stream.init(d, true);
+        errdefer side.deinit();
+        var fork_ev = try cuda.Event.init(d, false);
+        errdefer fork_ev.deinit();
+        var join_ev = try cuda.Event.init(d, false);
+        errdefer join_ev.deinit();
+        const segments = try mods[0].function("_ZN6tfl2pf15segments_kernelILb1EEEvPKlij");
+        const paced = try mods[1].function("_ZN12dsv41_l2pace12paced_kernelEPKlijmm");
+        return .{ .gpa = gpa, .o = o, .side = side, .fork_ev = fork_ev, .join_ev = join_ev, .mods = mods, .segments = segments, .paced = paced, .rows = rows, .spans = spans };
     }
 
-    /// Site `o`: the mixer's output projection (DSA's fired value half beside it).
-    fn outSite(w: *const wt.Weights, l: wt.Layer, gs: *std.ArrayList(Group), gpa: std.mem.Allocator) !void {
-        switch (l.mixer) {
-            .kda => |k| {
-                var g: Group = .{};
-                proj(w, &g, k.o);
-                try gs.append(gpa, g);
-            },
-            .mla => |a| {
-                var v: Group = .{};
-                whole(w, &v, a.wv);
-                try gs.append(gpa, v);
-                var g: Group = .{};
-                proj(w, &g, a.o);
-                try gs.append(gpa, g);
-            },
-        }
-    }
-
-    /// l2pf._span: the tensor's leading bytes (at most `left`), the start rounded down and the end up to 16.
-    fn span(t: T, left: usize) ?T {
-        const lo = t.ptr - t.ptr % align_b;
-        var hi = @min(t.ptr + t.bytes, lo + left);
-        hi += (align_b - hi % align_b) % align_b;
-        return if (hi > lo) .{ .ptr = lo, .bytes = hi - lo } else null;
-    }
-
-    /// l2pf.ranges: (address, bytes) ranges of `groups` up to `budget` bytes, appended to `out`.
-    fn ranges(gpa: std.mem.Allocator, groups: []const Group, budget: usize, out: *std.ArrayList(T)) !void {
-        var left = budget;
-        for (groups) |g0| {
-            var g = g0;
-            // within a group the small tensors first (a stable sort by size)
-            std.mem.sort(T, g.ts[0..g.n], {}, struct {
-                fn lt(_: void, a: T, b: T) bool {
-                    return a.bytes < b.bytes;
-                }
-            }.lt);
-            for (g.ts[0..g.n]) |t| {
-                if (left < align_b) return;
-                if (span(t, left)) |sp| {
-                    try out.append(gpa, sp);
-                    left -= sp.bytes;
-                }
-            }
-        }
-    }
-
-    pub fn build(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const wt.Weights, s: Settings) !Prefetch {
-        var p: Prefetch = .{ .s = s, .table = undefined, .sink = undefined, .mod = try cuda.Module.load(d, kernels.glm_l2pf), .f = undefined, .side = undefined, .fork = undefined, .join_ev = undefined };
-        errdefer p.mod.unload();
-        p.f = try p.mod.function("tf_glm_l2pf");
-        const budget: usize = @intFromFloat(s.mb * (1 << 20));
-        var rows: std.ArrayList(i64) = .empty;
-        errdefer rows.deinit(gpa);
-        for (w.layers, 0..) |l, i| {
-            const nxt: ?wt.Layer = if (i + 1 < w.layers.len) w.layers[i + 1] else null;
-            inline for (0..3) |si| {
-                if (s.sites[si]) {
-                    var gs: std.ArrayList(Group) = .empty;
-                    defer gs.deinit(gpa);
-                    switch (si) {
-                        0 => try ffnSite(w, l, &gs, gpa),
-                        1 => try nextSite(w, nxt, &gs, gpa),
-                        else => try outSite(w, l, &gs, gpa),
-                    }
-                    var rs: std.ArrayList(T) = .empty;
-                    defer rs.deinit(gpa);
-                    try ranges(gpa, gs.items, budget, &rs);
-                    const first = rows.items.len / 2;
-                    var total: usize = 0;
-                    for (rs.items) |sp| {
-                        total += sp.bytes;
-                        var o: usize = 0;
-                        while (o < sp.bytes) : (o += piece) {
-                            try rows.append(gpa, @intCast(sp.ptr + o));
-                            try rows.append(gpa, @intCast(@min(piece, sp.bytes - o)));
-                        }
-                    }
-                    const count = rows.items.len / 2 - first;
-                    if (count > 0) {
-                        const per: usize = if (s.mode == 0) s.threads else s.threads / 32;
-                        p.sites[l.index][si] = .{ .first = @intCast(first), .count = @intCast(count), .grid = @intCast(@max(1, @min(48, (count + per - 1) / per))) };
-                        p.bytes[si] += total;
-                        p.count[si] += 1;
-                    }
-                }
-            }
-        }
-        if (rows.items.len == 0) try rows.appendSlice(gpa, &.{ 0, 0 });
-        p.table = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(rows.items));
-        errdefer p.table.free();
-        p.sink = try cuda.DeviceBuffer.alloc(d, 256);
-        errdefer p.sink.free();
-        try p.sink.fill8(0, null);
-        p.side = try cuda.Stream.init(d, true);
-        errdefer p.side.deinit();
-        p.fork = try cuda.Event.init(d, false);
-        errdefer p.fork.deinit();
-        p.join_ev = try cuda.Event.init(d, false);
-        return p;
-    }
-
-    pub fn deinit(p: *Prefetch) void {
-        p.join_ev.deinit();
-        p.fork.deinit();
+    /// Before the weights free: the side stream drains first (Stream.deinit synchronizes).
+    pub fn deinit(p: *L2pf) void {
         p.side.deinit();
-        p.sink.free();
-        p.table.free();
-        p.mod.unload();
+        p.fork_ev.deinit();
+        p.join_ev.deinit();
+        p.rows.free();
+        for (&p.mods) |*m| m.unload();
+        p.gpa.free(p.spans);
         p.* = undefined;
     }
 
-    /// l2pf.Prefetch.site: fork the side stream at this point of `main` and prefetch the site's ranges there.
-    pub fn site(p: *Prefetch, main: cuda.Stream, layer: u32, which: usize) !void {
-        const st = p.sites[layer][which] orelse return;
-        try p.fork.record(main);
-        try p.side.wait(p.fork);
-        var args: cuda.Args = .{};
-        args.add(p.table.ptr);
-        args.add(@as(c_int, @intCast(st.count)));
-        args.add(p.s.mode);
-        args.add(p.sink.ptr);
-        try cuda.launch.launch(p.f, .{ .grid = .{ .x = st.grid }, .block = .{ .x = @intCast(p.s.threads) } }, p.side, &args);
-        p.forked = true;
+    /// Site `site` of layer `j` read into L2 on the side stream from this point of `main` on.
+    pub fn fork(p: *const L2pf, main: cuda.Stream, j: usize, site: Site) !void {
+        if (j * 3 >= p.spans.len) return;
+        const sp = p.spans[j * 3 + @backingInt(site)];
+        if (sp.rows == 0) return;
+        try p.fork_ev.record(main);
+        try p.side.wait(p.fork_ev);
+        var a: cuda.Args = .{};
+        a.add(p.rows.ptr + @as(u64, sp.at) * 16);
+        a.add(@as(c_int, @intCast(sp.rows)));
+        a.add(chunk);
+        if (site != .o and p.o.pace_gbps > 0) {
+            a.add(@as(u64, @max(1, (chunk + p.o.pace_gbps / 2) / p.o.pace_gbps))); // GB/s is bytes a ns
+            a.add(@as(u64, 0));
+            return cuda.launch.launch(p.paced, .{ .grid = .{ .x = p.o.ctas }, .block = .{ .x = 32 } }, p.side, &a);
+        }
+        const pieces = std.math.divCeil(u64, sp.bytes, chunk) catch unreachable;
+        const grid: u32 = @intCast(std.math.clamp(std.math.divCeil(u64, pieces, 128) catch unreachable, 1, p.o.ctas));
+        try cuda.launch.launch(p.segments, .{ .grid = .{ .x = grid }, .block = .{ .x = 128 } }, p.side, &a);
     }
 
-    /// The main stream waits for the side stream (every fork before a window ends has rejoined).
-    pub fn join(p: *Prefetch, main: cuda.Stream) !void {
-        if (!p.forked) return;
+    /// A window's end: `main` waits for every site forked on it, so nothing is in flight past the window.
+    pub fn join(p: *const L2pf, main: cuda.Stream) !void {
         try p.join_ev.record(p.side);
         try main.wait(p.join_ev);
-        p.forked = false;
     }
 };
+
+/// Site o's place in a KDA block: between its projections and its chain.
+pub const At = struct {
+    l2: *const L2pf,
+    layer: usize,
+
+    pub fn fork(at: At, main: cuda.Stream) !void {
+        return at.l2.fork(main, at.layer, .o);
+    }
+};
+
+fn Env(comptime pairs: anytype) type {
+    return struct {
+        fn get(key: [:0]const u8) ?[]const u8 {
+            inline for (pairs) |p| if (std.mem.eql(u8, key, p[0])) return p[1];
+            return null;
+        }
+    };
+}
+
+test "TF_GLM_L2PF: on unless 0, unset on a GB10 at two ranks or more, DeepSeek's knobs by default, refusals naming a bad value" {
+    const t = std.testing;
+    var problem: []const u8 = "";
+    const unset = try Options.read(Env(.{}).get, &problem);
+    try t.expectEqual([4]u32{ 1, 12, 2, 150 }, unset.words());
+    try t.expect(unset.want(121, 2) and unset.want(121, 3) and !unset.want(121, 1));
+    try t.expect(!unset.want(120, 2) and !unset.want(90, 2));
+    const off = try Options.read(Env(.{ .{ "TF_GLM_L2PF", "0" }, .{ "TF_GLM_L2PF_MB", "0" } }).get, &problem);
+    try t.expectEqual([4]u32{ 0, 0, 0, 0 }, off.words());
+    try t.expect(!off.want(121, 2) and !off.want(121, 1));
+    const named = try Options.read(Env(.{.{ "TF_GLM_L2PF", "1" }}).get, &problem);
+    try t.expectEqual([4]u32{ 1, 12, 2, 150 }, named.words());
+    try t.expect(named.want(121, 1) and named.want(121, 2) and named.want(120, 1) and named.want(90, 2));
+    const set = Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_MB", "4" }, .{ "TF_GLM_L2PF_CTAS", "4" }, .{ "TF_GLM_L2PF_PACE_GBPS", "0" } });
+    try t.expectEqual([4]u32{ 1, 4, 4, 0 }, (try Options.read(set.get, &problem)).words());
+    const bad = .{
+        .{ Env(.{.{ "TF_GLM_L2PF", "yes" }}), "TF_GLM_L2PF: 0 or 1" },
+        .{ Env(.{.{ "TF_GLM_L2PF_MB", "0" }}), "TF_GLM_L2PF_MB: a site's budget in MiB, 1 or more" },
+        .{ Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_MB", "0" } }), "TF_GLM_L2PF_MB: a site's budget in MiB, 1 or more" },
+        .{ Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_CTAS", "x" } }), "TF_GLM_L2PF_CTAS: 1 or more" },
+        .{ Env(.{ .{ "TF_GLM_L2PF", "1" }, .{ "TF_GLM_L2PF_PACE_GBPS", "-1" } }), "TF_GLM_L2PF_PACE_GBPS: GB/s, or 0 for unpaced" },
+    };
+    inline for (bad) |b| {
+        try t.expectError(error.BadSetting, Options.read(b[0].get, &problem));
+        try t.expectEqualStrings(b[1], problem);
+    }
+}
+
+test "take: each size in order within the budget, in 16-byte multiples, the last one's head and nothing past it" {
+    const t = std.testing;
+    var out: [3]u64 = undefined;
+    take(&.{ 1 << 20, 34 << 20, 2 << 20 }, 12 << 20, &out);
+    try t.expectEqual([3]u64{ 1 << 20, 11 << 20, 0 }, out);
+    take(&.{ 1000, 50, 7 }, 4096, &out);
+    try t.expectEqual([3]u64{ 992, 48, 0 }, out);
+    take(&.{ 5 << 20, 1 << 20, 1 << 20 }, (4 << 20) + 8, &out);
+    try t.expectEqual([3]u64{ 4 << 20, 0, 0 }, out);
+}
+
+test "the table: each site's sources in its matmuls' order, site n from the next layer, none past the last; an unknown buffer turns it off" {
+    const t = std.testing;
+    const kda_block = @import("cuda_kda_block.zig");
+    const lane: cuda.qmmf.Weight = .{ .mode = .mxfp8, .codes = 0x2000_0000, .scales = 0x1000_0000, .n = 64, .k = 64, .npad = 64 };
+    var k: kda_block.Layer = undefined;
+    k.proj = .{ .split = .{ .qkv = lane, .rest = 0x3000_0000 } };
+    k.o = .{ .bf16 = 0x4000_0000 };
+    var d: weights.Layer = undefined; // layer 0: DSA and a dense bf16 MLP
+    d.mixer = .{ .mla = undefined };
+    d.mixer.mla.proj = .{ .bf16 = 0x6000_0000 };
+    d.mixer.mla.q_b = .{ .bf16 = 0x7000_0000 };
+    d.ffn = .{ .dense = undefined };
+    d.ffn.dense.w = .{ .bf16 = .{ .gu = 0x9000_0000, .down = 0xa000_0000 } };
+    var e: weights.Layer = undefined; // layer 1: KDA on the lane and MoE
+    e.mixer = .{ .kda = k };
+    e.ffn = .{ .moe = undefined };
+    e.ffn.moe.router = 0x5000_0000;
+    const MiB = 1 << 20;
+    var bufs = [_]cuda.DeviceBuffer{
+        .{ .d = undefined, .ptr = 0x1000_0000, .len = 1 * MiB },
+        .{ .d = undefined, .ptr = 0x2000_0000, .len = 34 * MiB },
+        .{ .d = undefined, .ptr = 0x3000_0000, .len = 2 * MiB },
+        .{ .d = undefined, .ptr = 0x4000_0000, .len = 23 * MiB },
+        .{ .d = undefined, .ptr = 0x5000_0000, .len = 2 * MiB },
+        .{ .d = undefined, .ptr = 0x6000_0000, .len = 16 * MiB },
+        .{ .d = undefined, .ptr = 0x7000_0000, .len = 17 * MiB },
+        .{ .d = undefined, .ptr = 0x9000_0000, .len = 34 * MiB },
+    };
+    var rows: std.ArrayList([2]i64) = .empty;
+    defer rows.deinit(t.allocator);
+    var spans: [6]Span = undefined;
+    try t.expect(try table(t.allocator, &bufs, &.{ d, e }, 12 * MiB, &rows, &spans));
+    const want = [_][2]i64{
+        .{ 0x1000_0000, 1 * MiB }, // layer 0's n: layer 1's qkv scales whole, then its codes' head
+        .{ 0x2000_0000, 11 * MiB },
+        .{ 0x9000_0000, 12 * MiB }, // layer 0's f: its gate and up's head
+        .{ 0x5000_0000, 2 * MiB }, // layer 1's f: its router; its n would be the head's, its o is KDA's o
+        .{ 0x4000_0000, 12 * MiB },
+    };
+    try t.expectEqualSlices([2]i64, &want, rows.items);
+    try t.expectEqualSlices(Span, &.{
+        .{ .at = 0, .rows = 2, .bytes = 12 * MiB },
+        .{ .at = 2, .rows = 1, .bytes = 12 * MiB },
+        .{ .at = 3 }, // DSA: no site o
+        .{ .at = 3 },
+        .{ .at = 3, .rows = 1, .bytes = 2 * MiB },
+        .{ .at = 4, .rows = 1, .bytes = 12 * MiB },
+    }, &spans);
+    rows.clearRetainingCapacity();
+    try t.expect(!try table(t.allocator, bufs[1..], &.{ d, e }, 12 * MiB, &rows, &spans));
+}

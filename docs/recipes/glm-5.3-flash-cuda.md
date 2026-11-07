@@ -4,7 +4,7 @@ The native CUDA build serves GLM-5.3-Flash at tensor parallel over hosts: from N
 ([1.0.12](../../CHANGELOG.md#1012)), on two ranks from Mia-AiLab's EXL3/TR3 checkpoint
 ([1.1.0](../../CHANGELOG.md#110), [the checkpoint](glm-5.3-flash.md#exl3)), and in [1.1.5](../../CHANGELOG.md#115) (#1050) from
 NVIDIA's FP4-Local checkpoint as stored and from XSFP4, which keeps FP4-Local's tensors outside the routed experts.
-Jammed XSFP4, on `main` after 1.2.2 ([#2041](https://github.com/ashhart/TensorFold/pull/2041)), holds those experts at block 32 in the `csf0_v1` form and loads the same way.
+Jammed XSFP4, in [1.2.3](../../CHANGELOG.md#123) ([#2041](https://github.com/ashhart/TensorFold/pull/2041)), holds those experts at block 32 in the `csf0_v1` form and loads the same way.
 Rank 0 serves HTTP and the other ranks follow its steps, with MTP drafts, concurrent streams and kept prompt states.
 The [Python 0.6.6 recipe](glm-5.3-flash.md) and its `--tp`, `--rank` and `--master` flags belong to the frozen engine.
 
@@ -50,9 +50,17 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
   long conversation's next turn resumes when the card has no room left for its state (#1510). `--prompt-cache-gib`
   sizes the host cache on each rank (8 GiB unasked, at most half of the available memory), and the KV pool sets no
   device cache aside. Checked on two RTX PRO 6000 Blackwell cards at TP=2 with the EXL3 4bpw checkpoint.
+- A kept state larger than the prompt cache's whole budget is not kept (`kept nothing at … passes the … budget` on the
+  log), so a long conversation's next turn runs its prompt again from the start. With KV pages, `TF_KV_SHARE=n` keeps a
+  prompt's rows as the pool's pages instead of copying them into the cache, and that log line names it.
 - With KV pages (the default at two or more ranks), the pool sets the windows the room holds aside before the prompt
   cache, which gets what they leave of its 16 GiB. `--prompt-cache-gib N` sets N GiB aside first, after the engine's
   own window and a fixed part and page for each other stream, and the pool takes the rest.
+- `TF_GLM_PROMPT_TAIL=1` keeps a prompt that names no history, as a `/v1/completions` request's, at its last prompt
+  chunk start, as a chat keeps its history's, so the same prompt or a longer one resumes there. Those states share the
+  prompt cache's budget with chat states, least recently used out first, so long raw prompts between two chat turns can
+  push the chat's state out. Unset or 0, a raw prompt keeps none; GLM refuses any other value at startup. The KV
+  pages' store (`TF_KV_SHARE`) keeps a prompt's last page either way.
 - `TF_GLM_KV_HOST=1` on every rank (with KV pages, BF16) keeps the KV pages' latent rows in pinned host memory: the
   device keeps the pooled index keys, and each sparse call copies only the rows it picked into device slots. The KV
   pool then costs the card 768 bytes a token instead of 13,056, so a 1,048,576-token window fits beside the weights.
@@ -92,7 +100,8 @@ for each pass to end. A pass that takes more rows reads each routed expert's wei
 comes sooner. `TF_GLM_CHUNK_SOLO=4096` lets a pass take two of those chunks when no other stream is decoding as it
 starts. With one decoding, or with `prompt_logprobs` or image rows, the pass takes 2,048. Beside `--drafter`, DFlash2
 reads a solo pass's taps whole and keeps the prompt's last 2,048 rows as before; its tap buffer holds 4,096 rows, 80 MiB
-more on each rank.
+more on each rank. Solo passes take the place of `TF_GLM_PROMPT_PAIR`'s paired steps, whose second set of buffers they
+do not hold.
 
 The grid does not move, so warm turns resume where they do unset, and streams decoding beside a prompt see the same
 passes. Replies are the same bytes either way. Two costs remain:
@@ -117,8 +126,13 @@ Each setting is two fresh servers (one at TP=2 for the cold row), `--parallel 4 
 repeated filler line gains 2 to 5% at the same sizes. The other rows ran with the prompt cache on (the default at TP=2,
 2 GiB at TP=3). Three rows at TP=2 that waited on the heat guard are left out.
 
+It doesn't pay with every checkpoint. With `nvidia/GLM-5.3-Flash-NVFP4` on two GB10s at `--parallel 1 --context 65536`,
+`=4096` made cold prompts slower: 8K and 32K prompts ran 12 to 14% slower (about 1,280 against 1,480 tok/s at 8K), and
+the model took 1.9 GiB more at startup. That's two fresh servers each, with the same tokens either way. Leave it unset
+there.
+
 At TP=3 with `TF_GLM_ROCE_MULTI=1` (#1524) the gain is a little under half: on three GB10s at `--parallel 8` with
-`TF_GLM_KV_SHARE=32` and `TENSORFOLD_PREFILL_SHARE=0.7`, not the table's settings, cold Python-source prompts of 8K to
+`TF_KV_SHARE=32` and `TENSORFOLD_PREFILL_SHARE=0.7`, not the table's settings, cold Python-source prompts of 8K to
 128K tokens came 3.2 to 3.4% sooner with the wire and 7.3 to 8.4% sooner without it, two fresh servers each. The wire's
 extra time is in the side stream's exchanges and grows when solo doubles a pass (#1994). `TF_GLM_OVERLAP_PIECES`
 (1 to 8, the same on every rank; unset, 8 when `TF_GLM_CHUNK_SOLO=4096` and `TF_GLM_ROCE_MULTI=1` are both set at three
