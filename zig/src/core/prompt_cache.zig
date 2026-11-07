@@ -24,7 +24,7 @@ pub const Snapshots = struct {
     pub const VTable = struct {
         /// The most new storage `save` takes at `at` tokens (checked against the budget before any copy).
         bytes: *const fn (ptr: *anyopaque, at: u32) u64,
-        /// Copy the live state after `at` prompt tokens into new storage; `owner` is the lane core's stream (null: one stream).
+        /// Copy the live state after `at` prompt tokens to new storage; `owner`: lane core's stream (null: one stream).
         save: *const fn (ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!Saved,
         /// Make the live state `saved`'s: the next prompt chunk starts at its position.
         restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, saved: Saved) anyerror!void,
@@ -125,6 +125,7 @@ pub const Store = struct {
     hold: bool = false, // memory pressure: lookups plan no marks and keeps refuse, so no new state is kept
     spares_only: bool = false, // set around a call: it evicts only superseded states, never a conversation's latest
 
+    over: []const u8 = "", // what refusing a state past the whole budget adds: the setting that keeps it otherwise
     repeat_log: @import("prompt_cache_repeat.zig").Log = .{},
     const SHARED_KEYS = 64;
     pub const lookupUserImages = images.lookupUser;
@@ -172,7 +173,7 @@ pub const Store = struct {
         return if (s.family.vtable.spare) |f| f(s.family.ptr) else 0;
     }
 
-    /// A kept state takes `extra` more bytes (a family copied what it shared into it) if the budget has room; never evicts, a pass is under way.
+    /// A kept state takes `extra` bytes (a family's copied-in share) within budget; never evicts, a pass is under way.
     pub fn grow(s: *Store, saved: Saved, extra: u64) bool {
         for (s.entries.items) |e| if (!e.expired and e.tokens.len > 0 and e.saved == saved) {
             if (extra > s.room()) return false;
@@ -329,7 +330,7 @@ pub const Store = struct {
         return .{ .entry = e, .marks = marks_ };
     }
 
-    /// Room for every state the pass keeps, made before it: a peer that mirrors the keeps hears of these evictions with the request.
+    /// Room for every state the pass keeps, made before it: a keep-mirroring peer hears the evictions with the request.
     fn reserve(s: *Store, prompt: []const u32, born: u32, from: ?*Entry, marks_: []const u32, spans: []const modes.Span) void {
         var need: u64 = 0;
         var new: usize = 0; // states it keeps that the store lacks: a slot each
@@ -382,7 +383,7 @@ pub const Store = struct {
     const fitting = @import("prompt_cache_fit.zig").fitting;
     const fittingRewind = @import("prompt_cache_fit.zig").fittingRewind;
 
-    /// A looked-up entry's restore went through (it is now the prompt's), or failed (dropped: the pass ran from 0).
+    /// A looked-up entry's restore went through (it is now the prompt's), or failed (the refused state is dropped).
     pub fn resumed(s: *Store, e: *Entry, prompt: []const u32, ok: bool) void {
         return s.resumedWithReason(e, prompt, if (ok) null else error.RestoreRejected);
     }
@@ -477,7 +478,7 @@ pub const Store = struct {
         const bytes = s.family.vtable.bytes(s.family.ptr, at);
         if (bytes > s.budget or s.most == 0) {
             s.counts.refused += 1;
-            note("kept nothing at {d} tokens: {d} MiB passes the {d} MiB budget", .{ at, bytes >> 20, s.budget >> 20 });
+            note("kept nothing at {d} tokens: {d} MiB passes the {d} MiB budget{s}", .{ at, bytes >> 20, s.budget >> 20, if (bytes > s.budget) s.over else "" });
             return false;
         }
         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
@@ -576,9 +577,9 @@ pub const Store = struct {
     const extended = policy.extended;
 };
 
-/// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr).
+/// A line on the engine's log; tests stay quiet (the build runner fails a test that writes to stderr), a sink may hear.
 pub fn note(comptime fmt: []const u8, args: anytype) void {
-    if (@import("builtin").is_test) return;
+    if (@import("builtin").is_test) return @import("prompt_cache_note.zig").hear(fmt, args);
     std.log.warn("prompt cache: " ++ fmt, args);
 }
 

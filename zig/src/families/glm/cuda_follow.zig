@@ -12,6 +12,7 @@ const dflash = @import("dflash.zig");
 const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const one_chunk = @import("cuda_one_chunk.zig");
+const prompt_pair = @import("cuda_prompt_pair.zig");
 const Engine = engine.Engine;
 
 pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, costs, chunk_part };

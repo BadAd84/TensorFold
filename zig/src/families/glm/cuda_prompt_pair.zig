@@ -41,15 +41,9 @@ pub const Pair = struct {
     }
 };
 
-/// Whether an engine makes the pair's twin: TF_GLM_PROMPT_PAIR on, and other ranks whose exchanges a pair hides.
-pub fn wanted(on: bool, world: usize) bool {
-    return on and world > 1;
-}
-
-/// The second chunk's rows of a pair at `start`: from a's end to Engine.chunkEnd (a mark inside b ends it there).
-pub fn pairRows(start: usize, len: usize, marks: []const u32) usize {
-    const next = start + fw.prefill_rows;
-    return if (next >= len) 0 else engine.chunkEnd(next, len, marks) - next;
+/// Whether an engine makes the pair's twin: TF_GLM_PROMPT_PAIR on, no solo passes, and ranks to hide exchanges from.
+pub fn wanted(on: bool, solo: bool, world: usize) bool {
+    return on and !solo and world > 1;
 }
 
 /// Whether a step at `start` of a `len`-id prompt takes the next chunk too: min_rows or more there, and no mark at it.
@@ -57,6 +51,17 @@ pub fn takesTwo(start: usize, len: usize, world: usize, marks: []const u32) bool
     const next = start + fw.prefill_rows;
     if (next >= len or pairRows(start, len, marks) < @max(min_rows, world)) return false;
     return std.mem.indexOfScalar(u32, marks, @intCast(next)) == null;
+}
+
+/// The second chunk's rows of a pair at `start`: from a's end to Engine.chunkEnd (a mark inside b ends it there).
+pub fn pairRows(start: usize, len: usize, marks: []const u32) usize {
+    const next = start + fw.prefill_rows;
+    return if (next >= len) 0 else engine.chunkEnd(next, len, marks) - next;
+}
+pub fn piecesOf(e: *const Engine, b: *const fw.Buffers) ?*const fw.Pieces {
+    if (b == &e.bp) return &e.pieces;
+    const p = if (e.pair) |*p| p else return null;
+    return if (b == &p.bp) &p.pieces else null;
 }
 
 /// Whether a pair at `start` (b of `rb` rows) rebases the index rings where chunks one at a time do: at a, or not; and
@@ -179,19 +184,13 @@ test "a pair rebases the index rings where a chunk at a time would, so a ring ba
     try std.testing.expect(!ringsAgree(0, 2 * C, C + 3, C - 2));
 }
 
-test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
-    try std.testing.expect(!wanted(true, 1));
-    try std.testing.expect(wanted(true, 2));
-    try std.testing.expect(!wanted(false, 3));
-}
-
 test "TF_GLM_OVN_PRX: glm-prx-check's prompt takes one paired step, at 0 (pairedAt's rules), then split chunks alone" {
     const C = fw.prefill_rows;
     const len: usize = prx_check_len;
     const ring = @min(prx_check_capacity, @import("cuda_state.zig").index_ring); // State.ring_rows at that capacity
     try std.testing.expect(len <= prx_check_capacity);
     for (2..cuda.prx.max_world + 1) |world| {
-        try std.testing.expect(wanted(true, world)); // the engine makes the twin
+        try std.testing.expect(wanted(true, false, world)); // the engine makes the twin
         var at: usize = 0;
         var base: usize = 0; // the rings' base, as State.ready rebases it (glm-pair-check's walk)
         var pairs: usize = 0;
@@ -210,4 +209,15 @@ test "TF_GLM_OVN_PRX: glm-prx-check's prompt takes one paired step, at 0 (paired
         }
         try std.testing.expect(pairs == 1 and alone >= 1); // PRX_ALONE's lone chunks have calls to make
     }
+}
+
+test "only ranks that exchange make the twin: TP=1 has no exchanges to hide" {
+    try std.testing.expect(!wanted(true, false, 1));
+    try std.testing.expect(wanted(true, false, 2));
+    try std.testing.expect(!wanted(false, false, 3));
+}
+
+test "a server with solo passes holds no twin: they take the pair's steps" {
+    try std.testing.expect(!wanted(true, true, 2));
+    try std.testing.expect(!wanted(true, true, 3));
 }

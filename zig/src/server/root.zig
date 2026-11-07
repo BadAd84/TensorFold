@@ -85,6 +85,7 @@ test {
     _ = @import("speech_redraw.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_redraw_test.zig"); // over a Unix socket pair
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_register_test.zig"); // over a Unix socket pair
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("pdf_worker.zig"); // spawns /bin/sh workers
     _ = @import("drama_prompt.zig");
     _ = @import("health_test.zig");
     _ = @import("clef_encode_test.zig");
@@ -99,6 +100,7 @@ test {
     _ = @import("messages.zig");
     _ = @import("cache_salt.zig");
     _ = @import("pdf.zig");
+    _ = @import("pdf_flags_test.zig");
     _ = @import("images.zig");
     _ = @import("images_video_marker_test.zig");
     _ = @import("image_key.zig");
@@ -176,6 +178,9 @@ test {
     _ = @import("slide_questions_test.zig");
     _ = @import("slide_teacher_test.zig");
     _ = @import("slide_learn_path_test.zig");
+    _ = @import("slide_metrics_test.zig");
+    _ = @import("slide_metrics_off_test.zig");
+    _ = @import("cli_slide_drift_test.zig");
     _ = @import("slide_whom.zig");
     _ = @import("slide_subject.zig");
     _ = @import("slide_span.zig");
@@ -240,6 +245,7 @@ test {
 test {
     _ = @import("control_tokens_http_test.zig");
     _ = @import("request_provenance_test.zig");
+    _ = @import("quoted_markers_test.zig");
     _ = @import("request_cost_test.zig");
     _ = @import("prompt_tool_turn_test.zig");
     _ = @import("prompt_once_test.zig");
@@ -248,4 +254,5 @@ test {
 test {
     _ = @import("models_idle_audit_test.zig");
     _ = @import("penalty_request_test.zig");
+    _ = @import("deepseek_fixture_test.zig");
 }
