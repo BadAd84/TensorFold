@@ -35,6 +35,7 @@ pub fn warmQuiet(comptime F: type) ?u64 {
     if (@hasDecl(F, "warm_quiet")) return F.warm_quiet;
     if (@hasDecl(F, "warmQuietNow")) return F.warmQuietNow();
     return null;
+}
 
 /// The server's chunk step: a family whose cold passes cut at request starts gets message starts on its grid (0: none).
 pub fn requestStep(comptime F: type) u32 {
