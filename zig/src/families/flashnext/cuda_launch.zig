@@ -18,6 +18,7 @@ pub const draft_affine = @import("cuda_draft_affine.zig");
 pub const qmm = @import("cuda_qmm.zig");
 /// The batched pass's and its prompt tiles' symbols and launch sizes, which the contract's tests launch.
 pub const batch_state = @import("cuda_batch_state.zig");
+pub const batch_gdn_lanes = @import("cuda_batch_gdn_lanes.zig");
 pub const tile_kernels = @import("cuda_tile_kernels.zig");
 pub const gdn = @import("cuda_gdn.zig");
 pub const mlp = @import("cuda_mlp.zig");
@@ -441,6 +442,7 @@ pub const Tri = struct {
 };
 
 test {
+    _ = @import("cuda_split_lane_test.zig");
     _ = embed;
     _ = hc;
     _ = qmm;

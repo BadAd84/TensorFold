@@ -2,6 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const kv = @import("core").kv_pool;
+const kp = @import("core").kv_prompts;
 const fw = @import("cuda_forward.zig");
 const state = @import("cuda_state.zig");
 const types = @import("cuda_engine_types.zig");
@@ -62,6 +63,7 @@ pub const Pages = struct {
     poison: bool, // TF_KV_POISON=1: a stream's pages start as NaN, so a row read before its write shows in the reply
     tags: []lineage.PageTag = &.{}, // TF_GLM_OVN_LINEAGE: what each page's rows hold (none without the knob)
     want: u64 = 0, // TF_GLM_OVN_LINEAGE, rank 0: the kept state the next `open`'s restore takes (0: none)
+    prompts: ?kp.Prompts = null, // TF_KV_SHARE: the shared prompt store over this pool (rank 0's), from the server
 
     /// `streams` sequences from slot 0 on `pages` pages: the engine's own (`ownSequence`) placed, the others made now.
     pub fn init(gpa: std.mem.Allocator, e: *Engine, l: kv.Layout, streams: usize, pages: usize, leader: bool) !*Pages {
@@ -253,7 +255,7 @@ pub const Pages = struct {
         p.report();
     }
 
-    /// The idle server's line: nothing promised, every page free or, under TF_GLM_KV_SHARE, the store's.
+    /// The idle server's line: nothing promised, every page free or, under TF_KV_SHARE, the store's.
     fn report(p: *const Pages) void {
         if (@import("builtin").is_test) return;
         const c = p.pool.census();

@@ -82,7 +82,7 @@ fn words(a: std.mem.Allocator, out: *std.ArrayList(u8), pos: usize, mtp_len: usi
 /// The bound sequence's read set at its position, through the knob-off plan.
 fn readSet(a: std.mem.Allocator, e: *Engine) ![]u8 {
     const st = &e.cur.st;
-    const plan = try glm.snapshots.layout.Plan.init(st, &e.c, st.pos, if (e.mtp) st.mtp_len else null);
+    const plan = try glm.snapshots.layout.Plan.init(st, &e.c, st.pos, if (e.mtp) st.mtp_len else null, glm.snapshots.heldPages(e, st.pos));
     var out: std.ArrayList(u8) = .empty;
     for (plan.parts[0..plan.count]) |p| {
         var done: usize = 0;
@@ -102,7 +102,7 @@ fn image(a: std.mem.Allocator, e: *Engine, id: u64) ![]u8 {
     const st = &e.cur.st;
     const plan = try glm.snapshots.layout.Plan.sized(st, &e.c, e.capacity, s.pos, if (e.mtp) s.mtp_len else null);
     const l = glm.lineage_copy.lay(&plan, st, if (s.lin) |k| k.padded else false);
-    const arena = e.snap_pages.?.arena.?.ptr;
+    const arena = e.snap_pages.?.arena.?.ptr();
     const P = glm.snapshots.pages.page;
     var out: std.ArrayList(u8) = .empty;
     for (plan.parts[0..plan.count], 0..) |p, i| {
@@ -271,7 +271,7 @@ fn arm(a: std.mem.Allocator, on: bool, out: *std.ArrayList([]u8)) !glm.lineage_c
         var held: usize = 0;
         var it = e.snaps.valueIterator();
         while (it.next()) |s| held += s.lease.ids.items.len;
-        try t.expectEqual(pool.arena.?.len, held * glm.snapshots.pages.page + pool.spare());
+        try t.expectEqual(pool.arena.?.len(), held * glm.snapshots.pages.page + pool.spare());
         try t.expect(pool.pages.available() >= pool.spare() / glm.snapshots.pages.page);
     }
     return glm.lineage_copy.stats;

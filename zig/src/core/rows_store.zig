@@ -1,7 +1,6 @@
 //! Conversation states on disk (--learn-conversations): rows in blocks states share, each state's own parts in a file.
 const std = @import("std");
 const platform = @import("sys");
-const builtin = @import("builtin");
 const pc = @import("prompt_cache.zig");
 const modes = @import("cache_modes.zig");
 pub const image = @import("lanes").rows_image;
@@ -137,8 +136,10 @@ pub const Rows = struct {
         const r = try init(gpa, family, o);
         errdefer r.deinit();
         try makePath(gpa, r.dir);
-        try @import("rows_scan.zig").scan(r);
-        try @import("rows_scan.zig").settle(r);
+        var dropped: @import("rows_dropped.zig").Dropped = .{};
+        defer dropped.flush(); // said even when the open fails part way
+        try r.scan(&dropped);
+        try r.settle(&dropped);
         r.stamp();
         r.sync_writes = o.sync_writes or (if (platform.c.getenv("TENSORFOLD_ROWS_SYNC")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false);
         r.staging_bytes = stagingBytes(o.staging_bytes, if (platform.c.getenv("TENSORFOLD_ROWS_STAGING_GIB")) |v| std.mem.span(v) else null);
@@ -433,6 +434,85 @@ pub const Rows = struct {
         return before;
     }
 
+    /// The files under the store's directory: states read back and checked by name, blocks by size; leftovers go.
+    fn scan(r: *Rows, dropped: *@import("rows_dropped.zig").Dropped) !void {
+        const d = platform.c.opendir(r.dir) orelse return error.RowsDir;
+        defer _ = platform.c.closedir(d);
+        while (platform.c.readdir(d)) |ent| {
+            if (ent.type != platform.c.DT.REG) continue;
+            const name = std.mem.sliceTo(&ent.name, 0);
+            var buf: [1200]u8 = undefined;
+            const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ r.dir, name }, 0) catch continue;
+            if (std.mem.endsWith(u8, name, ".part")) {
+                _ = platform.c.unlink(p);
+                continue;
+            }
+            const n = parseName(name) orelse continue;
+            if (std.mem.endsWith(u8, name, ".blk")) {
+                const bytes = dirs.fileBytes(p) catch continue;
+                try r.blocks.put(r.gpa, n, .{ .bytes = bytes });
+            } else if (std.mem.endsWith(u8, name, ".st")) {
+                r.readState(p) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    _ = platform.c.unlink(p);
+                    dropped.add(err);
+                };
+            }
+        }
+    }
+
+    /// A state file's metadata checked against its name, kept for lookups (its payload is checked when read).
+    fn readState(r: *Rows, p: [:0]const u8) !void {
+        var o = try file.open(p, .state, null);
+        defer o.close();
+        const m = try file.meta(&o, r.gpa);
+        defer r.gpa.free(m);
+        if (m.len < 12) return error.RowsRead;
+        const counts = std.mem.bytesAsSlice(u32, m[0..12]);
+        const nt: usize = counts[0];
+        const ns: usize = counts[1];
+        const nst: usize = counts[2];
+        if (m.len != 12 + 4 * (nt + 2 * ns + nst) or nt == 0) return error.RowsRead;
+        var s: State = .{ .name = o.trailer.name, .at = o.trailer.at, .tokens = &.{}, .spans = &.{}, .starts = &.{}, .own = o.trailer.payload + o.trailer.meta + @sizeOf(file.Trailer), .rows = 0, .used = 0, .shared = o.trailer.flags & 1 != 0 };
+        errdefer freeState(r.gpa, &s);
+        s.tokens = try r.gpa.dupe(u32, @alignCast(std.mem.bytesAsSlice(u32, m[12..][0 .. 4 * nt])));
+        s.spans = try r.gpa.dupe(Span, @alignCast(std.mem.bytesAsSlice(Span, m[12 + 4 * nt ..][0 .. 8 * ns])));
+        s.starts = try r.gpa.dupe(u32, @alignCast(std.mem.bytesAsSlice(u32, m[12 + 4 * nt + 8 * ns ..][0 .. 4 * nst])));
+        if (s.at == 0 or s.tokens.len != s.at + r.keying.lookahead or o.trailer.block != r.keying.block) return error.RowsRead;
+        if (!std.mem.eql(u8, &chain.state(r.keying, s.tokens, s.spans, s.starts, s.at), &s.name)) return error.RowsRead;
+        modes.validate(s.spans) catch return error.RowsRead;
+        r.clock += 1;
+        s.used = r.clock;
+        try r.states.append(r.gpa, s);
+    }
+
+    /// Each state's blocks counted; a state missing one, or that its family cannot lay out, goes; then idle blocks.
+    fn settle(r: *Rows, dropped: *@import("rows_dropped.zig").Dropped) !void {
+        var i: usize = 0;
+        while (i < r.states.items.len) {
+            const s = &r.states.items[i];
+            var wants: std.ArrayList(write.Want) = .empty;
+            defer wants.deinit(r.gpa);
+            const cause: ?anyerror = if (r.wantsOf(r.gpa, s, &wants)) |_| for (wants.items) |w| {
+                if (!r.blocks.contains(chain.stem(w.name))) break @import("rows_dropped.zig").missing;
+            } else null else |err| if (err == error.OutOfMemory) return err else err;
+            if (cause) |err| {
+                dropped.add(err);
+                var gone = r.states.orderedRemove(i);
+                unlinkName(r.dir, gone.name, ".st");
+                freeState(r.gpa, &gone);
+                continue;
+            }
+            r.ref(wants.items, 1);
+            s.rows = 0;
+            for (wants.items) |w| s.rows += w.bytes;
+            i += 1;
+        }
+        const named = r.blocks.count();
+        r.collect();
+        dropped.blocks += named - r.blocks.count();
+    }
+
     /// This identity was opened (and wrote): the newest under the root for every identity's sweep.
     pub fn stamp(r: *const Rows) void {
         var path_buf: [1100]u8 = undefined;
@@ -484,6 +564,13 @@ fn dayNow() u64 {
     var t: platform.c.timespec = undefined;
     if (platform.c.clock_gettime(platform.c.CLOCK.REALTIME, &t) != 0 or t.sec < 0) return 0;
     return @as(u64, @intCast(t.sec)) / 86400;
+}
+
+fn parseName(name: []const u8) ?chain.Stem {
+    if (name.len < 33 or name[32] != '.') return null;
+    var n: chain.Stem = undefined;
+    _ = std.fmt.hexToBytes(&n, name[0..32]) catch return null;
+    return n;
 }
 
 /// The file of name `n` (a Name or a Stem) with extension `ext` removed (a missing one is fine).

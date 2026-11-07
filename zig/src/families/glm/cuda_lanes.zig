@@ -7,7 +7,7 @@ const follow = @import("cuda_follow.zig");
 const fw = @import("cuda_forward.zig");
 const dflash = @import("dflash.zig");
 const prompt_lp = @import("cuda_prompt_logprobs.zig");
-const prefix_mod = @import("cuda_prefix.zig");
+const share_mod = @import("cuda_share.zig");
 const prompt_solo = @import("cuda_prompt_solo.zig");
 const cuda = @import("cuda");
 
@@ -34,7 +34,7 @@ pub const Lane = struct {
     fill: ?usize = null, // a prompt pass going a chunk at a time: where its next chunk starts
     slicing: bool = false, // TF_GLM_OVN_FILL_SLICE_MS: its chunk from `fill` waits part-way through its layers
     settled: bool = false, // and its prompt pass ended inside another call (fill_mod.settle): `first` holds its token
-    marks: []const u32 = &.{}, // TF_GLM_KV_SHARE: where the prompt cache keeps this stream's pass (owned)
+    marks: []const u32 = &.{}, // TF_KV_SHARE: where the shared prompt store keeps this stream's pass (owned)
 };
 
 pub const Lanes = struct {
@@ -52,15 +52,12 @@ pub const Lanes = struct {
     bits_dev: u64 = 0,
     timed: ?@import("cuda_cost_time.zig").Timed = null, // TF_GLM_OVN_COST_TIME: the window costs timed at load
     multi: bool = false, // TF_GLM_OVN_MULTI_FILL: batched passes take marked and resumed prompts, a piece a pass
-    prefix: ?*prefix_mod.Prefix = null, // TF_GLM_KV_SHARE: the prompt cache over the pool's pages (rank 0's)
 
     pub fn deinit(self: *Lanes) void {
         if (self.bits) |*b| b.free();
         var it = self.lanes.valueIterator();
         while (it.next()) |l| self.x.e.gpa.free(l.marks);
         self.lanes.deinit(self.x.e.gpa);
-        if (self.prefix) |x| x.deinit(); // its pages back to the pool before the pool goes
-        self.prefix = null;
     }
 
     /// A window's grammar rows (rows of the vocabulary's words) at row `row` of the bits, device-read; 0 for none.
@@ -229,7 +226,7 @@ pub const Lanes = struct {
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
         var at: usize = if (from) |r| r.at else 0;
-        var keeps: prefix_mod.Keeps = undefined;
+        var keeps: share_mod.Keeps = undefined;
         while (true) {
             const step = try self.x.chunkOf(s.prompt(), at, false, from, reply.gate(s, cancelled), self.marksOf(s, &keeps), false, reply.rowsOf(s)); // a reply's background pass: capped chunks, yields at each gate
             if (step.first) |first| {
@@ -244,7 +241,7 @@ pub const Lanes = struct {
     fn prefillManyFn(ptr: *anyopaque, ss: []const *lanes.Stream) anyerror!bool {
         const self = of(ptr);
         try fill_mod.settle(self);
-        if (self.prefix != null) return false; // TF_GLM_KV_SHARE: the cache keeps a pass alone
+        if (share_mod.of(self.x.e) != null) return false; // TF_KV_SHARE: the store keeps a pass alone
         if (self.multi) return fill_mod.multiFill(self, ss);
         if (!self.x.e.m.tiled or ss.len > engine.max_together) return false;
         for (ss) |s| if (!canBatch(s)) return false;
@@ -290,7 +287,7 @@ pub const Lanes = struct {
         try sink.prepare();
         self.x.e.prompt_logprobs = sink.want();
         defer self.x.e.prompt_logprobs = null;
-        var keeps: prefix_mod.Keeps = undefined;
+        var keeps: share_mod.Keeps = undefined;
         const busy = prompt_solo.othersDecode(&self.lanes, s); // a pair would hold up their rounds; TF_GLM_OVN_FILL_SLICE_MS slices instead
         const step = try self.x.chunkOf(s.prompt(), at, !busy, from, .{ .ptr = s, .check = cancelled }, self.marksOf(s, &keeps), busy and @import("cuda_prompt_slices.zig").of(self.x.e) != null, 0);
         if (step.first) |first| {
@@ -314,7 +311,7 @@ pub const Lanes = struct {
         const at = l.fill orelse return;
         if (at <= s.cached or s.reuse.hook == null) return;
         try self.x.bind(l.slot);
-        var keeps: prefix_mod.Keeps = undefined;
+        var keeps: share_mod.Keeps = undefined;
         _ = self.x.chunk(s.prompt(), at, false, null, .{ .ptr = null, .check = cancelNow }, self.marksOf(s, &keeps)) catch |err| {
             if (err == error.Cancelled) return;
             return err;
@@ -335,11 +332,11 @@ pub const Lanes = struct {
         };
         const gpa = self.x.e.gpa;
         const share = self.cached(s);
-        var owner: prefix_mod.Owner = .{};
+        var owner: share_mod.Owner = .{};
         var adopt: std.ArrayList(u32) = .empty;
         defer adopt.deinit(gpa);
-        // TF_GLM_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
-        const marks: []const u32 = if (share) (try self.prefix.?.beginStream(s, &owner, &adopt)).marks else &.{};
+        // TF_KV_SHARE: the deepest kept state's pages, held for this call until the seat takes them
+        const marks: []const u32 = if (share) (try share_mod.begin(self.x.e, s, &owner, &adopt)).marks else &.{};
         var held = true;
         errdefer if (held) gpa.free(marks);
         const pages = try self.seat(s, ids.len, s.max_new, adopt.items);
@@ -370,9 +367,9 @@ pub const Lanes = struct {
         return if (k.at != s.reuse.at or k.at == 0 or k.at >= len or !self.x.e.holds(k.id)) 0 else k.id;
     }
 
-    /// Whether the pool's prompt cache keeps this content-keyed pass, with no prompt logprob rows asked.
+    /// Whether the shared prompt store keeps this content-keyed pass, with no prompt logprob rows asked.
     fn cached(self: *const Lanes, s: *const lanes.Stream) bool {
-        return self.prefix != null and prefix_mod.cacheable(s);
+        return share_mod.of(self.x.e) != null and share_mod.cacheable(s);
     }
 
     /// The stream's slot, its pages (the cache's `adopted` first, given back on a refusal), then its sequence.
@@ -422,10 +419,10 @@ pub const Lanes = struct {
     }
     const Sink = @import("cuda_prompt_sink.zig").Sink;
 
-    pub fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *prefix_mod.Keeps) ?engine.Marks {
+    pub fn marksOf(self: *Lanes, s: *lanes.Stream, keeps: *share_mod.Keeps) ?engine.Marks {
         if (self.cached(s)) {
             const l = self.lanes.getPtr(s) orelse return null;
-            return self.prefix.?.marks(l.slot, s, l.marks, keeps);
+            return share_mod.marks(self.x.e, l.slot, s, l.marks, keeps);
         }
         return if (s.reuse.hook == null) null else .{
             .at = s.reuse.marks,
