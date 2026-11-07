@@ -8,6 +8,7 @@ const kda_chunk = @import("cuda_kda_chunk.zig");
 const b16 = @import("cuda_b16.zig");
 const prof = @import("cuda_prof.zig");
 const l2pace = @import("cuda_l2pace.zig");
+const l2pf = @import("cuda_l2pf.zig");
 const projection = @import("cuda_proj.zig");
 
 /// The input projection [q | k | v | f_a | g_a | b] [3 heads 128 + 256 + heads][dims]: one bf16 stack, or two parts.

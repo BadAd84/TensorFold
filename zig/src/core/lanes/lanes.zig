@@ -11,6 +11,8 @@ pub const recall = @import("recall.zig");
 pub const recall_store = @import("recall_store.zig");
 pub const sampling = @import("sampling.zig");
 pub const fill = @import("fill.zig");
+pub const prefill_widths = @import("prefill_widths.zig");
+pub const solo_chunk = @import("solo_chunk.zig");
 pub const shape = @import("shape.zig");
 pub const plan_lanes = @import("plan_lanes.zig");
 pub const cost_cache = @import("cost_cache.zig");
@@ -85,6 +87,7 @@ test {
     _ = @import("shared_depth_test.zig");
     _ = @import("free_shared_test.zig");
     _ = @import("granted_reservation_test.zig");
+    _ = @import("rollback_test.zig");
 }
 
 pub const learned_disk = @import("learned_disk.zig");

@@ -10,6 +10,7 @@ pub const Shape = struct {
     taps: bool,
     slots: u8,
     hidden: bool = false,
+    rows: bool = false, // a readout piece: every row through the last layer and the final norm, no head
     paged: bool = false,
     mt2: bool = false,
 
@@ -22,7 +23,7 @@ pub const Shape = struct {
 
     pub fn key(s: Shape) u32 {
         // captured shapes only: a window bucket's rows fit the low byte
-        return @as(u32, @as(u8, @intCast(s.total))) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27 | @as(u32, @intFromBool(s.paged)) << 28 | @as(u32, @intFromBool(s.mt2)) << 29;
+        return @as(u32, @as(u8, @intCast(s.total))) | @as(u32, s.nseg) << 8 | @as(u32, @intFromBool(s.record)) << 16 | @as(u32, @intFromBool(s.prompt)) << 17 | @as(u32, @intFromBool(s.taps)) << 18 | @as(u32, s.slots) << 19 | @as(u32, @intFromBool(s.hidden)) << 27 | @as(u32, @intFromBool(s.paged)) << 28 | @as(u32, @intFromBool(s.mt2)) << 29 | @as(u32, @intFromBool(s.rows)) << 30;
     }
 };
 
@@ -46,4 +47,27 @@ test "MT2 dispatch keeps context boundaries and graph identities separate" {
     try std.testing.expect(!useMt2(true, true, true, 16, 1, 8192));
     try std.testing.expect(!useMt2(true, true, false, 16, 2, 8192));
     try std.testing.expect(!useMt2(true, true, false, 17, 1, 8192));
+}
+
+test "every captured verify shape keys its own graph: a shape after another never replays the other's (#2138)" {
+    const gpa = std.testing.allocator;
+    var keys: std.AutoHashMapUnmanaged(u32, Shape) = .empty;
+    defer keys.deinit(gpa);
+    var distinct: std.AutoHashMapUnmanaged(Shape, void) = .empty;
+    defer distinct.deinit(gpa);
+    const variants = [_]u8{ 1, 2, 4, 8, 16 }; // every slot count a window's register peak gives
+    for (1..Round.most_window + 1) |peak| try std.testing.expect(std.mem.indexOfScalar(u8, &variants, @intCast(Round.variant(peak))) != null);
+    for (1..Round.most_verify + 1) |rows| for (1..@min(rows, Round.max_segs) + 1) |segments| for ([_]bool{ false, true }) |taps| {
+        for (variants) |slots| for (0..8) |bits| {
+            var s = Shape.init(rows, segments, true, taps, slots);
+            s.hidden = bits & 1 != 0;
+            s.paged = bits & 2 != 0;
+            s.mt2 = bits & 4 != 0;
+            try distinct.put(gpa, s, {});
+            const got = try keys.getOrPut(gpa, s.key());
+            if (got.found_existing) try std.testing.expectEqual(got.value_ptr.*, s) else got.value_ptr.* = s;
+        };
+    };
+    try std.testing.expectEqual(distinct.count(), keys.count());
+    try std.testing.expect(keys.count() > 1000);
 }
