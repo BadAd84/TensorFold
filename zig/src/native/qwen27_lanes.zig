@@ -23,7 +23,7 @@ pub fn windowRows(units: bool) !u32 {
     return @import("qwen27_window.zig").requested(units, if (platform.c.getenv("TF_QWEN27_WINDOW")) |v| std.mem.span(v) else null);
 }
 /// A shared round's rows at most: the frame's.
-pub const batch_rows = 128;
+pub const batch_rows = @import("qwen27_prompt_floor.zig").minimum;
 /// Streams a runner holds at most (the attention plan's).
 pub const max_streams = q.attention_plan.max_streams;
 const ring = 64;
@@ -90,7 +90,13 @@ pub const Metal = struct {
     slot_resume: bool = true, // TF_QWEN27_SLOT_RESUME: a later prompt resumes where slot 0 stands (0: off)
 
     pub fn init(gpa: std.mem.Allocator, runner: *q.decode_round.Runner, draft: ?*Draft) !*Metal {
-        if (runner.slots == 0 or runner.slots > max_streams or runner.model.frame.capacity < batch_rows) return error.TargetBinding;
+        if (runner.slots == 0 or runner.slots > max_streams) return error.TargetBinding;
+        const floor = @import("qwen27_prompt_floor.zig");
+        floor.check(runner.model.frame.capacity) catch |err| {
+            var buffer: [320]u8 = undefined;
+            std.log.err("{s}", .{try floor.describe(&buffer, runner.model.frame.capacity, .frame)});
+            return err;
+        };
         const device = runner.model.device;
         const tensor_units = device.tensorUnits();
         const window = try windowRows(tensor_units);
@@ -103,7 +109,7 @@ pub const Metal = struct {
         errdefer kept.deinit();
         const b = try gpa.create(Metal);
         errdefer gpa.destroy(b);
-        b.* = .{ .gpa = gpa, .runner = runner, .draft = draft, .tensor_units = tensor_units, .window = window, .copies = copies, .nodes = @import("qwen27_window.zig").nodes(window, copies), .ops = ops, .picks = picks, .kept = kept, .draft_slots = draftSlots(), .slot_resume = slots.slotResumeEnv() };
+        b.* = .{ .gpa = gpa, .runner = runner, .draft = draft, .tensor_units = tensor_units, .window = window, .copies = copies, .nodes = @import("qwen27_window.zig").nodes(window, copies), .ops = ops, .picks = picks, .kept = kept, .draft_slots = try draftSlots(), .slot_resume = slots.slotResumeEnv() };
         b.pass_profile = platform.c.getenv("TF_Q27_PASS_PROFILE") != null;
         errdefer b.freeContexts();
         if (draft) |d| {
@@ -550,7 +556,6 @@ pub const Metal = struct {
 };
 
 /// Streams that draft their own trees in shared rounds, while no more are live (TF_Q27_DRAFT_SLOTS; 1: slot 0 alone).
-fn draftSlots() u32 {
-    const v = std.c.getenv("TF_Q27_DRAFT_SLOTS") orelse return 8;
-    return std.math.clamp(std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8, 1, max_streams);
+fn draftSlots() !u32 {
+    return std.math.clamp(try @import("sys").environment.read(u32, "TF_Q27_DRAFT_SLOTS", 8), 1, max_streams);
 }

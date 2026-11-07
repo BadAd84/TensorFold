@@ -28,6 +28,9 @@ pub const linked = slide.linked;
 pub const model_type = "qwen3_5";
 pub const formats: []const []const u8 = &.{ "mlx-q4g64", "exl3" };
 pub const default_context: i64 = 32768;
+/// A plain BF16 checkpoint's preflight counts its text tensors, not the tower and MTP in its shards.
+pub const textWeightBytes = @import("cuda_bf16_bytes.zig").textWeightBytes;
+const decide = @import("cuda_decide.zig");
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = E.max_rows;
 /// --drafter loads a DFlash2 draft model (openDrafter), or on the MoE target its MTP layer; DFlash2 has no own head.
@@ -35,7 +38,7 @@ pub const takes_drafter = true;
 /// A request's pages hold one more forward past its prompt and reply (TF_QWEN_KV_PAGES).
 pub const window_rows: u32 = pages_mod.window_rows;
 
-/// Kept prompt states for the shared cache (cuda_reuse.zig), in pinned host memory, on the zero-anchored chunk grid.
+/// Kept prompt states for the shared cache (cuda_reuse.zig) on the host budget, on the zero-anchored chunk grid.
 pub const snap_bytes = reuse.bytes;
 pub const snap_save = reuse.save;
 pub const snap_restore = reuse.restore;
@@ -85,6 +88,8 @@ pub const Loaded = struct {
     all_on_pages: bool = false,
     /// TF_QWEN_KV_PAGES_ALL=1: the engine's own stream takes pages too, a window of them set aside by the plan.
     engine_paged: bool = false,
+    /// An integrated GPU: kept states in device memory on the host budget (Target.device), the startup line says so.
+    device_snaps: bool = false,
 };
 
 pub fn cacheBytes(e: *const E.Engine, cap: usize, test_tokens: usize) !usize {
@@ -133,6 +138,7 @@ pub fn ledgerPool(p: *anyopaque) ?*@import("core").kv_pool.Pool {
 
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: ?[]const u8, o: Options) !Loaded {
     if (kernels != null) return error.QwenHasNoCapturedKernels;
+    try decide.check(gpa, io, dir, .{ .drafter = o.drafter != null, .slide = o.slide, .vision = o.vision != null, .kv8 = o.kv8, .prompt_int8 = o.prompt_int8 });
     if (o.slide and o.kv8) return error.UnsupportedLearningFormat;
     const page_tokens = try pages_mod.paging();
     const engine_paged = page_tokens > 0 and pages_mod.pagedOnly();
@@ -162,7 +168,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer if (trace) |x| gpa.destroy(x);
     const l = try gpa.create(Lanes);
     l.* = .{ .gpa = gpa, .io = io, .e = e, .capacity = o.context, .page_tokens = page_tokens, .engine_paged = engine_paged, .page_test = page_test, .share_snaps = share_snaps, .cost_context = ctx, .startup = e.startup, .vision = v, .target = undefined, .timing_on = timing_on, .trace = trace };
-    l.target = .{ .e = e, .caches = &l.caches, .seen = &l.seen };
+    l.target = .{ .e = e, .caches = &l.caches, .seen = &l.seen, .device = try ctx.attribute(.integrated) != 0 };
     return .{
         .learns = if (o.slide) e else null,
         .learn_bytes = if (o.slide) @import("cuda_train.zig").memory(try @import("cuda_learn_shape.zig").from(e.g)) + e.streamBytes(o.context) else 0,
@@ -175,6 +181,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .reserve = reserve,
         .vision = v,
         .target = &l.target,
+        .device_snaps = l.target.device,
         .layout = if (page_tokens > 0) pages_mod.layout(e, o.context, page_tokens, 0, 0) else null,
         .own_prompt_cache = share_snaps > 0,
         .all_on_pages = page_tokens > 0 and share_snaps > 0 and !engine_paged, // the engine's window idle
@@ -216,6 +223,7 @@ pub const openDrafter = drafter_open.openDrafter;
 
 /// A request this engine refuses, in words, or with no engine (null) its open; null: none of its own.
 pub fn explain(ctx: ?*anyopaque, err: anyerror) ?[]const u8 {
+    if (ctx == null) if (decide.explain(err)) |why| return why;
     if (ctx == null) return switch (err) {
         error.NoQwenVision => "--vision: this checkpoint has no image tower (no vision_config): serve it without --vision",
         error.QwenPagesNoLearner => "TF_QWEN_KV_PAGES: the learner reads whole windows, not pages; drop --slide or unset it",
@@ -531,6 +539,10 @@ pub const Lanes = struct {
 
 test "Qwen share faults: --parallel N admits N streams at once with every stream on pages" {
     try @import("cuda_admit_test.zig").admits(Lanes);
+}
+
+test "Qwen pages default: --parallel a cap with TF_QWEN_KV_PAGES set, a request waits for pages; unset, a window each" {
+    try @import("cuda_admit_test.zig").caps(Lanes);
 }
 
 test "Qwen stepped prefill: cancel between host iterations retains only the last completed cut" {

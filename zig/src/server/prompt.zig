@@ -41,7 +41,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
 
 /// The template's text for `messages` (call arguments through `args`); with `against`, cut a little past leaving it.
 fn rendered(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, args: ?*messages_mod.Args, against: ?[]const u8) errors.Refused!model_text.Rendered {
-    const normalized = if (srv.text.vtable.format == .kimi) messages else try messages_mod.toolArgumentsWith(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)), args);
+    const normalized = if (srv.text.vtable.format == .kimi or srv.text.native_deepseek) messages else try messages_mod.toolArgumentsWith(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, srv.media()), args);
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
@@ -50,6 +50,9 @@ fn rendered(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinki
         .reasoning_effort = if (thinking) effort else null,
         .clear_thinking = cx.clear_thinking,
         .stop = if (against) |t| .{ .against = t, .slack = stop_slack } else null,
+        .tool_choice = cx.template_fields.get("tool_choice"),
+        .response_format = cx.template_fields.get("response_format"),
+        .images = srv.info.vision != null,
     };
     var r = srv.text.render(cx.a, normalized, options, &problem) catch |e| return failed(cx, e, problem);
     // with image input, a marker the text spells is ordinary text (images.zig)
@@ -211,6 +214,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
+    cx.template_fields = input.fields;
     var once: Once = .{ .srv = srv, .tools = input.tools, .thinking = thinking, .effort = effort };
     const prompt = try once.prompt(cx, input.messages);
     const history = try once.history(cx, input.messages);
