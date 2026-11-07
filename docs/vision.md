@@ -255,6 +255,8 @@ as transformers 5.19's `Glm5NextProcessor` prepares them:
   `<|begin_of_image|>…<|end_of_image|>T.T seconds` block a pair.
 - **Budget:** a request's videos share `--vision-video-tokens` visual tokens (default 16,384; the processor's
   `max_image_tokens`). The frames are sized under it and resized with torch's antialiased uint8 bicubic.
+  `--max-frames N` caps the frames a video is sampled to, from 1 through 8,190; without it the engine samples at
+  most 256.
 
 Video needs `libtfvideo`, an optional library over FFmpeg 9.0.2 (the release PyAV 19.0.1 ships). The server loads it
 when the first video arrives and refuses videos by name without it:
@@ -294,11 +296,15 @@ With `--vision --vision-pdf`, user messages and tool results also accept inline 
 - **Images only, no text layer:** each page is rendered at 144 DPI (bounded to 2,048 pixels a side and 3.6 megapixels)
   and passed to the vision tower as a JPEG image (bounded by the 10 MiB per-image and 20 MiB per-request encoded byte
   limits). No PDF text layer is extracted.
-- **Resource and crash isolation:** on POSIX (`Linux` and `macOS`), each PDF renders in a forked worker process that
-  closes inherited descriptors past standard streams except its result pipe, sets `setrlimit` CPU, core, file-size, and
-  (on Linux) 1 GiB address-space growth limits, checks progressive-rendering pauses (`IFSDK_PAUSE`), and enforces a
-  10-second wall-clock deadline (`SIGKILL` on timeout) under a serializing lock so one PDF renders at a time and the OS
-  reclaims PDFium's heap after each document.
+- **Resource and crash isolation:** on POSIX (`Linux` and `macOS`), each PDF renders in a fresh worker process, the
+  server's own executable started again (`posix_spawn` on macOS) to run only the renderer, so no framework state is
+  inherited from the multithreaded server. The worker reads the PDF on its standard input and replies on its standard
+  output, closes every other inherited descriptor, sets `setrlimit` CPU, core, file-size, and (on Linux) 1 GiB
+  address-space growth limits before it opens PDFium, checks progressive-rendering pauses (`IFSDK_PAUSE`), and is held
+  to a 10-second wall-clock deadline (`SIGKILL` on timeout) under a serializing lock so one PDF renders at a time and
+  the OS reclaims PDFium's heap after each document. A worker stopped at a limit is reported as `PDF rendering exceeded
+  resource limits or failed`; one killed by any other signal is reported by name, for example `the PDF render worker
+  crashed (SIGSEGV)`.
 
 ### Nemotron 3.5 Super VL on CUDA
 

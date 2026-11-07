@@ -176,7 +176,7 @@ pub fn restore(e: anytype, id: u64) !void {
     try e.stream.synchronize();
 }
 
-/// TF_GLM_KV_SHARE: the pages below `at` a page-sharing store holds, whose rows a kept state leaves on them.
+/// The pages below `at` the shared prompt store holds (TF_KV_SHARE): a kept state's copy leaves them out.
 pub fn heldPages(e: anytype, at: usize) usize {
     const sharing = if (@hasField(@TypeOf(e.*), "share_pages")) e.share_pages else false; // a test's fake engine: none
     return if (sharing) at / @import("cuda_state.zig").page_rows else 0;

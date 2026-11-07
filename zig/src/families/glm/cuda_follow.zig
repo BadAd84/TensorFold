@@ -12,6 +12,7 @@ const dflash = @import("dflash.zig");
 const pages_mod = @import("cuda_pages.zig");
 const sparse = @import("cuda_sparse.zig");
 const one_chunk = @import("cuda_one_chunk.zig");
+const prompt_pair = @import("cuda_prompt_pair.zig");
 const Engine = engine.Engine;
 
 pub const Kind = enum(u32) { begin = 1, prefill, verify, keep, draft, end, drop, release, chunk, shared, image, block, many, redraw, idle, snapshots, pool, disk, costs, chunk_part };
@@ -530,7 +531,7 @@ pub fn follow(e: *Engine, link: *Link) !void {
                 try link.rows(v.rows.ptr, v.rowCount() * vcfg.out_hidden * 2);
             },
             .snapshots => {
-                e.share_pages = h.flags & 1 != 0; // TF_GLM_KV_SHARE on rank 0: a kept state leaves the prompt cache's pages out
+                e.share_pages = h.flags & 1 != 0; // TF_KV_SHARE on rank 0: a kept state leaves the shared store's pages out
                 try @import("cuda_snapshots.zig").agree(e, h.a);
             },
             .disk => try @import("cuda_disk_ranks.zig").step(e, link, h, step.ids),

@@ -517,6 +517,45 @@ pub const Gather = struct {
     }
 };
 
+/// The HCAs to stripe over, at most two: TF_ROCE_HCA, else NCCL_IB_HCA without "=^" prefixes or ":port" suffixes.
+fn hcaNames(io: std.Io, gpa: std.mem.Allocator, names: *[max_hcas][64]u8, lens: *[max_hcas]usize) !u32 {
+    _ = io;
+    _ = gpa;
+    const raw = std.c.getenv("TF_ROCE_HCA") orelse std.c.getenv("NCCL_IB_HCA") orelse return error.NoHca;
+    var n: u32 = 0;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(raw), ',');
+    while (it.next()) |w| {
+        if (n == max_hcas) break;
+        var s = std.mem.trimStart(u8, std.mem.trim(u8, w, " "), "=^");
+        if (std.mem.indexOfScalar(u8, s, ':')) |c| s = s[0..c];
+        if (s.len == 0 or s.len > 63) continue;
+        @memcpy(names[n][0..s.len], s);
+        lens[n] = s.len;
+        n += 1;
+    }
+    if (n == 0) return error.NoHca;
+    return n;
+}
+
+/// The HCA's RoCE v2 IPv4 GID (TF_ROCE_GID_INDEX overrides): its index differs between hosts' tables.
+fn gidIndex(io: std.Io, gpa: std.mem.Allocator, name: []const u8) !c_int {
+    if (@import("sys").getenv("TF_ROCE_GID_INDEX") != null) return @import("sys").environment.read(c_int, "TF_ROCE_GID_INDEX", 0);
+    const cwd = std.Io.Dir.cwd();
+    var i: c_int = 0;
+    while (i < 16) : (i += 1) {
+        var pbuf: [160]u8 = undefined;
+        const tpath = try std.fmt.bufPrint(&pbuf, "/sys/class/infiniband/{s}/ports/1/gid_attrs/types/{d}", .{ name, i });
+        const t = cwd.readFileAlloc(io, tpath, gpa, .limited(64)) catch continue;
+        defer gpa.free(t);
+        if (!std.mem.startsWith(u8, t, "RoCE v2")) continue;
+        const gpath = try std.fmt.bufPrint(&pbuf, "/sys/class/infiniband/{s}/ports/1/gids/{d}", .{ name, i });
+        const gid = cwd.readFileAlloc(io, gpath, gpa, .limited(64)) catch continue;
+        defer gpa.free(gid);
+        if (std.mem.startsWith(u8, gid, "0000:0000:0000:0000:0000:ffff:")) return i;
+    }
+    return error.NoHca;
+}
+
 test "RoCE gather: every rank agrees one cap" {
     // 511 KiB and 512 KiB round to the same slot; a 512 KiB shard must take the same path on every rank
     try std.testing.expectEqual(Layout.of(511 << 10, 2, rails.default_hcas).slot_bytes, Layout.of(512 << 10, 2, rails.default_hcas).slot_bytes);

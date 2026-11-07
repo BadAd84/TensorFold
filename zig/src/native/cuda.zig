@@ -6,19 +6,13 @@ const cuda = @import("cuda");
 const api = @import("engine_api");
 const lanes = @import("lanes");
 const nemotron = @import("nemotron");
-const flashnext = @import("flashnext");
+const glm = @import("glm_cuda");
 const family_memory = @import("cuda_family_memory.zig");
 const pool = family_memory.pool;
 const family_options = @import("cuda_options.zig");
 pub const follow = @import("cuda_follow.zig").follow;
 const lfm2 = @import("lfm2.zig");
-const glm = @import("glm_cuda");
-const minimax = @import("minimax_m3_cuda");
 const qwen35 = @import("qwen35");
-const kolibri1 = @import("kolibri1");
-const gemma4 = @import("gemma4_cuda");
-const spark25 = @import("spark25");
-const dory = @import("dory");
 const Allocator = std.mem.Allocator;
 pub const budget = @import("cuda_memory.zig");
 const lane_backend = @import("cuda_bound.zig");
@@ -30,22 +24,14 @@ const glm_disk = @import("cuda_glm_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
+const cuda_families = @import("cuda_families.zig");
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native, minimax.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, gemma4.native, gemma4.native31, spark25.native, dory.native };
+const registry = cuda_families.registry;
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const serves: []const []const u8 = &.{ "--tp", "--mtp-drafts", "--mtp-confidence", "--policy", "--checkpoint-slots", "--spill-gib" };
-pub const families: []const api.Family = blk: {
-    var out: [registry.len + 4]api.Family = undefined;
-    for (registry, 0..) |F, i| out[i] = .{ .model_type = F.model_type, .formats = F.formats };
-    out[registry.len] = lfm2.family;
-    out[registry.len + 1] = .{ .model_type = "fish_omni", .formats = &.{"fp8-block128"} };
-    out[registry.len + 2] = .{ .model_type = "qwen4", .formats = @import("qwen4").family.native_host.formats };
-    out[registry.len + 3] = .{ .model_type = "qwen4_text", .formats = @import("qwen4").family.native_host.formats };
-    const final = out;
-    break :blk &final;
-};
+pub const families = cuda_families.families;
 const gib: f64 = 1 << 30;
 const cuda_device = @import("cuda_device.zig");
 pub const chip = cuda_device.chip;
@@ -88,6 +74,7 @@ pub const Host = struct {
     dir: []u8 = &.{}, // the model folder the learner writes its lessons into
     follow_fn: ?*const fn (*anyopaque) anyerror!void = null,
     health: ?api.HealthSource = null,
+    startup_phase: @import("cuda_startup_phase.zig").Hook = null,
     recording: ?*record.Recording = null, // --record: the recorder in front of the family's backend
     served: drafted.Served = .{ .backend = undefined, .facts = .{}, .stream_bytes = 0 }, // the family's backend, wrapped with --drafter's draft model when given
     fn followFamily(p: *anyopaque) anyerror!void {
@@ -95,9 +82,7 @@ pub const Host = struct {
         if (h.gpu) |g| try g.ctx.makeCurrent();
         return h.follow_fn.?(h.family);
     }
-    fn readiness(h: *Host, comptime F: type) void {
-        if (@hasDecl(F, "healthy")) h.health = .{ .ctx = h.family, .read = F.healthy };
-    }
+    const readiness = @import("cuda_startup_phase.zig").readiness;
     fn halt(ctx: *anyopaque, reason: []const u8) void {
         const h: *Host = @ptrCast(@alignCast(ctx));
         h.host.halt(reason);
@@ -122,34 +107,16 @@ pub const Host = struct {
     }
     /// The round loop and the lane host over the family's backend, its thread started.
     pub fn serve(h: *Host, comptime F: type, io: std.Io, facts: lanes.Model, rows: u32, info: api.Info, explain: ?api.Explain) !void {
-        h.cfg = try lanes.Config.init(h.gpa, facts, rows, rows - 1);
-        errdefer h.cfg.deinit(h.gpa);
-        if (h.served.prepare != null) try @import("cuda_startup_costs.zig").open(h, &bound);
-        // a drafter's trees: the planner picks a lone stream's lanes, as deep as it drafts
-        if (facts.head_trees) h.cfg.head_lanes = rows - 1;
-        if (facts.head_trees) h.cfg.head_depth = @max(1, facts.drafts);
-        h.clock = .{ .io = io };
-        h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
-        errdefer h.core.deinit();
-        h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
-        // a family's own copy proposer (GLM's TF_GLM_COPY_* rules); null or absent: the core's SuffixLookup
-        if (comptime @hasDecl(F, "copyProposers")) if (F.copyProposers()) |cp| {
-            h.host.proposers = .{ .ctx = cp.ctx, .make = cp.make, .free = cp.free };
-        };
-        h.host.on_thread = .{ .ctx = h, .run = initThread };
-        h.host.memory = if (h.gpu != null) .{ .read = family_memory.read } else null;
-        h.host.explain = explain;
-        h.host.health = @import("cuda_readiness.zig").source(h);
-        h.host.cache = h.store;
-        h.host.warm_quiet = if (info.warm_turns) snaps.warmQuiet(F) orelse 0 else 0;
-        h.host.warm_spares = info.warm_turns and @hasDecl(F, "warm_spares"); // its pass evicts no conversation's latest state
-        if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true, .logprobs = h.inner.vtable.first_row != null, .structures = h.inner.vtable.first_masked != null, .min_budget = nemotron.native.lone_min_budget, .resumes = true };
-        if (h.learn != null) h.host.learner = h.learner();
-        kv_pages.install(&h.kv, &h.host); // the pool's first census, before the engine thread owns the pool
-        errdefer kv_pages.unwatch(&h.kv); // a host that never starts leaves the pool reporting to no one
-        if (h.kv_count) |p| h.host.countPool(p);
-        errdefer h.host.uncountPool();
-        try h.host.start();
+        return @import("cuda_startup_phase.zig").serve(h, F, io, facts, rows, info, explain, .{
+            .bound = &bound,
+            .backend = backend,
+            .initThread = initThread,
+            .loneRun = loneRun,
+            .learner = learner,
+            .warmQuiet = if (info.warm_turns) (snaps.warmQuiet(F) orelse 0) else 0,
+            .warmSpares = info.warm_turns and @hasDecl(F, "warm_spares"),
+            .proposers = if (comptime @hasDecl(F, "copyProposers")) F.copyProposers() else null,
+        });
     }
     /// The family's learner, each call made with the context current on the lane thread.
     fn learner(h: *Host) api.Learner {
@@ -193,10 +160,7 @@ const record = @import("cuda_record.zig");
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const report = platform.optional_libraries.atBoundary();
     defer report.deinit();
-    if (o.fsrRefusal("cuda")) |why| {
-        problem.* = why;
-        return null;
-    }
+    if (try refusals.startup(a, o, problem)) return null;
     if (@import("save_admission.zig").refused(io, o.dir, problem)) return null;
     if (refusals.backend(o)) |why| {
         problem.* = why;
@@ -432,7 +396,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
             if (disk) |rows| rows.deinit();
             h.store = null;
         }
-        try kv_pages.store(F, store, loaded.target, kept); // its snapshot slots, before a disk probe takes one
+        try kv_pages.store(F, store, loaded, kept); // its snapshot slots, before a disk probe takes one
         h.store = store;
         if (o.learn_conversations) if (o.learn) |root| {
             if (F == nemotron.native) try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
@@ -441,7 +405,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
     }
     errdefer if (h.store) |store| kv_pages.closeStore(gpa, store);
-    if (comptime @hasDecl(F, "share_attach")) if (share and cache > 0) {
+    if (comptime @hasDecl(F, "share_attach")) if (@import("cuda_streams.zig").opensStore(F, share, cache)) {
         h.prompts = try prompt_pages.Adapter.open(F, gpa, loaded.target, @intCast(layout.?.page_tokens), try @import("core").kv_prompts.sharing());
     };
     errdefer if (h.prompts) |x| x.close();
@@ -540,14 +504,6 @@ test "CUDA host preserves prefill_step, first-before-draft and chunk-invariance 
     try std.testing.expect(!h.backend().chunk_invariant);
 }
 
-test "every registered family and d1's decision engine are listed for capabilities" {
-    try std.testing.expectEqual(@as(usize, registry.len + 4), families.len);
-    try std.testing.expectEqualStrings("nemotron_h", families[0].model_type);
-    try std.testing.expectEqualStrings("lfm2_vl", families[registry.len].model_type);
-    try std.testing.expectEqualStrings("qwen4", families[registry.len + 2].model_type);
-    try std.testing.expectEqualStrings("qwen4_text", families[registry.len + 3].model_type);
-}
-
 test "a cancel during a long prompt stops it, and the next request's reply is unchanged (#291)" {
     try @import("cuda_prompt_cancel_test.zig").check(Host, Host.serve);
 }
@@ -560,8 +516,8 @@ test "a family's warm wait and warm_spares reach the lane host only with warm tu
     try @import("cuda_warm_serve_test.zig").check(Host, Host.serve);
 }
 
-test "Flash Next refuses tensor-rank draft caching before files or CUDA" {
-    try @import("cuda_flashnext_refusal_test.zig").cache(openWith);
+test "Flash Next takes kept prompt states and drafts together on any rank count" {
+    try @import("cuda_flashnext_refusal_test.zig").cache();
 }
 
 test "Flash Next takes --vision at family admission" {
@@ -597,15 +553,5 @@ test "slide admission: cuda refuses before checkpoint or device access" {
 
 test {
     _ = @import("copy_drafts_cuda_test.zig");
-}
-
-test "GLM capabilities: CUDA offers the EXL3 format its loader accepts" {
-    const config_json = "{\"quantization_config\":{\"quant_method\":\"exl3\",\"bits\":4,\"codebook\":\"mcg\"}}";
-    var why: @import("core").modelopt.Why = .{};
-    try std.testing.expect(glm.exl3.isExl3(std.testing.allocator, config_json));
-    try glm.exl3.admit(std.testing.allocator, config_json, &why);
-    for (families) |family| if (std.mem.eql(u8, family.model_type, "glm5_next")) {
-        for (family.formats) |format| if (std.mem.eql(u8, format, "exl3")) return;
-    };
-    return error.NoExl3Format;
+    _ = cuda_families;
 }

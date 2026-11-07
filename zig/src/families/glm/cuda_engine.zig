@@ -24,9 +24,6 @@ const prompt_pair = @import("cuda_prompt_pair.zig");
 const prompt_slices = @import("cuda_prompt_slices.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
-/// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
-pub const Cancel = struct { ptr: ?*anyopaque, check: *const fn (?*anyopaque) bool };
-
 /// The most drafts a chain holds (decode.DepthPolicy's top depth).
 pub const max_drafts = 3;
 /// A greedy pick as it crosses ranks: (value, id) and padding, so the RoCE gather (16-byte packs) can carry it.
@@ -70,6 +67,7 @@ pub const Kept = types.Kept;
 const Seq = types.Seq;
 const Snap = types.Snap;
 pub const Resume = types.Resume;
+pub const Cancel = types.Cancel;
 pub const Marks = types.Marks;
 
 pub const Engine = struct {
@@ -97,7 +95,6 @@ pub const Engine = struct {
     slices: ?*prompt_slices.Slices = null, // TF_GLM_OVN_FILL_SLICE_MS: a prompt chunk's layer slices (cuda_engine_ovn)
     one: ?*@import("cuda_one_chunk.zig").Capture = null, // TF_GLM_OVN_ONE_CHUNK: marks kept from inside a chunk (read only on)
     checkpoint_digest: [32]u8,
-    l2pf: ?l2pf_mod.Prefetch = null, // TF_GLM_L2PF: a decode window's weight prefetch on a side stream
     settings: ranks.Settings,
     m: fw.Modules,
     stream: cuda.Stream,
@@ -134,7 +131,8 @@ pub const Engine = struct {
     index_split: bool = false, // the next prompt step's indexer rows split across the ranks: rank 0's choice, the chunk's flag 2
     index_splits: u64 = 0, // prompt steps whose indexer rows split (glm-split-check counts them)
     shared_made: bool = false, // e.bs, DRAW1 and SEG_DSA made (cuda_engine_shared.ensure, at the first verify)
-    share_pages: bool = false, // TF_GLM_KV_SHARE: a kept state leaves its prefix's pages to the prompt cache that holds them
+    share_pages: bool = false, // TF_KV_SHARE: a kept state leaves its prefix's pages to the shared store that holds them
+    l2pf: ?l2pf_mod.L2pf = null, // TF_GLM_L2PF: the prefetch's side stream, kernels and table, made after the weights tile
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -190,7 +188,7 @@ pub const Engine = struct {
         const block32 = !exl3.isExl3(gpa, text) and try @import("cuda_experts.zig").wantsBlock32(gpa, text);
         var m = try fw.Modules.load(d, ctx, block32);
         errdefer m.deinit();
-        const pair = prompt_pair.wanted(o.settings.pair, world);
+        const pair = prompt_pair.wanted(o.settings.pair, o.settings.solo, world);
         var pieces = try fw.Pieces.init(d, o.settings.pieces, pair);
         errdefer pieces.deinit();
         if (o.settings.layers > c.layers) return error.BadLayers;
@@ -220,21 +218,12 @@ pub const Engine = struct {
             gpa.free(e.packs.bits);
         }
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
-        var l2pf_problem: []const u8 = "";
-        const l2pf_settings = l2pf_mod.Settings.read(&ranks.environment, &l2pf_problem) catch |err| {
-            std.log.err("glm: {s}", .{l2pf_problem});
-            return err;
-        };
-        if (l2pf_settings.on()) {
-            e.l2pf = try l2pf_mod.Prefetch.build(gpa, d, &e.w, l2pf_settings);
-            const p = &e.l2pf.?;
-            std.log.info("glm: L2 prefetch beside decode windows: sites a {d} MiB, f {d} MiB, o {d} MiB each layer", .{ p.bytes[0] >> 20, p.bytes[1] >> 20, p.bytes[2] >> 20 });
-        }
-        errdefer if (e.l2pf) |*p| p.deinit();
-        e.m.l2pace = try @import("cuda_l2pace.zig").Paced.open(gpa, d, &e.w, l2pf_settings.on()); // TF_GLM_OVN_L2PF_PACED
+        e.m.l2pace = try @import("cuda_l2pace.zig").Paced.open(gpa, d, &e.w, o.settings.l2pf.want(try ctx.capability(), world)); // TF_GLM_OVN_L2PF_PACED rides the L2PF setting
         errdefer if (e.m.l2pace) |*p| p.deinit(); // `m`'s own errdefer frees the copy taken before this was opened
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
+        if (o.settings.l2pf.want(try ctx.capability(), world)) e.l2pf = try l2pf_mod.L2pf.init(gpa, d, &e.w, o.settings.l2pf);
+        errdefer if (e.l2pf) |*p| p.deinit();
         if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
@@ -246,6 +235,8 @@ pub const Engine = struct {
         errdefer if (e.pair) |*p| p.deinit();
         if (o.settings.solo and rank == 0) std.log.info("glm: prompt passes of {d} rows, {d} while another stream decodes", .{ fw.solo_rows, fw.prefill_rows });
         if (world > 1 and rank == 0) std.log.info("glm: a prompt chunk's exchanges in {d} row pieces", .{o.settings.pieces});
+        if (pair) e.pair = try prompt_pair.Pair.init(d, &e.w, &e.bp, &e.pieces, o.capacity);
+        errdefer if (e.pair) |*p| p.deinit();
         e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
         errdefer e.bd.deinit();
         e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
@@ -304,6 +295,7 @@ pub const Engine = struct {
         if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
+        if (e.l2pf) |*p| p.deinit();
         e.w.deinit();
         e.pieces.deinit();
         e.m.deinit();
@@ -322,8 +314,7 @@ pub const Engine = struct {
     pub fn view(e: *Engine, b: *fw.Buffers, out: *[1]fw.Rank) fw.Forward {
         out.* = .{.{ .w = &e.w, .st = &e.cur.st, .b = b }};
         const im: ?fw.ImageRows = if (e.images) |v| .{ .v = v, .slot = e.slot } else null;
-        const twin = if (e.pair) |*p| (if (b == &p.bp) &p.pieces else null) else null;
-        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = if (b == &e.bp) &e.pieces else twin, .split = e.settings.split, .ring = e.settings.ring, .prx = @import("cuda_forward_prx.zig").takes(false), .split_min = e.settings.split_min, .kda_wide = e.settings.kda_wide, .l2pf = if (e.l2pf) |*p| p else null, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .side = @import("cuda_moe_side.zig").pick(e, b) };
+        return .{ .d = e.d, .m = &e.m, .stream = e.stream, .ranks = out, .exchange = e.exchange(), .pieces = prompt_pair.piecesOf(e, b), .split = e.settings.split, .ring = e.settings.ring, .kda_wide = e.settings.kda_wide, .images = im, .taps = if (e.drafter) |dr| dr.taps(b == &e.bp) else null, .l2pf = if (e.l2pf) |*p| p else null };
     }
 
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
@@ -456,17 +447,8 @@ pub const Engine = struct {
         return first;
     }
 
-    /// The chunk gate on every rank: a kept state at the mark, the heat wait, rank 0's cancel; the id exchanged first.
-    pub fn gate(e: *Engine, cancel: ?Cancel) !void {
-        try snapshots.gate(e);
-        if (e.heat_gate.bands != null) {
-            var w: Wait = .{ .e = e, .cancel = cancel };
-            const before = e.heat_gate.waited_s;
-            e.heat_gate.waitUntil(Wait.read, Wait.sleep, &w, .{ .ptr = &w, .check = Wait.stop }) catch |err| return w.failed orelse err;
-            if (e.heat_gate.waited_s > before) heat.note(e.heat_gate.waited_s - before);
-        }
-        if (try e.shared(if (cancel) |c| @floatFromInt(@intFromBool(c.check(c.ptr))) else 0) > 0) return error.Cancelled;
-    }
+    pub const gate = @import("cuda_engine_gate.zig").gate;
+    pub const shared = @import("cuda_engine_gate.zig").shared;
 
     pub const stateBytes = snapshots.bytes;
     pub const prepareSnapshots = snapshots.prepare;
@@ -480,17 +462,6 @@ pub const Engine = struct {
     const freeSnap = snapshots.free;
 
     /// The ranks' maximum of `v` (an all-reduce on the engine's stream).
-    pub fn shared(e: *Engine, v: f64) !f64 {
-        var x = v;
-        try e.shared_buf.uploadAsync(0, std.mem.asBytes(&x), e.stream.handle);
-        const stamp = prof_mod.span(e.profiling_prompt, e.stream, .control_reduce);
-        try e.lib.check(e.lib.api.ncclAllReduce(e.shared_buf.ptr, e.shared_buf.ptr, 1, .f64, .max, e.comm, e.stream.handle), "ncclAllReduce");
-        stamp.end();
-        try e.stream.synchronize();
-        try e.shared_buf.download(0, std.mem.asBytes(&x));
-        return x;
-    }
-
     const Wait = @import("cuda_engine_wait.zig").Wait;
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
