@@ -241,7 +241,16 @@ pub fn probeServed(comptime Tri: type, gpa: std.mem.Allocator, driver: *cuda.Dri
     }
     std.log.info("flashnext: window self-check: {d} of {d} rows byte-equal to their one-token steps (widths 1-{d})", .{ compared - differing, compared, rows });
     if (first_bad > 0) std.log.warn("flashnext: width {d} is the first with rows differing from their one-token steps", .{first_bad});
-    return if (differing == 0) rows else 32;
+    if (differing == 0) return rows;
+    // serve the largest proven-exact prefix: every width to it has all rows byte-equal, past it some differ
+    var run: usize = 0;
+    for (bad[0..rows], 0..) |b, i| {
+        if (b != 0) break;
+        run = i + 1;
+    }
+    const served = @max(@min(run, rows), 32);
+    std.log.info("flashnext: widths 1-{d} are row-equal at every row; serving {d}-row copy windows", .{ run, served });
+    return served;
 }
 
 /// A sequence's caches back to empty (the check reruns a prompt on one allocation).
