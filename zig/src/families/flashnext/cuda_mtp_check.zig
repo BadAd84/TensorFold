@@ -198,6 +198,7 @@ pub fn windowCheck(comptime Tri: type, o: Ops(Tri), seq: *prompt.Seq, d: *Draft,
     }
     var total: usize = 0;
     for (widths, bad) |w, *b| {
+        d.settle(seq); // the last window's spares back to the sequence before its reset
         seq.fed = 0;
         seq.history = .{ o.e.eos, o.e.eos };
         try resetSeq(seq, o.e.stream.*);
