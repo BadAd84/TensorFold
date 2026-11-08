@@ -163,6 +163,86 @@ pub fn check(comptime Tri: type, gpa: std.mem.Allocator, io: std.Io, driver: *cu
     return same;
 }
 
+/// One row's scores read back from the device.
+fn downloadRow(stream: cuda.Stream, dst: []u16, src: u64) !void {
+    try stream.synchronize();
+    try cuda.memory.download(stream.d, src, std.mem.sliceAsBytes(dst));
+}
+
+/// The copied continuations' row invariance, proved on the weights: for every width w in `widths`
+/// (ascending), the continuation's first w tokens run as one verify window and each row's scores are
+/// compared byte for byte with that row's one-token step. The 32- and the 64-row paths overlap wherever a
+/// window is common to both, so equal rows at every width is the overlap proof. `bad` takes each width's
+/// differing row count (its length must match `widths`'); the return is every width's differing total.
+/// `seq` and `d` are scratch reused across widths.
+pub fn windowCheck(comptime Tri: type, o: Ops(Tri), seq: *prompt.Seq, d: *Draft, prompt_ids: []const u32, widths: []const usize, bad: []usize) !usize {
+    const gpa = o.e.gpa;
+    const rows = widths[widths.len - 1];
+    var cont: [max_rows]u32 = undefined;
+    var ref = try gpa.alloc(u16, rows * vocab);
+    defer gpa.free(ref);
+    const row = try gpa.alloc(u16, vocab);
+    defer gpa.free(row);
+    const got = try gpa.alloc(u16, vocab);
+    defer gpa.free(got);
+    // the greedy continuation and each row's one-token step's scores
+    try o.e.predict(Tri, o.tri, seq, prompt_ids);
+    for (row, 0..) |*v, i| v.* = std.mem.readInt(u16, seq.logits[2 * i ..][0..2], .little);
+    cont[0] = try drawRow(gpa, row, null, seq.fed, null);
+    for (0..rows) |r| {
+        var one = [_]u32{cont[r]};
+        try o.e.predict(Tri, o.tri, seq, &one);
+        for (row, 0..) |*v, i| v.* = std.mem.readInt(u16, seq.logits[2 * i ..][0..2], .little);
+        @memcpy(ref[r * vocab ..][0..vocab], row);
+        if (r + 1 < rows) cont[r + 1] = try drawRow(gpa, row, null, seq.fed, null);
+    }
+    var total: usize = 0;
+    for (widths, bad) |w, *b| {
+        seq.fed = 0;
+        seq.history = .{ o.e.eos, o.e.eos };
+        try resetSeq(seq, o.e.stream.*);
+        try o.e.predict(Tri, o.tri, seq, prompt_ids);
+        for (row, 0..) |*v, i| v.* = std.mem.readInt(u16, seq.logits[2 * i ..][0..2], .little);
+        if ((try drawRow(gpa, row, null, seq.fed, null)) != cont[0]) return error.FirstTokenDiffers;
+        try o.verify(seq, d, cont[0..w]);
+        var differ: usize = 0;
+        for (0..w) |r| {
+            try downloadRow(o.e.stream.*, got, d.logits.ptr + r * vocab * 2);
+            total += 1;
+            if (!std.mem.eql(u16, got, ref[r * vocab ..][0..vocab])) differ += 1;
+        }
+        b.* = differ;
+    }
+    return total;
+}
+
+/// The boot self-check: the full width sweep to `rows` over a synthetic prompt. `rows` when every row of
+/// every width scored byte-equal to its one-token step, else 32 (the upstream window); the summary and the
+/// first differing width go to the log.
+pub fn probeServed(comptime Tri: type, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, tri: Tri, e: *prompt.Engine, h: *Head, rows: usize) !usize {
+    var ids: [96]u32 = undefined;
+    for (&ids, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 200_000);
+    const cap = ids.len + rows + max_rows;
+    var seq = try e.newSeq(cap);
+    defer seq.deinit(gpa);
+    var d = try Draft.init(gpa, driver, stream.*, cap, h.ids.len, e.chunk, e.heads);
+    defer d.deinit();
+    const o: Ops(Tri) = .{ .e = e, .tri = tri, .h = h };
+    var widths: [max_rows]usize = undefined;
+    for (&widths, 0..) |*w, i| w.* = i + 1;
+    var bad: [max_rows]usize = @splat(0);
+    const compared = try windowCheck(Tri, o, &seq, &d, &ids, widths[0..rows], bad[0..rows]);
+    var differing: usize = 0;
+    var first_bad: usize = 0;
+    for (bad[0..rows], 0..) |b, i| {
+        differing += b;
+        if (b > 0 and first_bad == 0) first_bad = i + 1;
+    }
+    std.log.info("flashnext: window self-check: {d} of {d} rows byte-equal to their one-token steps (widths 1-{d})", .{ compared - differing, compared, rows });
+    if (first_bad > 0) std.log.warn("flashnext: width {d} is the first with rows differing from their one-token steps", .{first_bad});
+    return if (differing == 0) rows else 32;
+}
+
 /// A sequence's caches back to empty (the check reruns a prompt on one allocation).
 fn resetSeq(seq: *prompt.Seq, stream: cuda.Stream) !void {
     for (seq.conv) |*b| try b.fill8(0, stream.handle);

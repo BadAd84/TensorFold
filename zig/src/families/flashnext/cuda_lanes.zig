@@ -226,11 +226,11 @@ pub fn Namespace(comptime Tri: type) type {
                 return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .first_before_draft = mtp.firstEarly(), .vtable = if (self.ranks == null) &scoring_table else &ranked_table };
             }
 
-            /// With the head: chains of up to 16 rows cut by its confidence, copies of up to 32; else one-row rounds.
+            /// With the head: chains of up to 16 rows cut by its confidence, copies of up to 64; else one-row rounds.
             pub fn facts(self: *const Cuda) lanes.Model {
                 const drafting = self.head != null;
                 return .{
-                    .exact_width = if (drafting) mtp.max_rows else 2,
+                    .exact_width = if (drafting) @intCast(mtp.window()) else 2,
                     .first_copy_rows = if (drafting) mtp.max_chain + 1 else 0,
                     .gpu_tokens = false,
                     .mtp = drafting,
@@ -475,7 +475,7 @@ pub fn Namespace(comptime Tri: type) type {
                 const l = try self.lane(w.stream);
                 const rows = w.rows();
                 if (l.draft != null) {
-                    if (rows > mtp.max_rows) return error.WindowTooWide;
+                    if (rows > mtp.window()) return error.WindowTooWide;
                     for (w.positions, 0..) |p, r| if (p != l.seq.fed + 1 + r) return error.PositionMismatch;
                     row_ids[wi][0] = w.pending;
                     @memcpy(row_ids[wi][1..rows], w.tokens);

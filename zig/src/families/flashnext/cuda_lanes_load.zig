@@ -88,6 +88,19 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
     }
     errdefer if (own.head) |h| h.deinit();
+    // the copied continuations' row invariance on the real weights, before anything serves: every row of
+    // every width to the served window must score byte-equal to its one-token step. A differing row falls
+    // back to the upstream 32-row windows for this load; a probe that cannot run leaves max_rows and says
+    // so (TF_FLASHNEXT_WINDOW_CHECK=0 skips the probe).
+    const probe = if (std.c.getenv("TF_FLASHNEXT_WINDOW_CHECK")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+    if (own.head != null and o.drafts and o.tp == 1 and probe) {
+        const tri = own.tri();
+        mtp.served_rows = @import("cuda_mtp_check.zig").probeServed(@TypeOf(tri), gpa, driver, &own.stream, tri, own.engine, own.head.?, mtp.max_rows) catch |err| blk: {
+            std.log.warn("flashnext: the window self-check did not run ({s}); serving {d}-row copy windows unprobed", .{ @errorName(err), mtp.max_rows });
+            break :blk mtp.max_rows;
+        };
+        if (mtp.served_rows != mtp.max_rows) std.log.warn("flashnext: serving {d}-row copy windows after the self-check", .{mtp.served_rows});
+    }
     @import("cuda_prompt_wt.zig").dropPageCache(io, dir, e.ngram.files.items);
     const window = @min(o.context + mtp.max_rows, prompt.max_tokens);
     // and an attention block's block scores at the window (64 MiB at 262,144 tokens)
@@ -118,7 +131,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         .vision = own.vision,
         .backend = own.backend(),
         .facts = own.facts(),
-        .rows = if (own.head != null) mtp.max_rows else 2,
+        .rows = if (own.head != null) @intCast(mtp.window()) else 2,
         .prompt_rows = @intCast(own.engine.chunk),
         .stream_bytes = stream_bytes,
         .ctx = own,

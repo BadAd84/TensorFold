@@ -80,8 +80,19 @@ test "the stop rule: per draft above zero, the running product below it, every d
     var all: Stop = .{ .c = 0 };
     try std.testing.expect(all.take(5, 0.01).propose and all.take(6, 0.01).more);
 }
-/// A verify window's rows at most: the pending token and a chain, or a copied continuation.
-pub const max_rows: usize = 32;
+/// A verify window's rows at most: the pending token and up to 63 drafts. The MTP chain keeps `max_chain`
+/// and a copied continuation takes the rest; the row kernels take any row count and a shared verify pass
+/// already runs `round_rows`, so a 64-row window runs the same kernels at a row count they serve today.
+pub const max_rows: usize = 64;
+/// The window a load serves: `max_rows`, or 32 when the boot self-check found a row whose scores differ
+/// from its one-token step. Buffers hold `max_rows` rows either way; the facts and the window checks
+/// read `window`.
+pub var served_rows: usize = max_rows;
+
+pub fn window() usize {
+    return served_rows;
+}
+
 /// A drafting round's rows at most: a shared verify's (TF_FLASHNEXT_WINDOW_ROWS lowers it; 0: each alone).
 pub const round_rows: usize = 64;
 /// qmm.split_for(2560, 2560): fc_embedding and fc_hidden sum K in four slices, in order.
@@ -420,7 +431,7 @@ test "a masked row draws only allowed tokens, greedy the best of them" {
 
 test "draft chains fit one verify window while the default stays six" {
     try std.testing.expectEqual(@as(usize, 16), max_chain + 1);
-    try std.testing.expectEqual(@as(usize, 32), max_rows);
+    try std.testing.expectEqual(@as(usize, 64), max_rows);
     try std.testing.expect(max_chain < max_rows and max_rows <= round_rows);
     try std.testing.expectEqual(@as(usize, 6), default_depth);
     try std.testing.expect(default_depth <= max_chain);
