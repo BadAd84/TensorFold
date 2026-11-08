@@ -217,9 +217,7 @@ pub fn windowCheck(comptime Tri: type, o: Ops(Tri), seq: *prompt.Seq, d: *Draft,
     return total;
 }
 
-/// The boot self-check: the full width sweep to `rows` over a synthetic prompt. `rows` when every row of
-/// every width scored byte-equal to its one-token step, else 32 (the upstream window); the summary and the
-/// first differing width go to the log.
+/// The boot self-check sweeps widths to `rows` on a synthetic prompt: `rows` when every row is byte-equal to its one-token step, else 32.
 pub fn probeServed(comptime Tri: type, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, tri: Tri, e: *prompt.Engine, h: *Head, rows: usize) !usize {
     var ids: [96]u32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 200_000);
