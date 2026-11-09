@@ -169,12 +169,7 @@ fn downloadRow(stream: cuda.Stream, dst: []u16, src: u64) !void {
     try cuda.memory.download(stream.d, src, std.mem.sliceAsBytes(dst));
 }
 
-/// The copied continuations' row invariance, proved on the weights: for every width w in `widths`
-/// (ascending), the continuation's first w tokens run as one verify window and each row's scores are
-/// compared byte for byte with that row's one-token step. The 32- and the 64-row paths overlap wherever a
-/// window is common to both, so equal rows at every width is the overlap proof. `bad` takes each width's
-/// differing row count (its length must match `widths`'); the return is every width's differing total.
-/// `seq` and `d` are scratch reused across widths.
+/// Each width's rows must score byte-equal to their one-token steps; `bad` takes each width's differing count.
 pub fn windowCheck(comptime Tri: type, o: Ops(Tri), seq: *prompt.Seq, d: *Draft, prompt_ids: []const u32, widths: []const usize, bad: []usize) !usize {
     const gpa = o.e.gpa;
     const rows = widths[widths.len - 1];
@@ -217,7 +212,7 @@ pub fn windowCheck(comptime Tri: type, o: Ops(Tri), seq: *prompt.Seq, d: *Draft,
     return total;
 }
 
-/// The boot self-check sweeps widths to `rows` on a synthetic prompt: `rows` when every row is byte-equal to its one-token step, else 32.
+/// The boot self-check: sweeps widths to `rows` on a synthetic prompt; returns the largest row-exact width.
 pub fn probeServed(comptime Tri: type, gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, tri: Tri, e: *prompt.Engine, h: *Head, rows: usize) !usize {
     var ids: [96]u32 = undefined;
     for (&ids, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 200_000);

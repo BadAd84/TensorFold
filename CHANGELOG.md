@@ -2,6 +2,10 @@
 
 Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
 
+## Unreleased
+
+- Flash Next on CUDA: a lone stream's copy window grows past the MTP chain's drafts to the boot self-check's largest row-exact width (#9999); on GB10 that is 48 rows against the 32-row upstream default, and a verify window carrying a pending-row log takes the row-by-row DeltaNet path, which the fused kernel it replaced does not serve.
+
 ## 1.2.4
 
 - Docs: four subcommand-flag fixes checked against the code: `slide audit --threshold`'s range, `benchmark --context` and `--kv-cache`, `info` on Flash Next, and `run --device` and `--carveout` on CUDA builds (#2348).

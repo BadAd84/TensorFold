@@ -88,10 +88,7 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         if (std.c.getenv("TF_FLASHNEXT_CONFIDENCE")) |v| own.confidence = std.fmt.parseFloat(f64, std.mem.span(v)) catch mtp.default_confidence;
     }
     errdefer if (own.head) |h| h.deinit();
-    // the copied continuations' row invariance on the real weights, before anything serves: every row of
-    // every width to the served window must score byte-equal to its one-token step. A differing row falls
-    // back to the upstream 32-row windows for this load; a probe that cannot run leaves max_rows and says
-    // so (TF_FLASHNEXT_WINDOW_CHECK=0 skips the probe).
+    // the boot self-check proves the copied continuations' row invariance; TF_FLASHNEXT_WINDOW_CHECK=0 skips it
     const probe = if (std.c.getenv("TF_FLASHNEXT_WINDOW_CHECK")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
     if (own.head != null and o.drafts and o.tp == 1 and probe) {
         const tri = own.tri();

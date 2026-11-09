@@ -257,7 +257,7 @@ pub fn Pass(comptime Tri: type) type {
                 try self.copy(keep.proj, s.proj, n * pw * 2);
                 try self.copy(keep.hist, self.seq.conv[li].ptr, (gdn.taps - 1) * cd * 2);
             }
-            // one-block chain's bits every row (conv, norms, gates, recurrence, gated norm); a pending-row log needs the row path
+            // the fused kernel writes no pending-row log: a log-carrying window takes the row-by-row path
             const fused = self.lanes.len == 0 and keep.log == 0 and (n >= 64 or marks.inPass(self)) and gdn_fused.on();
             const cuts = try marks.cuts(self, li, fused);
             if (fused and keep.log != 0) return error.UnexpectedTensor;

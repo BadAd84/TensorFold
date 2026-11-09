@@ -348,30 +348,30 @@ test "a draft at 65,536 tokens and 1,536-row chunks: the head's cache whole, sav
     const draft_n = 32768;
     // the head's cache: two KV heads of 256, 128 indexer keys a position, a pooled row a block of 4
     const head: usize = cap * (2 * 2 * 256 * 2 + 128 * 2) + cap / 4 * 128 * 2;
-    // streams rows, the head's output row, a window's scores, the draft head's, best values
-    const buffers: usize = rows * 4 * 2560 * 2 + 4 * 2560 * 2 + 32 * 248320 * 2 + draft_n * 2 + best_bytes;
-    // saved: 36 conv windows, 36 layers' 32 projection rows, the n-gram tail and 32 n-gram rows; 36 spare states
-    const tail: usize = 9 * 4 * 2560 * 2 + 32 * 4 * 2560 * 2;
-    const full: usize = 36 * 3 * 10240 * 2 + 36 * 32 * 16480 * 2 + tail + 36 * 48 * 128 * 128 * 4;
-    const half: usize = 36 * 3 * 5120 * 2 + 36 * 32 * 8240 * 2 + tail + 36 * 24 * 128 * 128 * 4;
+    // streams rows, the head's output row, a window's scores (max_rows), the draft head's, best values
+    const buffers: usize = rows * 4 * 2560 * 2 + 4 * 2560 * 2 + max_rows * 248320 * 2 + draft_n * 2 + best_bytes;
+    // saved: 36 conv windows, 36 layers' max_rows projection rows, the n-gram tail and max_rows n-gram rows
+    const tail: usize = 9 * 4 * 2560 * 2 + max_rows * 4 * 2560 * 2;
+    const full: usize = 36 * 3 * 10240 * 2 + 36 * max_rows * 16480 * 2 + tail + 36 * 48 * 128 * 128 * 4;
+    const half: usize = 36 * 3 * 5120 * 2 + 36 * max_rows * 8240 * 2 + tail + 36 * 24 * 128 * 128 * 4;
     try std.testing.expectEqual(head + buffers + full, Draft.bytes(cap, draft_n, rows, .full));
     try std.testing.expectEqual(head + buffers + half, Draft.bytes(cap, draft_n, rows, .half));
-    try std.testing.expectEqual(@as(usize, 356_905_472), Draft.bytes(cap, draft_n, rows, .full));
-    try std.testing.expectEqual(@as(usize, 280_191_488), Draft.bytes(cap, draft_n, rows, .half));
+    try std.testing.expectEqual(@as(usize, 411_436_032), Draft.bytes(cap, draft_n, rows, .full));
+    try std.testing.expectEqual(@as(usize, 315_737_088), Draft.bytes(cap, draft_n, rows, .half));
     // with the stream's own caches at half the heads
-    try std.testing.expectEqual(@as(usize, 1_395_069_440), sizes.seqBytes(cap, .half) + Draft.bytes(cap, draft_n, rows, .half));
+    try std.testing.expectEqual(@as(usize, 1_430_615_040), sizes.seqBytes(cap, .half) + Draft.bytes(cap, draft_n, rows, .half));
 }
 
 test "the saved pieces follow one another at the model's heads, and the spares hold its states" {
     for ([_]Heads{ .full, .half }) |h| {
         const l = Draft.Layout.of(h);
         try std.testing.expectEqual(@as(usize, 36 * 3 * h.convDim() * 2), l.proj_at);
-        try std.testing.expectEqual(l.proj_at + 36 * 32 * h.projWidth() * 2, l.tail_at);
+        try std.testing.expectEqual(l.proj_at + 36 * max_rows * h.projWidth() * 2, l.tail_at);
         try std.testing.expectEqual(l.tail_at + 9 * 4 * 2560 * 2, l.nrow_at);
-        try std.testing.expectEqual(l.nrow_at + 32 * 4 * 2560 * 2, l.saved);
+        try std.testing.expectEqual(l.nrow_at + max_rows * 4 * 2560 * 2, l.saved);
         try std.testing.expectEqual(sizes.stateBytes(h), l.state);
         try std.testing.expect(l.heads.eql(h));
     }
-    try std.testing.expectEqual(@as(usize, 41_021_440), Draft.Layout.of(.full).saved);
-    try std.testing.expectEqual(@as(usize, 20_930_560), Draft.Layout.of(.half).saved);
+    try std.testing.expectEqual(@as(usize, 79_646_720), Draft.Layout.of(.full).saved);
+    try std.testing.expectEqual(@as(usize, 40_570_880), Draft.Layout.of(.half).saved);
 }

@@ -80,13 +80,9 @@ test "the stop rule: per draft above zero, the running product below it, every d
     var all: Stop = .{ .c = 0 };
     try std.testing.expect(all.take(5, 0.01).propose and all.take(6, 0.01).more);
 }
-/// A verify window's rows at most: the pending token and up to 63 drafts. The MTP chain keeps `max_chain`
-/// and a copied continuation takes the rest; the row kernels take any row count and a shared verify pass
-/// already runs `round_rows`, so a 64-row window runs the same kernels at a row count they serve today.
+/// A verify window's rows at most: the pending token and up to 63 drafts (the chain keeps `max_chain`).
 pub const max_rows: usize = 64;
-/// The window a load serves: `max_rows`, or 32 when the boot self-check found a row whose scores differ
-/// from its one-token step. Buffers hold `max_rows` rows either way; the facts and the window checks
-/// read `window`.
+/// The window a load serves: the boot self-check's largest row-exact prefix (buffers hold `max_rows`).
 pub var served_rows: usize = max_rows;
 
 pub fn window() usize {
