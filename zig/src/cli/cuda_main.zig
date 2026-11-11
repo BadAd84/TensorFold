@@ -24,7 +24,8 @@ const usage =
     \\         [--context N] [--ignore-eos] [--eager] [--costs MS1,...,MSW,LEVEL]   (W window rows: 32 for a latent MoE, else 16)
     \\         [--loops N]   (a Dory checkpoint: passes over its recurrent block, 1-4; default its n_recurrent_loops)
     \\         [--carveout]   (KV caches in GB10's display memory first; also TF_CUDA_CARVEOUT=1,
-    \\         sized by TF_CUDA_CARVEOUT_MIB (default 1792), card TF_DRM_CARD (default /dev/dri/card0))
+    \\         sized by TF_CUDA_CARVEOUT_MIB (default 1792), card TF_DRM_CARD (default /dev/dri/card0),
+    \\         source TF_CUDA_CARVEOUT_SOURCE: drm (default) or daemon, whose socket and key are TF_CUDA_CARVEOUT_SOCKET/TF_CUDA_CARVEOUT_KEY)
     \\         [--tokens-file PATH] [--segments N]   (N whole 2048-row prompt chunks a call as staggered segments,
     \\         1-4; default TF_CUDA_SEGMENTS, else 1)
     \\       tensorfold segments MODEL IDS_FILE... [--counts 1,2,3,4] [--repeat N] [--max-tokens N] [--profile]
@@ -209,14 +210,21 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const env = init.environ_map;
     var carve: ?cuda.Carveout = null;
-    if (try cuda.carveout.requested(opts.carveout, env.get("TF_CUDA_CARVEOUT"), env.get("TF_CUDA_CARVEOUT_MIB"))) |bytes| {
+    const carve_flag = opts.carveout or std.mem.eql(u8, env.get("TF_CUDA_CARVEOUT") orelse "0", "1");
+    if (try cuda.carveout.requested(carve_flag, env.get("TF_CUDA_CARVEOUT_SOURCE"), env.get("TF_CUDA_CARVEOUT_SOCKET"), env.get("TF_CUDA_CARVEOUT_KEY"), env.get("TF_CUDA_CARVEOUT_KEY_FILE"), env.get("TF_CUDA_CARVEOUT_MIB"))) |want| {
         const card = try init.arena.allocator().dupeSentinel(u8, env.get("TF_DRM_CARD") orelse cuda.carveout.default_card, 0);
-        carve = cuda.Carveout.open(&driver, card, bytes) catch |err| {
-            std.log.err("display carveout of {d} MiB from {s}: {t} (needs nvidia_drm modeset=1, the card's device node and no display in use)", .{ bytes >> 20, card, err });
-            return err;
+        carve = switch (want.backend) {
+            .drm => cuda.Carveout.open(&driver, card, want.bytes) catch |err| {
+                std.log.err("display carveout of {d} MiB from {s}: {t} (needs nvidia_drm modeset=1, the card's device node and no display in use)", .{ want.bytes >> 20, card, err });
+                return err;
+            },
+            .daemon => cuda.Carveout.openDaemon(&driver, want.socket, want.key, want.bytes) catch |err| {
+                std.log.err("display carveout of {d} MiB from the daemon at {s}: {t} (run the daemon, set TF_CUDA_CARVEOUT_SOCKET/TF_CUDA_CARVEOUT_KEY, or TF_CUDA_CARVEOUT_SOURCE=drm)", .{ want.bytes >> 20, want.socket, err });
+                return err;
+            },
         };
-        const io_flag = if (carve.?.flags & cuda.abi.host_register_iomemory != 0) "|IOMEMORY" else "";
-        std.debug.print("display carveout: {d} MiB from {s}, registered DEVICEMAP{s}\n", .{ bytes >> 20, card, io_flag });
+        const io_flag = if (want.backend == .drm and carve.?.flags & cuda.abi.host_register_iomemory != 0) "|IOMEMORY" else "";
+        std.debug.print("display carveout: {d} MiB, {s}, registered DEVICEMAP{s}\n", .{ carve.?.bytes() >> 20, @tagName(carve.?.backend), io_flag });
     }
     defer if (carve) |*c| c.close();
     const cmd = args[1];

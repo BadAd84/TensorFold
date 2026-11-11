@@ -55,6 +55,12 @@ const valid = [_]Case{
     .{ .name = "TF_CUDA_SEGMENTS", .raw = "4", .n = 4 },
     .{ .name = "TF_CUDA_CARVEOUT", .raw = "0", .n = 0 },
     .{ .name = "TF_CUDA_CARVEOUT", .raw = "1", .n = 1 },
+    .{ .name = "TF_DRM_CARD", .raw = "/dev/dri/card0", .n = 0 },
+    .{ .name = "TF_CUDA_CARVEOUT_SOURCE", .raw = "drm", .n = 0 },
+    .{ .name = "TF_CUDA_CARVEOUT_SOURCE", .raw = "daemon", .n = 1 },
+    .{ .name = "TF_CUDA_CARVEOUT_SOCKET", .raw = "/run/dispram/dispram.sock", .n = 0 },
+    .{ .name = "TF_CUDA_CARVEOUT_KEY", .raw = "kindlingai_1", .n = 0 },
+    .{ .name = "TF_CUDA_CARVEOUT_KEY_FILE", .raw = "/etc/spark-attic/key", .n = 0 },
     .{ .name = "TF_CUDA_CARVEOUT_MIB", .raw = "1792", .n = 1792 },
     .{ .name = "TF_MTP_DRAFTS", .raw = "0", .n = 0 },
     .{ .name = "TF_MTP_DRAFTS", .raw = "4294967295", .n = std.math.maxInt(u32) },
@@ -99,6 +105,34 @@ const valid = [_]Case{
     .{ .name = "TF_SLIDE_FORGET_FAIL", .raw = " 0 ", .n = 0 },
 };
 
+/// An environment whose carveout flag is set by the test, for the settings the daemon source owns.
+const CarveEnv = struct {
+    name: []const u8,
+    raw: ?[]const u8,
+    carveout: []const u8,
+    pub fn get(v: CarveEnv, n: []const u8) ?[]const u8 {
+        if (std.mem.eql(u8, n, v.name)) return v.raw;
+        if (std.mem.eql(u8, n, "TF_CUDA_CARVEOUT")) return v.carveout;
+        return null;
+    }
+};
+
+test "environment: the daemon's settings are skipped while the carveout is off, and refused by name when it is on" {
+    const names = [_][]const u8{
+        "TF_CUDA_CARVEOUT_SOURCE",
+        "TF_CUDA_CARVEOUT_SOCKET",
+        "TF_CUDA_CARVEOUT_KEY",
+        "TF_CUDA_CARVEOUT_KEY_FILE",
+    };
+    for (names) |name| {
+        const off = try e.refusal(a, CarveEnv{ .name = name, .raw = "typo\x1b", .carveout = "0" }, all);
+        try t.expectEqual(@as(?[]const u8, null), off);
+        const why = (try e.refusal(a, CarveEnv{ .name = name, .raw = "typo\x1b", .carveout = "1" }, all)).?;
+        defer a.free(why);
+        try t.expect(std.mem.indexOf(u8, why, name) != null);
+    }
+}
+
 test "environment: valid forms remain raw numbers before existing consumer clamps and defaults" {
     for (valid) |c| {
         try t.expectEqual(@as(?u64, c.n), try e.parse(c.name, c.raw));
@@ -124,6 +158,7 @@ test "environment: range, enum, whitespace and native prompt geometry refusals a
         .{ "TENSORFOLD_PREFIX_WAIT_MS", "+1" }, .{ "TENSORFOLD_RESTORE_PREFETCH", "+1" },
         .{ "TF_CUDA_SEGMENTS", "0" },           .{ "TF_CUDA_SEGMENTS", "5" },
         .{ "TF_CUDA_CARVEOUT", "true" },        .{ "TF_CUDA_CARVEOUT", "01" },
+        .{ "TF_CUDA_CARVEOUT_SOURCE", "1" },   .{ "TF_CUDA_CARVEOUT_SOURCE", "drm " },
         .{ "TF_CUDA_CARVEOUT_MIB", "0" },       .{ "TF_CUDA_CARVEOUT_MIB", "18446744073709551615" },
         .{ "TF_ROCE_GID_INDEX", "2147483648" }, .{ "TF_PROMPT_ROWS", "16" },
         .{ "TF_PROMPT_ROWS", "129" },           .{ "TF_PROMPT_ROWS", "2064" },

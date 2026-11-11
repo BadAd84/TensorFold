@@ -26,24 +26,66 @@ pub const ioctl_create_dumb = linux.IOCTL.IOWR('d', 0xB2, CreateDumb);
 pub const ioctl_map_dumb = linux.IOCTL.IOWR('d', 0xB3, MapDumb);
 pub const ioctl_destroy_dumb = linux.IOCTL.IOWR('d', 0xB4, DestroyDumb);
 
-pub const Error = DriverError || error{ CardUnavailable, DumbBufferRefused, MapRefused, RegisterRefused };
+pub const Error = DriverError || error{ CardUnavailable, DumbBufferRefused, MapRefused, RegisterRefused, NoDaemon, DaemonRefused, SliceTooSmall, VmmUnavailable, MapFailed };
+
+/// Which way the display memory is obtained: a DRM dumb buffer, or a display-memory daemon lending its reservation.
+pub const Backend = enum { drm, daemon };
+
+/// What TF_CUDA_CARVEOUT asked for: the backend and the size in bytes (whole framebuffer rows for drm).
+pub const Request = struct { backend: Backend, bytes: usize, socket: []const u8 = default_socket, key: []const u8 = default_key };
 
 /// `bytes` in whole framebuffer rows; zero below one row.
 pub fn roundBytes(bytes: usize) usize {
     return bytes / row_bytes * row_bytes;
 }
 
-/// The size the options ask for: `flag` or `on` = "1" turns it on, `mib` sizes it; null means off.
-pub fn requested(flag: bool, on: ?[]const u8, mib: ?[]const u8) error{ InvalidCharacter, Overflow, CarveoutTooSmall, InvalidEnvironment }!?usize {
-    if (!flag) _ = try @import("sys").environment.parse("TF_CUDA_CARVEOUT", on);
-    const wanted = flag or (if (on) |v| std.mem.eql(u8, v, "1") else false);
-    if (!wanted) return null;
-    const m = mib orelse return default_bytes;
-    if (m.len == 0) return default_bytes;
+/// The options: the flag turns it on, the source picks the card or a daemon, plus that daemon's socket and key.
+pub fn requested(flag: bool, source: ?[]const u8, socket: ?[]const u8, key: ?[]const u8, key_file: ?[]const u8, mib: ?[]const u8) error{ InvalidCharacter, Overflow, CarveoutTooSmall, InvalidEnvironment }!?Request {
+    // Off: not this source's business, the walk skips them too. On: a mistyped value is refused here and at startup.
+    if (!flag) return null;
+    _ = try @import("sys").environment.parse("TF_CUDA_CARVEOUT_SOURCE", source);
+    _ = try @import("sys").environment.parse("TF_CUDA_CARVEOUT_SOCKET", socket);
+    _ = try @import("sys").environment.parse("TF_CUDA_CARVEOUT_KEY", key);
+    if (key == null) _ = try @import("sys").environment.parse("TF_CUDA_CARVEOUT_KEY_FILE", key_file);
+    const backend: Backend = if (if (source) |v| std.mem.eql(u8, v, "daemon") else false) .daemon else .drm;
+    const where = socket orelse default_socket;
+    const whose = key orelse try keyFrom(if (key_file) |f| f else null);
+    const m = mib orelse return .{ .backend = backend, .bytes = default_bytes, .socket = where, .key = whose };
+    if (m.len == 0) return .{ .backend = backend, .bytes = default_bytes, .socket = where, .key = whose };
     _ = try @import("sys").environment.parse("TF_CUDA_CARVEOUT_MIB", m);
     const bytes = try std.math.mul(usize, try std.fmt.parseInt(usize, m, 10), 1 << 20);
-    if (roundBytes(bytes) == 0) return error.CarveoutTooSmall;
-    return roundBytes(bytes);
+    if (backend == .drm) {
+        if (roundBytes(bytes) == 0) return error.CarveoutTooSmall;
+        return .{ .backend = backend, .bytes = roundBytes(bytes), .socket = where, .key = whose };
+    }
+    if (bytes < gran) return error.CarveoutTooSmall;
+    return .{ .backend = backend, .bytes = bytes, .socket = where, .key = whose };
+}
+
+/// The key: the setting, else the key file's first line, else the default; a per-box key names that file.
+fn keyFrom(key_file: ?[]const u8) error{InvalidEnvironment}![]const u8 {
+    const Held = struct {
+        var text: ?[]const u8 = null;
+    };
+    const path = key_file orelse return default_key;
+    if (path.len == 0) return default_key;
+    if (Held.text) |held| return held;
+    var pbuf: [256]u8 = undefined;
+    if (path.len >= pbuf.len) return error.InvalidEnvironment;
+    @memcpy(pbuf[0..path.len], path);
+    pbuf[path.len] = 0;
+    const fd_rc = linux.openat(linux.AT.FDCWD, @ptrCast(&pbuf), .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    if (linux.errno(fd_rc) != .SUCCESS) return error.InvalidEnvironment;
+    const fd: linux.fd_t = @intCast(fd_rc);
+    defer _ = linux.close(fd);
+    var buf: [256]u8 = undefined;
+    const n = linux.read(fd, &buf, buf.len);
+    if (linux.errno(n) != .SUCCESS) return error.InvalidEnvironment;
+    const line = std.mem.sliceTo(buf[0..n], '\n');
+    if (line.len == 0) return error.InvalidEnvironment;
+    const dup = std.heap.page_allocator.dupe(u8, line) catch return error.InvalidEnvironment; // outlives this call
+    Held.text = dup;
+    return dup;
 }
 
 /// First-fit placement of 256-byte aligned spans in `size` bytes; with nothing given back it is a bump allocator.
@@ -89,15 +131,22 @@ pub const Spans = struct {
     }
 };
 
+/// The reference daemon's socket and key (kindling spark-os's dispramd); another daemon sets both.
+pub const default_socket = "/run/dispram/dispram.sock";
+pub const default_key = "kindlingai_1";
+pub const gran = @import("carveout_lend.zig").gran; // one owner for the slice size
+
 /// The registered framebuffer: owns the card's fd, the dumb buffer, its mapping and the CUDA registration.
 pub const Carveout = struct {
     d: *const Driver,
+    backend: Backend = .drm,
     fd: linux.fd_t,
     handle: u32,
     host: []align(std.heap.page_size_min) u8,
     dev: abi.DevicePtr,
     flags: c_uint, // the registration flags the driver took
     spans: Spans,
+    vmm: ?@import("arena.zig").Vmm = null, // the daemon slice's mapping; the card path has none
 
     /// Maps `want` bytes (whole rows) of `card`'s display memory into the current context.
     pub fn open(d: *const Driver, card: [*:0]const u8, want: usize) Error!Carveout {
@@ -140,11 +189,22 @@ pub const Carveout = struct {
 
     /// Releases in reverse order of open; every span taken from it must be out of use.
     pub fn close(c: *Carveout) void {
-        _ = c.d.api.cuMemHostUnregister(c.host.ptr);
-        _ = linux.munmap(c.host.ptr, c.host.len);
-        destroy(c.fd, c.handle);
-        _ = linux.close(c.fd);
+        switch (c.backend) {
+            .drm => {
+                _ = c.d.api.cuMemHostUnregister(c.host.ptr);
+                _ = linux.munmap(c.host.ptr, c.host.len);
+                destroy(c.fd, c.handle);
+                _ = linux.close(c.fd);
+            },
+            .daemon => @import("carveout_lend.zig").release(.{ .fd = c.fd, .dev = c.dev, .size = c.spans.size, .vmm = c.vmm.? }),
+        }
         c.* = undefined;
+    }
+
+    /// The daemon backend: claims what a lending daemon holds, over its socket with its key, keeping the socket open.
+    pub fn openDaemon(d: *const Driver, socket: []const u8, key: []const u8, want: usize) Error!Carveout {
+        const claimed = try @import("carveout_lend.zig").claim(d, socket, key, want);
+        return .{ .d = d, .backend = .daemon, .fd = claimed.fd, .handle = 0, .host = undefined, .dev = claimed.dev, .flags = 0, .spans = .{ .size = claimed.size }, .vmm = claimed.vmm };
     }
 
     /// A zeroed span of `len` bytes, 256-byte aligned; null when it does not fit (the caller falls back).
@@ -162,7 +222,7 @@ pub const Carveout = struct {
     }
 
     pub fn bytes(c: *const Carveout) usize {
-        return c.host.len;
+        return c.spans.size;
     }
 
     pub fn freeBytes(c: *const Carveout) usize {
@@ -218,13 +278,17 @@ test "a span list holds at most max spans" {
     try std.testing.expectEqual(@as(?usize, null), s.take(1));
 }
 
-test "the carveout is opt-in, sized in whole rows" {
-    try std.testing.expectEqual(@as(?usize, null), try requested(false, null, null));
-    try std.testing.expectEqual(@as(?usize, null), try requested(false, "0", "64"));
-    try std.testing.expectEqual(@as(?usize, default_bytes), try requested(true, null, null));
-    try std.testing.expectEqual(@as(?usize, default_bytes), try requested(false, "1", ""));
-    try std.testing.expectEqual(@as(?usize, 64 << 20), try requested(false, "1", "64"));
-    try std.testing.expectError(error.InvalidEnvironment, requested(true, null, "lots"));
+test "the carveout is opt-in, sized in whole rows, with a source a value selects" {
+    try std.testing.expectEqual(@as(?Request, null), try requested(false, null, null, null, null, null));
+    try std.testing.expectEqual(@as(?Request, null), try requested(false, "daemon", null, null, null, "64")); // off: the source alone does nothing
+    try std.testing.expectEqual(@as(?Request, .{ .backend = .drm, .bytes = default_bytes }), try requested(true, null, null, null, null, null)); // drm is the default source
+    try std.testing.expectEqual(@as(?Request, .{ .backend = .drm, .bytes = default_bytes }), try requested(true, "drm", null, null, null, ""));
+    try std.testing.expectEqual(@as(?Request, .{ .backend = .drm, .bytes = 64 << 20 }), try requested(true, "drm", null, null, null, "64"));
+    try std.testing.expectEqual(@as(?Request, .{ .backend = .daemon, .bytes = default_bytes }), try requested(true, "daemon", null, null, null, null));
+    try std.testing.expectEqual(@as(?Request, .{ .backend = .daemon, .bytes = 64 << 20 }), try requested(true, "daemon", null, null, null, "64"));
+    try std.testing.expectError(error.InvalidEnvironment, requested(true, "drm", null, null, null, "lots"));
+    try std.testing.expectError(error.InvalidEnvironment, requested(true, "magic", null, null, null, null)); // a third source is refused
+    try std.testing.expectEqual(@as(?Request, null), try requested(false, "magic", null, null, null, null)); // off: not validated
     try std.testing.expectEqual(0, roundBytes(row_bytes - 1));
     try std.testing.expectEqual(row_bytes, roundBytes(row_bytes + 1));
 }

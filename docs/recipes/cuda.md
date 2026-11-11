@@ -127,7 +127,17 @@ Experimental: on a DGX Spark (GB10), `tensorfold run --carveout` on a CUDA build
 `tensorfold-native`, puts Nemotron's KV caches in the memory the display controller reserves, which
 MemAvailable never counts. The native engine maps a
 DRM dumb buffer from `/dev/dri/card0` (`TF_DRM_CARD` picks another card) and registers it with
-CUDA. It is 1,792 MiB unless `TF_CUDA_CARVEOUT_MIB` says otherwise. Each sequence's key and value
+CUDA. `TF_CUDA_CARVEOUT_SOURCE=daemon` (with `TF_CUDA_CARVEOUT=1` or `--carveout`) selects a second
+backend with the same placement and receipts; the default source, `drm`, keeps the dumb-buffer route. It
+claims the same reservation from a display-memory daemon that holds it and lends it in slices - kindling
+spark-os's dispramd over `/run/dispram/dispram.sock` (its key is fixed) or spark-attic's atticd over
+`/run/spark-attic/attic.sock`, since both speak the same protocol; `TF_CUDA_CARVEOUT_SOCKET`,
+`TF_CUDA_CARVEOUT_KEY` and `TF_CUDA_CARVEOUT_KEY_FILE` name whichever one a box runs. The claim is a
+`SOCK_SEQPACKET` datagram exchange, one JSON object each way, and the descriptor comes back by `SCM_RIGHTS`;
+the slice is then mapped with the CUDA virtual-memory API, so it works where the DRM dumb buffer does not
+(kindling's driver answers ENOSYS to `DRM_IOCTL_MODE_CREATE_DUMB`). Without the daemon answering, with the claim refused or
+with a slice shorter than asked, the load stops with the cause named, as the DRM backend does: it never
+quietly fits less than the placement was planned for. It is 1,792 MiB unless `TF_CUDA_CARVEOUT_MIB` says otherwise. Each sequence's key and value
 planes go there while the carveout holds both, and the rest stays in device memory. The recurrent
 state stays out, because every round reads and writes all of it. Copies into and out of this memory
 run at about half the speed of ordinary memory and kernels reading it keep about 90%, so expect a small

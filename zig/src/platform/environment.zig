@@ -4,7 +4,7 @@ const sys = @import("sys.zig");
 
 pub const Error = error{InvalidEnvironment};
 pub const Scope = enum { common, cuda, metal, xpu, slide, hooks, dsv41, gemma4, drama3, glm };
-pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path };
+pub const Kind = enum { u32, u64, size, percent, positive, device, segments, mib, bit_width, word, prompt, flag, toggle, real, positive_real, signed_real, range, path, pocket, carveout };
 pub const Rule = struct {
     name: [:0]const u8,
     scope: Scope,
@@ -41,7 +41,12 @@ pub const rules = [_]Rule{
     .{ .name = "TENSORFOLD_TOOL_ID_KEY_FILE", .scope = .common, .kind = .path, .forms = "a path without control characters to a file only its owner can read, holding at least 32 key bytes" },
     .{ .name = "TF_CUDA_DEVICE", .scope = .cuda, .kind = .device, .trim = " ", .forms = "a whole GPU ordinal from 0 to 4294967295, or empty for the default" },
     .{ .name = "TF_CUDA_SEGMENTS", .scope = .cuda, .kind = .segments, .trim = " ", .forms = "a whole number from 1 to 4, or empty for the default" },
-    .{ .name = "TF_CUDA_CARVEOUT", .scope = .cuda, .kind = .flag, .forms = "0 or 1" },
+    .{ .name = "TF_CUDA_CARVEOUT", .scope = .cuda, .kind = .flag, .forms = "0 or 1 (1 puts the KV caches in GB10's display memory first)" },
+    .{ .name = "TF_CUDA_CARVEOUT_SOURCE", .scope = .cuda, .kind = .carveout, .forms = "drm or daemon, or empty for drm: where the reservation comes from" },
+    .{ .name = "TF_CUDA_CARVEOUT_SOCKET", .scope = .cuda, .kind = .path, .forms = "a socket path without control characters to the daemon; empty for /run/dispram/dispram.sock" },
+    .{ .name = "TF_CUDA_CARVEOUT_KEY", .scope = .cuda, .kind = .path, .forms = "the daemon protocol key without control characters; empty for kindlingai_1" },
+    .{ .name = "TF_DRM_CARD", .scope = .cuda, .kind = .path, .forms = "a device path without control characters to a DRM card (default /dev/dri/card0)" },
+    .{ .name = "TF_CUDA_CARVEOUT_KEY_FILE", .scope = .cuda, .kind = .path, .forms = "a file whose first line is the key, without control characters; empty for none (atticd keeps it at /etc/spark-attic/key)" },
     .{ .name = "TF_CUDA_CARVEOUT_MIB", .scope = .cuda, .kind = .mib, .forms = "a positive whole MiB count fitting a native byte size, or empty for 1792 MiB" },
     .{ .name = "TF_MTP_DRAFTS", .scope = .cuda, .kind = .u32, .forms = "a whole number from 0 to 4294967295 (clamped to the drafter's window)" },
     .{ .name = "TF_DRAFT_NODES", .scope = .cuda, .kind = .size, .forms = "a whole nonnegative native-size node count (capped by the drafter's window)" },
@@ -198,6 +203,11 @@ pub fn parse(name: []const u8, raw: ?[]const u8) Error!?u64 {
         const b: []const u8 = if (r.kind == .flag) "1" else "8";
         if (!std.mem.eql(u8, text, a) and !std.mem.eql(u8, text, b)) return error.InvalidEnvironment;
     }
+    if (r.kind == .carveout) {
+        for ([_][]const u8{ "drm", "daemon" }, 0..) |v, i|
+            if (std.mem.eql(u8, text, v)) return i;
+        return error.InvalidEnvironment;
+    }
     const n = std.fmt.parseInt(u64, text, 10) catch return error.InvalidEnvironment;
     const max: u64 = switch (r.kind) {
         .u32, .positive, .device => std.math.maxInt(u32),
@@ -301,6 +311,13 @@ fn masked(r: Rule, environment: anytype) bool {
     return if (r.alias_of) |canonical| environment.get(canonical) != null else false;
 }
 
+/// The carveout value that turns it on: "1" (the drm backend) or "dispram"; null for off or unknown.
+fn on_value(raw: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, raw, "1")) return raw;
+    if (std.mem.eql(u8, raw, "dispram")) return raw;
+    return null;
+}
+
 /// Every CUDA entry point shares flag precedence, accepted text and diagnostics.
 pub fn device(flag: ?u32, raw: ?[]const u8) Error!u32 {
     if (flag) |n| return n;
@@ -345,7 +362,14 @@ pub fn refusal(a: std.mem.Allocator, environment: anytype, flags: Flags) !?[]con
         if (std.mem.eql(u8, r.name, "TF_CUDA_SEGMENTS") and flags.segments != null) continue;
         if (std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT") and flags.carveout) continue;
         if (std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT_MIB") and !flags.carveout and
-            !std.mem.eql(u8, environment.get("TF_CUDA_CARVEOUT") orelse "0", "1")) continue;
+            on_value(environment.get("TF_CUDA_CARVEOUT") orelse "0") == null) continue;
+        // The daemon's settings only matter once the carveout is on, as the DRM card's do not when a daemon lends it.
+        const carve_on = flags.carveout or on_value(environment.get("TF_CUDA_CARVEOUT") orelse "0") != null;
+        if (std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT_SOURCE") and !carve_on) continue;
+        if ((std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT_SOCKET") or std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT_KEY") or
+            std.mem.eql(u8, r.name, "TF_CUDA_CARVEOUT_KEY_FILE")) and !carve_on) continue;
+        const lend = carve_on and std.mem.eql(u8, environment.get("TF_CUDA_CARVEOUT_SOURCE") orelse "drm", "daemon");
+        if (std.mem.eql(u8, r.name, "TF_DRM_CARD") and lend) continue; // no card is opened when a daemon lends
         if (std.mem.eql(u8, r.name, "TF_DRAFT_NODES") and environment.get("TF_NO_TREES") != null) continue;
         const raw = environment.get(r.name) orelse continue;
         _ = parse(r.name, raw) catch return try describe(a, r.name, raw);

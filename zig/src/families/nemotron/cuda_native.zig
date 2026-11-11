@@ -203,17 +203,27 @@ fn release(p: *anyopaque) void {
     own.gpa.destroy(own);
 }
 
-/// TF_CUDA_CARVEOUT=1: the display carveout KV planes go to first (cuda/carveout.zig); null when it is off.
+/// TF_CUDA_CARVEOUT=1 from the card or a lending daemon: the display carveout holds the KV planes first; null off.
 fn openCarveout(gpa: std.mem.Allocator, ctx: *const cuda.Context) !?*cuda.Carveout {
-    const bytes = (try cuda.carveout.requested(false, env("TF_CUDA_CARVEOUT"), env("TF_CUDA_CARVEOUT_MIB"))) orelse return null;
-    const card: [*:0]const u8 = platform.c.getenv("TF_DRM_CARD") orelse cuda.carveout.default_card;
+    const on = std.mem.eql(u8, env("TF_CUDA_CARVEOUT") orelse "0", "1");
+    const want = (try cuda.carveout.requested(on, env("TF_CUDA_CARVEOUT_SOURCE"), env("TF_CUDA_CARVEOUT_SOCKET"), env("TF_CUDA_CARVEOUT_KEY"), env("TF_CUDA_CARVEOUT_KEY_FILE"), env("TF_CUDA_CARVEOUT_MIB"))) orelse return null;
+    const card_setting = platform.environment.Process.get(.{}, "TF_DRM_CARD");
+    const card_buf = if (card_setting) |t| try gpa.dupeSentinel(u8, t, 0) else null;
+    defer if (card_buf) |b| gpa.free(b);
+    const card: [*:0]const u8 = if (card_buf) |b| b.ptr else cuda.carveout.default_card;
     const c = try gpa.create(cuda.Carveout);
     errdefer gpa.destroy(c);
-    c.* = cuda.Carveout.open(ctx.d, card, bytes) catch |err| {
-        std.log.err("display carveout of {d} MiB from {s}: {t} (needs nvidia_drm modeset=1, the card's device node and no display in use)", .{ bytes >> 20, card, err });
-        return err;
+    c.* = switch (want.backend) {
+        .drm => cuda.Carveout.open(ctx.d, card, want.bytes) catch |err| {
+            std.log.err("display carveout of {d} MiB from {s}: {t} (needs nvidia_drm modeset=1, the card's device node and no display in use)", .{ want.bytes >> 20, card, err });
+            return err;
+        },
+        .daemon => cuda.Carveout.openDaemon(ctx.d, want.socket, want.key, want.bytes) catch |err| {
+            std.log.err("display carveout of {d} MiB from the daemon at {s}: {t} (run the daemon, set TF_CUDA_CARVEOUT_SOCKET/TF_CUDA_CARVEOUT_KEY, or set TF_CUDA_CARVEOUT_SOURCE=drm)", .{ want.bytes >> 20, want.socket, err });
+            return err;
+        },
     };
-    std.log.info("display carveout: {d} MiB from {s}; KV planes go there first", .{ bytes >> 20, card });
+    std.log.info("display carveout: {d} MiB, {s}; KV planes go there first", .{ c.bytes() >> 20, @tagName(c.backend) });
     return c;
 }
 
@@ -255,7 +265,7 @@ test "Nemotron paging: registered lookup preserves the native reader's live envi
 }
 
 fn env(name: [:0]const u8) ?[]const u8 {
-    return std.mem.span(platform.c.getenv(name) orelse return null);
+    return platform.environment.Process.get(.{}, name);
 }
 
 /// The tensors this family loads; the early check uses the same vision switch as open().

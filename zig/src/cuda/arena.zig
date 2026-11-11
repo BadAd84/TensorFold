@@ -215,6 +215,7 @@ pub const Vmm = struct {
         unmap: *const fn (u64, usize) callconv(.c) abi.Result,
         setAccess: *const fn (u64, usize, *const AccessDesc, usize) callconv(.c) abi.Result,
         granularity: *const fn (*usize, *const Prop, c_int) callconv(.c) abi.Result,
+        importFd: *const fn (*u64, ?*anyopaque, c_int) callconv(.c) abi.Result,
     };
 
     pub const Prop = extern struct { // CUmemAllocationProp
@@ -241,7 +242,7 @@ pub const Vmm = struct {
         var lib = std.DynLib.open("libcuda.so.1") catch return error.DriverUnavailable;
         errdefer lib.close();
         var api: Api = undefined;
-        const names = .{ .{ "reserve", "cuMemAddressReserve" }, .{ "addressFree", "cuMemAddressFree" }, .{ "create", "cuMemCreate" }, .{ "release", "cuMemRelease" }, .{ "map", "cuMemMap" }, .{ "unmap", "cuMemUnmap" }, .{ "setAccess", "cuMemSetAccess" }, .{ "granularity", "cuMemGetAllocationGranularity" } };
+        const names = .{ .{ "reserve", "cuMemAddressReserve" }, .{ "addressFree", "cuMemAddressFree" }, .{ "create", "cuMemCreate" }, .{ "release", "cuMemRelease" }, .{ "map", "cuMemMap" }, .{ "unmap", "cuMemUnmap" }, .{ "setAccess", "cuMemSetAccess" }, .{ "granularity", "cuMemGetAllocationGranularity" }, .{ "importFd", "cuMemImportFromShareableHandle" } };
         inline for (names) |n| @field(api, n[0]) = lib.lookup(@FieldType(Api, n[0]), n[1]) orelse return error.MissingSymbol;
         var prop: Prop = .{ .loc_id = device };
         var rdma: c_int = 0; // GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED: keep the memory registrable as cuMemAlloc's is
@@ -282,6 +283,29 @@ pub const Vmm = struct {
         }
         v.next += len;
         return at;
+    }
+
+    /// Maps a slice another process shared as an fd (CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) in a range of ours. 
+    pub fn mapSlice(v: *Vmm, fd: anytype, len: usize) Error!u64 {
+        const handle_type_posix_fd: c_int = 1;
+        var va: u64 = 0;
+        if (v.api.reserve(&va, len, v.granularity, 0, 0) != abi.success) return error.CudaFailed;
+        errdefer _ = v.api.addressFree(va, len);
+        var h: u64 = 0;
+        if (v.api.importFd(&h, @ptrFromInt(@as(usize, @intCast(fd))), handle_type_posix_fd) != abi.success)
+            return error.CudaFailed;
+        errdefer _ = v.api.release(h);
+        if (v.api.map(va, len, 0, h, 0) != abi.success) return error.CudaFailed;
+        errdefer _ = v.api.unmap(va, len);
+        const desc: AccessDesc = .{ .loc_id = v.device };
+        if (v.api.setAccess(va, len, &desc, 1) != abi.success) return error.CudaFailed;
+        _ = v.api.release(h); // the mapping keeps its own reference to the memory
+        return va;
+    }
+
+    pub fn unmapSlice(v: *Vmm, base: u64, len: usize) void {
+        _ = v.api.unmap(base, len);
+        _ = v.api.addressFree(base, len);
     }
 
     fn fail(v: *Vmm, call: []const u8, code: c_int) ?u64 {

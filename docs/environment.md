@@ -18,7 +18,12 @@ Diagnostics quote and escape the supplied text so it cannot create another termi
 | `TF_STARTUP_RECEIPT` | Exactly `0` or `1`; default off. `1` writes the startup and first completion receipts |
 | `TF_CUDA_DEVICE` | Whole ordinal 0 through 4294967295, or empty; default 0 |
 | `TF_CUDA_SEGMENTS` | Whole count 1 through 4, or empty; default 1 |
-| `TF_CUDA_CARVEOUT` | Exactly `0` or `1`; default off |
+| `TF_CUDA_CARVEOUT` | `0` or `1`; default off. `1` puts the KV caches in GB10's display reservation first |
+| `TF_CUDA_CARVEOUT_SOURCE` | `drm` (default) or `daemon`: where the reservation comes from, a DRM dumb buffer or a display-memory daemon that lends it (see docs/recipes/cuda.md) |
+| `TF_CUDA_CARVEOUT_SOCKET` | Socket path to the lending daemon without control characters, or empty for `/run/dispram/dispram.sock` |
+| `TF_CUDA_CARVEOUT_KEY` | The daemon protocol's key, no control characters, or empty for `kindlingai_1` |
+| `TF_CUDA_CARVEOUT_KEY_FILE` | A file whose first line is the key, or empty for none; atticd keeps it at `/etc/spark-attic/key` |
+| `TF_DRM_CARD` | A device path without control characters to a DRM card, or empty for `/dev/dri/card0` |
 | `TF_CUDA_CARVEOUT_MIB` | Positive whole MiB count whose byte size fits the platform, or empty for 1792 MiB |
 | `TF_Q27_COPY_ROWS` | Whole u32 count; zero disables copied rows; default 48 |
 | `TF_Q27_DRAFT_SLOTS` | Whole u32 count, clamped to 1 through the lane stream limit; default 8. DFlash2 can draft for at most the smaller of this count and the admitted streams, and none without a drafter. |
